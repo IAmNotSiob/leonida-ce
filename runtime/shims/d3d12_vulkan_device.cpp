@@ -476,9 +476,15 @@ static void ce_cb_peek(const std::uint32_t* s, std::uint64_t pipe) {
     const bool in_mirror = mt && at >= mlo && at + 16 <= mhi;
     std::uint32_t t[4] = {};
     const bool tok = in_mirror && rt::d3d12::ce_copy_title(t, mt + (at - mlo), sizeof t);
-    char tail[128] = {};
+    std::uint32_t tv[2] = {0xdeadbeefu, 0xdeadbeefu};  // the same address read as TITLE memory (placed buffers alias it)
+    const bool tvok = base && rt::d3d12::ce_copy_title(tv, base + pk.cboff, 8);
+    float tf[2];
+    std::memcpy(tf, tv, 8);
+    char tail[256] = {};
+    int tl = std::snprintf(tail, sizeof tail, " | title@base %s %08x %08x (%g %g)%s", tvok ? "" : "UNREADABLE", tv[0], tv[1],
+                           double(tf[0]), double(tf[1]), tvok && std::memcmp(tv, val, 8) != 0 ? " (DIFFERS from GPU view)" : "");
     if (in_mirror)
-        std::snprintf(tail, sizeof tail, "; title heap [ %08x %08x %08x %08x ]%s", t[0], t[1], t[2], t[3],
+        std::snprintf(tail + tl, sizeof tail - tl, "; title heap [ %08x %08x %08x %08x ]%s", t[0], t[1], t[2], t[3],
                       !tok ? " UNREADABLE" : std::memcmp(t, d, 16) == 0 ? " (= mirror)" : " (DIFFERS)");
     std::fprintf(stderr,
                  "[hack] CB_PEEK: %s s%u=0x%llx +0x%x (entry %s) V# [ %08x %08x %08x %08x ] base 0x%llx -> %s +0x%x = %08x %08x (%g %g)%s\n",
