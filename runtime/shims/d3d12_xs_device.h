@@ -98,6 +98,8 @@ bool set_device_adapter_provider(void* device, DxgiAdapterProvider provider);
 bool placed_buffer_holds(std::uint64_t va, std::uint64_t bytes);
 // agA20: the title VA and size of the newest placed-resource record whose stand-in is `resource` (false: none).
 bool placed_title_of(const void* resource, std::uint64_t& va, std::uint64_t& size);
+// agA20 (LEONIDA_CE_MIRROR_GFX=0): the heap mirror's arena VA range, so graphics tables can keep their raw handle.
+void set_heap_mirror_range(std::uint64_t lo, std::uint64_t hi);
 
 // Creates a descriptor heap whose storage is the title's memory at `console_address` (the console-extended slot 14
 // description, issue #313). The Vulkan layer registers rt::d3d12::create_console_descriptor_heap here; without a

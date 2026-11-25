@@ -3679,7 +3679,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 const bool s_ok = A && off + bytes <= AS && (std::memcpy(s_, A + off, 12), true);
                 const bool t_ok = tva && detail::copy_title_bytes(tva, t_, 12);
                 const bool g_ok = A && tva && tva + bytes <= AS && (std::memcpy(g_, A + tva, 12), true);
-                auto plausible = [](const std::uint32_t* v) { return v[0] <= 65535 && v[1] <= 65535 && v[2] <= 65535; };
+                auto plausible = [](const std::uint32_t* v) { return (v[0] | v[1] | v[2]) && v[0] <= 65535 && v[1] <= 65535 && v[2] <= 65535; };
                 int used = 0;
                 if (src_mode) {
                     const bool want_t = src_mode == 2 || (src_mode >= 3 && t_ok && plausible(t_));

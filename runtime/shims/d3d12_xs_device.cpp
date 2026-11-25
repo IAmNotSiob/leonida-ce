@@ -618,6 +618,7 @@ void xs_register_heap_range(std::uint64_t cpu, std::uint64_t size, std::uint64_t
     g_heap_ranges.push_back({cpu, size, gpu});
     g_heap_range_count.store(static_cast<int>(g_heap_ranges.size()), std::memory_order_release);
 }
+static std::atomic<std::uint64_t> g_mirror_lo{0}, g_mirror_hi{0};  // agA20
 std::uint64_t xs_gpu_handle_from_console(std::uint64_t v) {
     if (g_heap_range_count.load(std::memory_order_acquire) == 0) return v;
     std::lock_guard lock(g_heap_ranges_mu);
@@ -3031,6 +3032,19 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
             if constexpr (pc == 31 || pc == 32) {
                 const std::uint64_t raw = a2;
                 a2 = xs_gpu_handle_from_console(a2);  // HACK: unified handles
+                if constexpr (pc == 32) {
+                    // agA20 LEONIDA_CE_MIRROR_GFX=0: graphics tables keep the raw (title heap) handle, as before
+                    // HEAP_MIRROR, when it was translated into the mirror (the presented surface stayed zero with the
+                    // mirror; ri45-50 without it composited). Compute tables still read the mirror.
+                    static const bool gfx_mirror = [] { const char* e = std::getenv("LEONIDA_CE_MIRROR_GFX"); return !e || e[0] != '0'; }();
+                    const std::uint64_t lo = g_mirror_lo.load(std::memory_order_relaxed);
+                    if (!gfx_mirror && lo && a2 >= lo && a2 < g_mirror_hi.load(std::memory_order_relaxed) && a2 != raw) {
+                        static std::atomic<int> told_g{0};
+                        if (told_g++ < 4) std::fprintf(stderr, "[hack] MIRROR_GFX=0: graphics table 0x%llx kept raw (mirror 0x%llx)\n",
+                                                       (unsigned long long)raw, (unsigned long long)a2);
+                        a2 = raw;
+                    }
+                }
                 static const int tlog = [] { const char* v = std::getenv("LEONIDA_CE_TABLE_LOG"); return v ? std::atoi(v) : 0; }();
                 if (tlog > 0 && pc == 31) {  // agA17 diagnostic: raw compute table handles
                     static std::atomic<int> tl{0};
@@ -5774,6 +5788,11 @@ void set_console_arena(std::uint8_t* mapped, std::uint64_t arena_size, std::uint
 
 void set_console_descriptor_heap_factory(ConsoleDescriptorHeapFactory factory) {
     g_console_heap_factory = factory;
+}
+
+void set_heap_mirror_range(std::uint64_t lo, std::uint64_t hi) {
+    g_mirror_hi.store(hi);
+    g_mirror_lo.store(lo);
 }
 
 bool placed_title_of(const void* resource, std::uint64_t& va, std::uint64_t& size) {

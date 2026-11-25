@@ -2301,6 +2301,7 @@ public:
                 mirrored_ = true;
                 std::memcpy(device.arena.mapped + arena_offset_, cpu_, std::size_t(bytes));
                 ce_heap_mirror_add(cpu_, device.arena.mapped + arena_offset_, std::size_t(bytes), mirror);
+                rt::d3d12_xs::set_heap_mirror_range(arena_offset_, arena_offset_ + bytes);  // agA20 MIRROR_GFX
                 static const bool remap = [] { const char* e = std::getenv("LEONIDA_CE_MIRROR_REMAP"); return !e || e[0] != '0'; }();
                 if (remap && !leonida::ce::mirror_lo().load()) {  // agA20
                     leonida::ce::mirror_title().store(reinterpret_cast<std::uint64_t>(cpu_));
