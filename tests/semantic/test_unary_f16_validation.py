@@ -43,7 +43,10 @@ def validate_spirv(spv_text):
     spirv_as = shutil.which("spirv-as")
     spirv_val = shutil.which("spirv-val")
     if not spirv_as or not spirv_val:
-        raise AssertionError("spirv-as / spirv-val not found on PATH")
+        # As the other semantic tests do: a runner without SPIRV-Tools skips, unless the tools are required.
+        if os.environ.get("LEONIDA_REQUIRE_SPIRV_TOOLS"):
+            raise AssertionError("spirv-as / spirv-val required but not found on PATH")
+        raise unittest.SkipTest("spirv-as / spirv-val not on PATH")
     with tempfile.TemporaryDirectory() as d:
         asm_p = os.path.join(d, "s.spvasm")
         bin_p = os.path.join(d, "s.spv")
