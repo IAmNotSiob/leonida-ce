@@ -1593,3 +1593,40 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   compute queues only, to see whether the hang is on the compute or direct side.
 - Recommended env: build 68 + /root/handoff/re74.env (= re69). Screens: title UI (ACCOUNT PICKER / PLAYER prompts) then the navy
   post-Confirm loading screen; nothing past it yet.
+- (new receiver a93593c06bc558af6 names runs rlN)
+- rl75 (build 68 + re75, PTR_CHECK on cs_c5b1005e/344692c2/cee65a2d/956fdcc6): Confirm 129.4 s, LOST ~139 s after Confirm. Checkpoints
+  direct cs_00f50ab8, compute cs_c5b1005e x2 + cs_752cc8dc. FaultInfo: type 6 IP 0x20ada0940 + type 1 READ_INVALID 0x6b9b8f7da000.
+  PTR_CHECK: no V# base in 0xd9..-0xe3.. (lead 1 negative for these shaders). Its "bad" entries (floats in table slots 4/5/16/21/22)
+  are FALSE POSITIVES: cs_c5b1005e (disasm, 43 lines, loop-free) reads only table slots 0, 1, 2 (s_load s4+0x0/0x20/0x40).
+- Build 69 (md5 aa040ef8, 75e031bcd): LEONIDA_CE_INDIRECT_CLAMP=1 (default off): every count-less ExecuteIndirect DISPATCH goes
+  through the existing count-gating pass with a clamp variant (src/indirect_dispatch_clamp_spv.h, hand-edited SPIR-V, spirv-val ok):
+  records with any group count > 65535 become (0,0,0). Never run alone.
+- Build 70 (md5 279ac0ed, 4e06d28e9): PTR_CHECK prints the TITLE heap bytes for a bad entry inside the heap mirror.
+- rl77 (build 70 + re77 = re69 + INDIRECT_CLAMP=1 + PTR_CHECK): every flagged mirror entry "(= mirror)": the mirror is faithful,
+  the floats are title data in slots the shader never reads => descriptor tables OK (Very likely). INDIRECT_CLAMP active (16+
+  dispatches) and STILL LOST at ~frame 2670 => giant GPU-written indirect dispatch counts are not the cause (Likely).
+  At the loss 4 compute queues sit at the SAME marker = the cs_c5b1005e pipeline (marker = VkPipeline handle), direct cs_d80e80ca.
+- Arena never frees ("0 releases", live 1.3 -> 1.9 GiB over the run, largest free block 2.7 -> 2.0 GiB): a leak but not exhausted
+  at the loss. Bindless "2D-array full" before Confirm and "1D full" ~at Confirm+60 s in every run (misses fall back; the T# hash table
+  probes are bounded at 8, no infinite probe) - probably harmless.
+- Build 71 (md5 dfdf1661, 87f18b27f): LEONIDA_CE_DISPATCH_LOG=1 (direct dispatch per-pipeline group-count highs >= 4096 with s0-s11),
+  LEONIDA_CE_DISPATCH_MAX=N (skip direct dispatches over N groups). Handed rl78 = build 71 + re78 (= re69 + DISPATCH_LOG=1, rtdump98).
+- Wine note: gta6rt.sh --run needs DISPLAY=:1 here; st9 (build 71) without it hit int3 at game+0x19f4f58 after the HDR query, with
+  it stalled right after the HDR query within 150 s (did not investigate; st8 by agA20 ran fine, launch recipe not recorded).
+- KEY OBSERVATION (rl77, also rk71/rk73 by line position): the loss comes within the same second as the FIRST ray-tracing
+  acceleration-structure build: list slot 26/148/43/37/45 first calls (XboxBvhBuilder.dll), then ROOT_SPILL dispatches #1..#256
+  (the builder compute signature "14 spill dwords behind s[0:1]"), then DEVICE LOST. The ~139-148 s after Confirm is when the world
+  load finishes and the first BVH build is recorded (time-based, not frame-based: pace varies 7-17 s/60 frames, the delay does not).
+  Theory (Likely): the builder receives geometry / dest / scratch addresses from the title as DATA (build descs, root constants,
+  slot-148 upload records of count*40 bytes) - raw title VAs, many above 4 GiB (title placed buffers 0xd9..-0xe3..; slot 45 root UAV
+  0x103ddf21a0) - which the runtime never translates, so its shaders read/write heap_base + title VA, far outside the arena
+  (READ_INVALID 0x6b9b8f7da000 in rl75, garbage writes elsewhere -> hang). Root views from the title ARE translated (CBV_FIX), data
+  is not.
+- Build 72 (md5 ee0cfc38, 9fc74143a): LEONIDA_CE_SKIP_BVH=1 (default off, bisect): list slots 14/80/61 called from the builder image
+  (return address 0x180000000..0x1800de000) are dropped. Handed rl79 = build 72 + re79 (= re78 + SKIP_BVH=1, rtdump99).
+- FIX DESIGN if rl79 survives: wrap the game imports of XboxBvhBuilder exports (BuildRaytracingAccelerationStructure RVA 0x21610,
+  ...Batched2X 0x216a0, CopyRaytracingAccelerationStructure 0x21980, Rehydrate*) and rewrite every GPU VA in the descs
+  (DestAccelerationStructureData, ScratchAccelerationStructureData, SourceAccelerationStructureData, geometry VertexBuffer.StartAddress,
+  IndexBuffer, Transform3x4, AABBs.StartAddress, instance descs) from title VA to the placed buffer stand-in arena VA
+  (xs_placed_buffer_va), docs/xdxr.md + d3d12_command_objects.md 3.3b have the layouts. TLAS instance descs hold BLAS addresses in
+  GPU memory (written by the title) - those need the same translation (CPU pass over the instance buffer, or identity placement).
