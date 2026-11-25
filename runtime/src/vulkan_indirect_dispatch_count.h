@@ -12,6 +12,7 @@
 #include <memory>
 #include <vector>
 #include "indirect_dispatch_count_spv.h"
+#include "indirect_dispatch_clamp_spv.h"  // agA21
 
 namespace leonida {
 
@@ -23,6 +24,10 @@ struct CountedDispatch {
     VkDeviceAddress output = 0;
     std::uint32_t stride = 0;
     std::uint32_t max_count = 0;
+    // agA21 LEONIDA_CE_INDIRECT_CLAMP: no D3D12 count buffer; the count word is filled with ~0 at count_fill in
+    // `indirect` and the clamp shader zeroes records with any group count > 65535.
+    bool clamp = false;
+    VkDeviceSize count_fill = 0;
 };
 
 class IndirectDispatchCounter {
@@ -32,6 +37,7 @@ public:
         : get_(get), device_(device), memory_(memory), limits_(limits) {}
     ~IndirectDispatchCounter() {
         if (pipeline_) fn<PFN_vkDestroyPipeline>("vkDestroyPipeline")(device_, pipeline_, nullptr);
+        if (clamp_pipeline_) fn<PFN_vkDestroyPipeline>("vkDestroyPipeline")(device_, clamp_pipeline_, nullptr);
         if (layout_) fn<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(device_, layout_, nullptr);
     }
     IndirectDispatchCounter(const IndirectDispatchCounter&) = delete;
@@ -59,16 +65,17 @@ public:
                      VkDeviceSize count_offset, std::uint32_t stride, std::uint32_t max_count,
                      CountedDispatch& out) {
             out = {};
-            if (!arguments || !count || !stride || stride % 4 || !max_count ||
+            const bool clamp = !count;  // agA21
+            if (!arguments || !stride || stride % 4 || !max_count ||
                 !owner.limits_.maxComputeWorkGroupCount[0] || !owner.make_pipeline()) return false;
             constexpr VkDeviceSize record_bytes = 3 * sizeof(std::uint32_t);
             if (VkDeviceSize(max_count) > std::numeric_limits<VkDeviceSize>::max() / record_bytes)
                 return false;
             const VkDeviceSize bytes = VkDeviceSize(max_count) * record_bytes;
             VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-            info.size = bytes;
+            info.size = clamp ? bytes + 4 : bytes;
             info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
-                         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+                         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | (clamp ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0u);
             Allocation scratch{};
             if (owner.fn<PFN_vkCreateBuffer>("vkCreateBuffer")(owner.device_, &info, nullptr, &scratch.buffer) != VK_SUCCESS)
                 return false;
@@ -99,15 +106,17 @@ public:
             VkBufferDeviceAddressInfo addr{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
             addr.buffer = arguments;
             const VkDeviceAddress args_va = address(owner.device_, &addr);
-            addr.buffer = count;
-            const VkDeviceAddress count_va = address(owner.device_, &addr);
             addr.buffer = a.buffer;
             const VkDeviceAddress output_va = address(owner.device_, &addr);
+            addr.buffer = count;
+            const VkDeviceAddress count_va = clamp ? (output_va ? output_va + bytes : 0) : address(owner.device_, &addr);
             if (!args_va || !count_va || !output_va ||
                 argument_offset > UINT64_MAX - args_va || count_offset > UINT64_MAX - count_va)
                 return false;
             out = {a.buffer, 0, args_va + argument_offset, count_va + count_offset,
                    output_va, stride, max_count};
+            out.clamp = clamp;
+            out.count_fill = clamp ? bytes : 0;
             return true;
         }
     };
@@ -121,7 +130,14 @@ public:
         before.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         barrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 0, 1, &before, 0, nullptr, 0, nullptr);
-        fn<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+        if (job.clamp) {  // agA21: count word = ~0 (every record kept unless clamped)
+            fn<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(cb, job.indirect, job.count_fill, 4, 0xffffffffu);
+            VkMemoryBarrier filled{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            filled.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            filled.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &filled, 0, nullptr, 0, nullptr);
+        }
+        fn<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(cb, VK_PIPELINE_BIND_POINT_COMPUTE, job.clamp ? clamp_pipeline_ : pipeline_);
         struct Push {
             VkDeviceAddress arguments, count, output;
             std::uint32_t stride_words, first_record, records;
@@ -157,7 +173,7 @@ private:
              "vkAllocateMemory", "vkFreeMemory", "vkBindBufferMemory", "vkGetBufferDeviceAddress",
              "vkCreateShaderModule", "vkDestroyShaderModule", "vkCreatePipelineLayout",
              "vkDestroyPipelineLayout", "vkCreateComputePipelines", "vkDestroyPipeline",
-             "vkCmdPipelineBarrier", "vkCmdBindPipeline", "vkCmdPushConstants", "vkCmdDispatch"})
+             "vkCmdPipelineBarrier", "vkCmdBindPipeline", "vkCmdPushConstants", "vkCmdDispatch", "vkCmdFillBuffer"})
             if (!get_(device_, name)) return false;
         VkShaderModule module = VK_NULL_HANDLE;
         VkPipelineLayout layout = VK_NULL_HANDLE;
@@ -180,13 +196,26 @@ private:
         ok = ok && fn<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(
             device_, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline) == VK_SUCCESS;
         if (module) fn<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(device_, module, nullptr);
+        VkPipeline clamp_pipeline = VK_NULL_HANDLE;  // agA21
+        if (ok) {
+            VkShaderModule clamp_module = VK_NULL_HANDLE;
+            shader.codeSize = sizeof(indirect_dispatch_clamp_spirv);
+            shader.pCode = indirect_dispatch_clamp_spirv;
+            ok = fn<PFN_vkCreateShaderModule>("vkCreateShaderModule")(device_, &shader, nullptr, &clamp_module) == VK_SUCCESS;
+            info.stage.module = clamp_module;
+            ok = ok && fn<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(
+                device_, VK_NULL_HANDLE, 1, &info, nullptr, &clamp_pipeline) == VK_SUCCESS;
+            if (clamp_module) fn<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(device_, clamp_module, nullptr);
+        }
         if (!ok) {
+            if (clamp_pipeline) fn<PFN_vkDestroyPipeline>("vkDestroyPipeline")(device_, clamp_pipeline, nullptr);
             if (pipeline) fn<PFN_vkDestroyPipeline>("vkDestroyPipeline")(device_, pipeline, nullptr);
             if (layout) fn<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(device_, layout, nullptr);
             return false;
         }
         layout_ = layout;
         pipeline_ = pipeline;
+        clamp_pipeline_ = clamp_pipeline;
         return true;
     }
     PFN_vkGetDeviceProcAddr get_;
@@ -195,5 +224,6 @@ private:
     VkPhysicalDeviceLimits limits_;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
+    VkPipeline clamp_pipeline_ = VK_NULL_HANDLE;  // agA21
 };
 }  // namespace leonida

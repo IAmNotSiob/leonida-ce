@@ -3710,6 +3710,19 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                                  ::leonida::ce::pipeline_name(ind->pipeline ? reinterpret_cast<std::uint64_t>(p.pipeline.pipeline) : 0).c_str(), ind->max_count, (unsigned long long)off,
                                  s_ok ? "" : "(n/a)", s_[0], s_[1], s_[2], (unsigned long long)tva, t_ok ? "" : "(n/a)", t_[0], t_[1], t_[2],
                                  g_ok ? "" : "(n/a)", g_[0], g_[1], g_[2], src_mode, used);
+                // agA21 LEONIDA_CE_INDIRECT_CLAMP=1: run the GPU-written group counts through the count-gating pass
+                // (clamp variant): a record with any count > 65535 becomes a zero-group dispatch.
+                static const bool clamp_ind = [] { const char* e = std::getenv("LEONIDA_CE_INDIRECT_CLAMP"); return e && e[0] == '1'; }();
+                p.counted_dispatch = {};
+                if (clamp_ind && vk.prepare_counted_dispatch && vk.emit_counted_dispatch && !statistics_active &&
+                    vk.prepare_counted_dispatch(p.binding.buffer, p.binding.buffer_offset + ind->argument_offset,
+                                                VK_NULL_HANDLE, 0, ind->stride, ind->max_count, p.counted_dispatch)) {
+                    static std::atomic<std::uint64_t> clamped{0};
+                    const std::uint64_t k = ++clamped;
+                    if ((k & (k - 1)) == 0) { std::fprintf(stderr, "[hack] INDIRECT_CLAMP: %llu indirect dispatches routed through the clamp\n", (unsigned long long)k); std::fflush(stderr); }
+                } else {
+                    p.counted_dispatch = {};
+                }
             }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             p.khr_instances = 0;
@@ -4817,7 +4830,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 } else if (ind->kind == IndirectKind::draw_indexed) {
                     vk.draw_indexed_indirect(command_buffer, p.binding.buffer, arguments, ind->max_count, ind->stride);
                 } else if (ind->kind == IndirectKind::dispatch) {
-                    if (ind->count_buffer) {
+                    const bool via_scratch = ind->count_buffer || p.counted_dispatch.clamp;  // agA21
+                    if (via_scratch) {
                         // No D3D12 query must count this internal compute pass as an application dispatch.
                         end_statistics();
                         vk.emit_counted_dispatch(command_buffer, p.counted_dispatch);
@@ -4839,8 +4853,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     }
                     for (std::uint32_t k = 0; k < ind->max_count; ++k) {
                         vk.dispatch_indirect(command_buffer,
-                            ind->count_buffer ? p.counted_dispatch.indirect : p.binding.buffer,
-                            (ind->count_buffer ? p.counted_dispatch.offset + VkDeviceSize(k) * 12
+                            via_scratch ? p.counted_dispatch.indirect : p.binding.buffer,
+                            (via_scratch ? p.counted_dispatch.offset + VkDeviceSize(k) * 12
                                                : arguments + VkDeviceSize(k) * ind->stride));
                     }
                 }
