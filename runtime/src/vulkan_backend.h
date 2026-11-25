@@ -46,6 +46,17 @@
 
 namespace leonida {
 
+// HACK (agA11): called once when the device is first seen lost (VK_EXT_device_fault report, d3d12_vulkan_device.cpp).
+inline std::atomic<void (*)()>& device_lost_hook() {
+    static std::atomic<void (*)()> hook{nullptr};
+    return hook;
+}
+inline void report_device_lost() {
+    static std::atomic<bool> once{false};
+    if (once.exchange(true)) return;
+    if (auto h = device_lost_hook().load(std::memory_order_acquire)) h();
+}
+
 // A CPU-written Vulkan-address instance pointer array, kept until the submission that builds with it completes.
 // Completed stages are pooled per queue and reused, so a per-frame TLAS build does not allocate memory each frame.
 struct KhrInstanceStage {
@@ -799,7 +810,7 @@ private:
             epoch_cv_.notify_all();
 
             if (res == VK_ERROR_DEVICE_LOST || device_lost_.load(std::memory_order_acquire)) {
-                device_lost_.store(true, std::memory_order_release);
+                device_lost_.store(true, std::memory_order_release); report_device_lost();
                 std::vector<Entry> drained = std::move(pending_);
                 pending_.clear();
                 dispatch_outside_lock(lock, drained, signal_event_);
@@ -829,7 +840,7 @@ private:
                 pending_.resize(write);
                 for (Entry& e : pending_) ready.push_back(std::move(e));
                 pending_.clear();
-                device_lost_.store(true, std::memory_order_release);
+                device_lost_.store(true, std::memory_order_release); report_device_lost();
                 dispatch_outside_lock(lock, ready, signal_event_);
                 return;
             }
@@ -1505,7 +1516,7 @@ public:
     std::mutex& submit_mutex() { return submit_mutex_; }
 
     void mark_device_lost() noexcept {
-        device_lost_.store(true, std::memory_order_release);
+        device_lost_.store(true, std::memory_order_release); report_device_lost();
         if (fence_dispatcher_) {
             try {
                 fence_dispatcher_->notify_device_lost();

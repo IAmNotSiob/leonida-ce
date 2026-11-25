@@ -454,6 +454,10 @@ std::vector<XsPendingWrites> g_pending_writes;      // under g_fence_mirror_mu
 
 void xs_do_write(const XsDeferredWrite& w) {
     std::uint64_t v = w.value;
+    if (w.what == 0 && v == ~std::uint64_t{0}) {  // HACK (agA11) diagnostic
+        static std::atomic<int> told{0};
+        if (told++ < 8) std::fprintf(stderr, "[hack] deferred list write of UINT64_MAX to 0x%llx\n", (unsigned long long)w.address);
+    }
     if (w.what != 0) {
         LARGE_INTEGER now{};
         QueryPerformanceCounter(&now);
@@ -468,7 +472,19 @@ DWORD WINAPI xs_fence_mirror_thread(void*) {
     for (;;) {
         {
             std::lock_guard lock(g_fence_mirror_mu);
-            for (auto& [key, m] : g_fence_mirrors) m->value = m->fence->GetCompletedValue();
+            for (auto& [key, m] : g_fence_mirrors) {
+                const std::uint64_t before = m->value, now = m->fence->GetCompletedValue();
+                // HACK (agA11): the title's 0x144fb0ad0 treats UINT64_MAX as device removed (Quitf 0x142474500).
+                if (now == ~std::uint64_t{0} && before != now) {
+                    static std::atomic<int> told{0};
+                    if (told++ < 8) {
+                        std::fprintf(stderr, "[hack] fence mirror %p (fence %p) went 0x%llx -> UINT64_MAX\n",
+                                     (void*)&m->value, (void*)m->fence, (unsigned long long)before);
+                        std::fflush(stderr);
+                    }
+                }
+                m->value = now;
+            }
             for (auto it = g_pending_writes.begin(); it != g_pending_writes.end();) {
                 if (it->fence->GetCompletedValue() >= it->value) {
                     for (const auto& w : it->writes) xs_do_write(w);

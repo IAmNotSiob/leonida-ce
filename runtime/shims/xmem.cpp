@@ -978,7 +978,19 @@ bool xmem_write_phys(uint64_t va, const void* src, uint64_t n) {
     return true;
 }
 
+bool xmem_write_page(uint64_t page, uint64_t off, const void* src, uint64_t n) {
+    if (off >= kPhysicalPageSize || n > kPhysicalPageSize - off) return false;
+    const std::lock_guard lock(g_phys_mutex);
+    const auto it = g_pages.find(page);
+    if (it == g_pages.end() || !it->second.section || !it->second.section->scratch) return false;
+    auto* backing = static_cast<uint8_t*>(it->second.section->scratch) + it->second.offset;
+    if (!VirtualAlloc(backing, kPhysicalPageSize, MEM_COMMIT, PAGE_READWRITE)) return false;
+    std::memcpy(backing + off, src, static_cast<size_t>(n));
+    return true;
+}
+
 void register_map_alias() {
+    rt::xmem::write_page_hook().store(&xmem_write_page, std::memory_order_release);
     rt::xmem::map_alias_hook().store(&xmem_map_alias, std::memory_order_release);
     rt::xmem::write_phys_hook().store(&xmem_write_phys, std::memory_order_release);
 }

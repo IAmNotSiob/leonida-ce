@@ -1463,6 +1463,13 @@ public:
     // value, in the order the signals were made. Until then GetCompletedValue reads the GPU's progress, where D3D12
     // would already read `value`.
     HRESULT STDMETHODCALLTYPE Signal(UINT64 value) override {
+        if (value >= (UINT64(1) << 48)) {  // HACK (agA11): who signals a huge value (re26: a mirror read UINT64_MAX)
+            static std::atomic<int> told{0};
+            if (told++ < 16) {
+                std::fprintf(stderr, "[hack] fence Signal(%p, 0x%llx) from %p\n", (void*)this, (unsigned long long)value, _ReturnAddress());
+                std::fflush(stderr);
+            }
+        }
         std::lock_guard lock(claim_mutex_);
         if (!claim_locked(value, false)) return S_OK;
         const UINT64 queued = queued_;
@@ -1703,6 +1710,13 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE Signal(ID3D12Fence* fence, UINT64 value) override {
+        if (value >= (UINT64(1) << 48)) {  // HACK (agA11): who signals a huge value (re26: a mirror read UINT64_MAX)
+            static std::atomic<int> told{0};
+            if (told++ < 16) {
+                std::fprintf(stderr, "[hack] queue Signal(%p, 0x%llx) from %p\n", (void*)fence, (unsigned long long)value, _ReturnAddress());
+                std::fflush(stderr);
+            }
+        }
         constexpr auto method = "ID3D12CommandQueue::Signal";
         Fence* f = Fence::from(fence);
         if (!f || f->context() != &context_ || f->attached_device() != attached_device())

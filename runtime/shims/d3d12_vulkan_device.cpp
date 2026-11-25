@@ -851,6 +851,21 @@ struct DeviceState {
             return true;
         }
         ++arena.failures;
+        // HACK (agA11): re24 ran the 4 GiB arena full at t~203 (buffers refused), then lost the device at t~223.
+        // Say what fills it: live bytes by use, peak, free blocks and the largest one (first and every 2^k-th failure).
+        if ((arena.failures & (arena.failures - 1)) == 0) {
+            VkDeviceSize largest = 0, free_total = 0;
+            for (const auto& [o, n] : arena.free) { largest = std::max(largest, n); free_total += n; }
+            const double mib = 1.0 / (1 << 20);
+            std::fprintf(stderr, "[hack] arena full #%llu (%s 0x%llx bytes): live %.1f MiB (buffers %.1f, descriptor heaps %.1f, "
+                         "shaders %.1f, heaps %.1f), peak live %.1f, peak end %.1f of %.1f MiB, %zu free blocks %.1f MiB, "
+                         "largest %.3f MiB, %llu allocations\n", (unsigned long long)arena.failures, kArenaUseNames[use],
+                         (unsigned long long)bytes, arena.in_use * mib, arena.use_in_use[arena_buffer] * mib,
+                         arena.use_in_use[arena_descriptor_heap] * mib, arena.use_in_use[arena_shader] * mib,
+                         arena.use_in_use[arena_heap] * mib, arena.peak_in_use * mib, arena.peak_end * mib, arena.size * mib,
+                         arena.free.size(), free_total * mib, largest * mib, (unsigned long long)arena.allocations);
+            std::fflush(stderr);
+        }
         if (arena.log)
             std::fprintf(stderr, "[rt] d3d12: arena %s: no room for 0x%llx bytes\n", kArenaUseNames[use],
                          (unsigned long long)bytes);
@@ -1992,11 +2007,24 @@ public:
         leonida::ResourceBinding binding{};  // a buffer: no image
         binding.size = desc_.Width;
         if (!host && device_.arena.mapped) {
-            if (!device_.arena_allocate(desc_.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, arena_offset_,
-                                        DeviceState::arena_buffer)) {
+            // HACK (agA11): re26 showed the arena full with 1.6 GiB live and 2.4 GiB free in 44238 slivers (largest
+            // 64 KiB): every buffer, even 0x50 bytes, took a 64 KiB-aligned slot. LEONIDA_CE_ARENA_SMALL_ALIGN=N
+            // (e.g. 256) places buffers smaller than 64 KiB at N-byte alignment instead.
+            static const VkDeviceSize small_align = [] {
+                const char* v = std::getenv("LEONIDA_CE_ARENA_SMALL_ALIGN");
+                const unsigned long long n = v ? std::strtoull(v, nullptr, 0) : 0;
+                return VkDeviceSize((n && (n & (n - 1)) == 0 && n <= 65536) ? n : 0);
+            }();
+            const VkDeviceSize align = (small_align && desc_.Width < D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
+                                           ? small_align : VkDeviceSize(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+            if (!device_.arena_allocate(desc_.Width, align, arena_offset_, DeviceState::arena_buffer)) {
                 log_once("GPU address arena full (raise LEONIDA_ARENA_MB); buffer size in KiB:",
                          int(desc_.Width / 1024));
-                return E_OUTOFMEMORY;
+                // HACK (agA11): LEONIDA_CE_ARENA_SPILL=1 gives the buffer its own memory (VA = its device address
+                // minus the arena's, as for upload buffers) instead of refusing it.
+                static const bool spill = [] { const char* v = std::getenv("LEONIDA_CE_ARENA_SPILL"); return v && *v == '1'; }();
+                if (!spill) return E_OUTOFMEMORY;
+                goto own_memory;
             }
             in_arena_ = true;
             std::memset(device_.arena.mapped + arena_offset_, 0, std::size_t(desc_.Width));
@@ -2025,6 +2053,7 @@ public:
             device_.context->add_resource(id(), binding);
             return S_OK;
         }
+    own_memory:
         const bool addressable = device_.arena.buffer != VK_NULL_HANDLE;
         const bool need_bda = device_.info.buffer_device_address || device_.info.ray_tracing;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -10538,6 +10567,30 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                      "[rt] d3d12: no VK_EXT_custom_border_color; custom sampler border colours fall back to transparent black\n");
     }
 
+    // HACK (agA11): LEONIDA_CE_DEVICE_FAULT=1 enables VK_EXT_device_fault, and the first device loss prints what the
+    // driver says faulted (addresses, kinds, vendor codes).
+    static VkPhysicalDeviceFaultFeaturesEXT fault_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    bool want_fault = false;
+    {
+        char fv[8] = {};
+        std::size_t fl = 0;
+        want_fault = getenv_s(&fl, fv, "LEONIDA_CE_DEVICE_FAULT") == 0 && fl > 1 && fv[0] == '1' &&
+                     std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+                         return std::strcmp(e.extensionName, VK_EXT_DEVICE_FAULT_EXTENSION_NAME) == 0;
+                     });
+        if (want_fault) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fault_features};
+            vkGetPhysicalDeviceFeatures2(info.physical, &query);
+            want_fault = fault_features.deviceFault == VK_TRUE;
+            fault_features.deviceFaultVendorBinary = VK_FALSE;
+        }
+        if (want_fault) {
+            fault_features.pNext = *v13.next();
+            *v13.next() = &fault_features;
+        }
+        std::fprintf(stderr, "[hack] device fault reporting: %s\n", want_fault ? "on" : "off");
+    }
+
     // Optional: VK_EXT_external_memory_host lets OpenExistingHeapFromAddress import the caller's committed memory as
     // the heap's backing, so the GPU reads what the CPU writes there without a copy.
     if (std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
@@ -10586,11 +10639,41 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     info.swapchain_colorspace = info.presentation && swapchain_colorspace_enabled;
     if (info.custom_border_color) device_extensions.push_back(custom_border_name);
     if (info.host_pointer_alignment) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    if (want_fault) device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
         return fail("vkCreateDevice failed");
     info.device = owned.device;
+    if (want_fault) {
+        static VkDevice fault_device = VK_NULL_HANDLE;
+        static PFN_vkGetDeviceFaultInfoEXT get_fault = nullptr;
+        fault_device = owned.device;
+        get_fault = reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(vkGetDeviceProcAddr(owned.device, "vkGetDeviceFaultInfoEXT"));
+        if (get_fault) {
+            leonida::device_lost_hook().store(+[] {
+                VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+                VkResult r = get_fault(fault_device, &counts, nullptr);
+                std::fprintf(stderr, "[hack] DEVICE LOST: vkGetDeviceFaultInfoEXT counts -> %d: %u address infos, %u vendor infos\n",
+                             int(r), counts.addressInfoCount, counts.vendorInfoCount);
+                std::vector<VkDeviceFaultAddressInfoEXT> addrs(counts.addressInfoCount);
+                std::vector<VkDeviceFaultVendorInfoEXT> vendors(counts.vendorInfoCount);
+                counts.vendorBinarySize = 0;
+                VkDeviceFaultInfoEXT fi{VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+                fi.pAddressInfos = addrs.empty() ? nullptr : addrs.data();
+                fi.pVendorInfos = vendors.empty() ? nullptr : vendors.data();
+                r = get_fault(fault_device, &counts, &fi);
+                std::fprintf(stderr, "[hack] DEVICE LOST: %d: \"%s\"\n", int(r), fi.description);
+                for (const auto& a : addrs)
+                    std::fprintf(stderr, "[hack]   fault address type %d address 0x%llx precision 0x%llx\n", int(a.addressType),
+                                 (unsigned long long)a.reportedAddress, (unsigned long long)a.addressPrecision);
+                for (const auto& v : vendors)
+                    std::fprintf(stderr, "[hack]   vendor \"%s\" code 0x%llx data 0x%llx\n", v.description,
+                                 (unsigned long long)v.vendorFaultCode, (unsigned long long)v.vendorFaultData);
+                std::fflush(stderr);
+            }, std::memory_order_release);
+        }
+    }
     owned.destroy_device = reinterpret_cast<PFN_vkDestroyDevice>(vkGetDeviceProcAddr(owned.device, "vkDestroyDevice"));
     info.command_queues.resize(command_queue_count);
     const auto get_queue = reinterpret_cast<PFN_vkGetDeviceQueue>(vkGetDeviceProcAddr(owned.device, "vkGetDeviceQueue"));

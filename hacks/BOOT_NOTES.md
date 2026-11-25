@@ -1049,3 +1049,52 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
      (E_FAIL) and the refused BCPack (comp=14, opts 0x0020000e, also slot-descriptor destinations) requests.
   3. BCPack decode (comp=14) is still missing; the account-picker art and later textures depend on it.
 - Recommended env: re19.env (+ DS_DESC default on). SLOT_GUARD=2 and DSCTX_ISOLATE=2 are only tripwires now.
+
+## agA11 (sender gen 11, 2026-11-25)
+- table2 decoded (Definite, disassembly 0x1455aa6a0(slot, page)): table1[slot] bits 20..40 = pool page index;
+  table2[slot] = ((packed[0x1471bfcc0][page/3] >> 21*(page%3)) & 0x1fffff) << 4 = the slot's PHYSICAL page number, i.e.
+  the XMemAllocatePhysicalPages page number (4K frame number of a 64K page; xmem.cpp g_pages key). So an option-bit-21
+  DStorage request is a DMA to physical page table2[slot] at offset low16, independent of any VA mapping. Build 39/40 went
+  via the GPU VA, which is only MEM_RESERVE for slots whose CopyPageMappings has not happened yet -> the 16 NOT WRITTEN.
+- Build 41: rt::xmem::write_page_hook (page_alias.h / xmem.cpp xmem_write_page) + dstorage_x.cpp write_out "phys page"
+  path (first), continuing with table2[slot+1].. when a request crosses 64K; the build-40 VA paths are the fallback
+  (LEONIDA_CE_DS_DESC=2 = VA paths only). comp=14 (BCPack) now zero-filled through the same path with S_OK by default
+  (LEONIDA_CE_DS_ZEROFILL=0 = old E_NOTIMPL). md5 4e297d29.
+- The Quitf at +0x2474606 (Definite, disassembly + re24 regs): 0x142474500 is the title's GPU-hang/device-removed handler;
+  0x144fb0ad0 is a fence wait (monitorx/mwaitx on the fence's completed-value address from vtbl+0x60 = our fence mirror,
+  rdi = 0x1319d690bb8 next to the mirrors logged at 0x1319d690c58) and calls it when the value is UINT64_MAX. Our
+  GetCompletedValue returns UINT64_MAX on device loss (d3d12_com.cpp:1456) - but re26 proved there was NO device loss
+  (see below), so the semaphore itself reached ~0 (a Signal of ~0) or something wrote the mirror. Preceded at t~203 by "GPU address arena full (raise
+  LEONIDA_ARENA_MB)" (275 refused buffers; arena already at the 4094 MiB cap) and one "ExecuteCommandLists failed: invalid
+  subresource". Likely chain (Plausible): arena full -> buffers refused (E_OUTOFMEMORY, the console never fails) -> title
+  uses null/garbage VAs -> GPU fault -> device lost -> Quitf.
+- Build 42 = 41 + "[hack] arena full #k" lines (live MiB by use, free blocks, largest block; 1st and 2^k-th failure) +
+  LEONIDA_CE_ARENA_SPILL=1 (a refused default-heap buffer gets its own VkDeviceMemory, VA = device address - arena base,
+  like upload buffers). md5 3a129e21.
+- BCPack: not ported (tools/bcpack.py is ~1500 lines of rANS + six block rebuilders + tables; a multi-hour port). The
+  comp=14 requests are opts 0x0020000e with no codec bits (0x20/0x40/0x60/0x80 from 0x144ffd520's switch).
+- re25 (build 41, B): Confirm t=116.9. All 15 slot-descriptor requests "written via phys page", 0 NOT WRITTEN, 0 page-path
+  misses; 4 comp=14 zero-filled, 0 request FAILED; still clean (0 foreign/canary/bad handle). => jobs 1 and 3 (safe answer)
+  done (Very likely). BUT the int3 +0x2474606 still fires, earlier (t=173.4), same signature; then exec AVs (0x10e48fd8130,
+  0) and AVs +0x516b8cb, +0x25782ed, +0x5205230. No arena full this time; just before: "bindless image array is full;
+  dimension 3" (= 1D, cap 256; dim 1 = 2D-array, cap 1024, full at boot) and one "ExecuteCommandLists failed: unsupported".
+  Last present f1744, exit 261 s. Screens: navy + ACCOUNT PICKER hint, then flat navy (/root/rb/re25d, re25v).
+- Build 42 (md5 8fc8b46b): LEONIDA_CE_DEVICE_FAULT=1 -> VK_EXT_device_fault on (verified "on" with the NVIDIA RTX 6000 Ada
+  under Wine sk3); leonida::device_lost_hook()/report_device_lost() in src/vulkan_backend.h fire once at the 3 places
+  device_lost_ is set; the hook prints vkGetDeviceFaultInfoEXT description/addresses/vendor codes. Plus arena-full stats
+  and ARENA_SPILL. Handed as re26 (re26.env).
+- re26 (build 42, B): "device fault reporting: on", but NO DEVICE LOST line -> no Vulkan device loss (Very likely; the
+  hook is called at all 3 device_lost_ stores). int3 +0x2474606 at t=256.3, rdi 0x1710cc6dfc8 = the FIRST logged fence
+  mirror (Definite) -> that fence's completed value was UINT64_MAX without a loss. Arena: full at t=197.3 with live
+  1677.6 MiB, 2416 MiB free in 44238 blocks, largest 64 KiB = FRAGMENTATION from 64 KiB alignment of tiny buffers
+  (44974 allocations). 354 refused buffers. 1 slot-descriptor request NOT WRITTEN because table2[slot] = 0 at write time
+  (desc 0xD84789EC0, low 0x5000/0x8000; slot unmapped/released by then) -> request FAILED comp=1 terrain. Confirm t=126.5.
+  Screens unchanged (re26d/re26v).
+- Build 43 (md5 1a49ff43, NOT RUN on the VM yet): LEONIDA_CE_ARENA_SMALL_ALIGN=256 (buffers < 64 KiB at 256-byte
+  alignment) + tracing of who makes a fence ~0 ("[hack] fence mirror .. -> UINT64_MAX", "[hack] fence/queue Signal(..,
+  >=2^48) from <ret>", "[hack] deferred list write of UINT64_MAX"). Wine sk4: state 1 / f600 fine. Handoff: build-43.txt,
+  re27.env.
+- NEXT (agA12): run re27. If a Signal(~0) shows up, decompile its return address (the title may Signal ~0 on purpose
+  while tearing down / on a timeout path; then find why). If the arena still fills, measure live buffers (leak?).
+  table2[slot]==0 requests: park and retry, or answer S_OK and drop. BCPack port still open (tools/bcpack.py).
+- Recommended env: /root/handoff/re27.env with build 43.

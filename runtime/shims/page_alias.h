@@ -28,4 +28,13 @@ inline std::atomic<WritePhysFn>& write_phys_hook() {
     return hook;
 }
 
+// agA11 hack: copies n bytes into physical page `page` (an XMemAllocatePhysicalPages page number = 4K frame number of a
+// 64K page) at byte offset `off` (off + n <= 64 KiB), through the section. False if the page number is unknown.
+using WritePageFn = bool (*)(std::uint64_t page, std::uint64_t off, const void* src, std::uint64_t n);
+
+inline std::atomic<WritePageFn>& write_page_hook() {
+    static std::atomic<WritePageFn> hook{nullptr};
+    return hook;
+}
+
 }  // namespace rt::xmem

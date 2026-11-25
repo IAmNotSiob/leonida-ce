@@ -73,6 +73,7 @@ bool sync_mode() {
 struct Req {
     uint32_t comp;
     uint32_t opts = 0;    // the whole option dword (agA10)
+    uint16_t low16 = 0;    // agA11: low 16 bits of the destination (offset into the first descriptor's 64K page)
     uint64_t desc_va = 0;  // agA10: option bit 21 -> +8 is a pool slot descriptor; the guest address it stands for
     uint8_t* dst;
     uint32_t dst_size;
@@ -104,6 +105,7 @@ Req parse_request(const void* p) {
         const uint64_t gpu = *reinterpret_cast<const volatile uint64_t*>(uintptr_t{0x149e1dad0});
         const uint64_t p = reinterpret_cast<uint64_t>(r.dst);
         const uint16_t low = *reinterpret_cast<const uint16_t*>(rq + 0x10);
+        r.low16 = low;
         if (table2 && gpu && p >= table2 && ((p - table2) & 7) == 0)
             r.desc_va = gpu + (((p - table2) >> 3) << 16) + low;
         else
@@ -229,10 +231,38 @@ bool write_out(const Req& r, const void* data, size_t n, bool zero = false) {
         if (zero) { z.assign(n, 0); data = z.data(); }
         // 1) the physical pages mapped at the GPU-pool address; 2) the same offset in the CPU pool view (agA10 re23:
         // some slots have no GPU-view mapping yet, e.g. 0xc31ae0000); 3) plain committed, writable memory there.
+        // agA11 (THE PAGE PATH): table2[slot] (written by 0x1455aa6a0) = the slot's physical page number, i.e. the
+        // XMemAllocatePhysicalPages page number (4K frame number of a 64K page). The console's DMA writes to that
+        // physical page whether or not any VA maps it yet (re24: 16 targets only MEM_RESERVE at write time). A request
+        // that runs past its page continues with the next descriptor (table2[slot + 1], ...). LEONIDA_CE_DS_DESC=2:
+        // skip this and use only the build-40 VA paths.
+        static const bool page_path = [] { const char* v = std::getenv("LEONIDA_CE_DS_DESC"); return !v || *v != '2'; }();
+        const auto wpage = rt::xmem::write_page_hook().load(std::memory_order_acquire);
+        if (page_path && wpage) {
+            const auto* desc = reinterpret_cast<const volatile uint64_t*>(r.dst);
+            const auto* from = static_cast<const uint8_t*>(data);
+            uint64_t off = r.low16, left = n;
+            bool good = true;
+            for (size_t k = 0; left && good; ++k) {
+                const uint64_t page = desc[k];
+                const uint64_t chunk = (std::min)(left, uint64_t{0x10000} - off);
+                good = page && wpage(page, off, from, chunk);
+                if (!good) {
+                    static std::atomic<int> pt{0};
+                    if (pt++ < 16) std::fprintf(stderr, "[dstorage] page path: desc[%zu] = 0x%llx not a known page (desc %p low 0x%x n %zu)\n",
+                                                k, (unsigned long long)page, (void*)r.dst, r.low16, n);
+                }
+                from += chunk;
+                left -= chunk;
+                off = 0;
+            }
+            if (good) { ok = true; how = "phys page"; }
+        }
         const uint64_t gpu = *reinterpret_cast<const volatile uint64_t*>(uintptr_t{0x149e1dad0});
         const uint64_t cpu = *reinterpret_cast<const volatile uint64_t*>(uintptr_t{0x149e1dac0});
         const uint64_t cva = cpu + (r.desc_va - gpu);
-        if (hook && hook(r.desc_va, data, n)) { ok = true; how = "gpu pages"; }
+        if (ok) {}
+        else if (hook && hook(r.desc_va, data, n)) { ok = true; how = "gpu pages"; }
         else if (hook && cpu && hook(cva, data, n)) { ok = true; how = "cpu pages"; }
         else {
             for (uint64_t va : {r.desc_va, cva}) {
@@ -302,7 +332,7 @@ int32_t run_request(const Req& r) {
             } else {
                 // HACK (agA5): comp 14 = BCPack (ttdb_graphics.ttpf), no runtime decoder yet. LEONIDA_CE_DS_ZEROFILL=1
                 // answers such requests with a zero-filled destination and success instead of E_NOTIMPL.
-                static const bool zero = [] { const char* e = std::getenv("LEONIDA_CE_DS_ZEROFILL"); return e && e[0] == '1'; }();
+                static const bool zero = [] { const char* e = std::getenv("LEONIDA_CE_DS_ZEROFILL"); return !e || e[0] != '0'; }();  // agA11: default on
                 if (zero) {
                     write_out(r, nullptr, dst_size, true);
                     static std::atomic<int> told{0};
