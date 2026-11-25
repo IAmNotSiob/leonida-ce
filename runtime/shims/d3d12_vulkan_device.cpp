@@ -120,6 +120,7 @@ struct CeHeapMirror {
     std::shared_ptr<std::uint8_t[]> shadow;  // last bytes copied to the mirror (compare path)
 };
 static std::atomic<std::uint64_t> g_hm_cmp_pages{0};
+static void ce_pool_rebase(std::uint8_t* p, std::size_t n);  // agA24 POOL_GPU fallback (defined with CePoolGpu)
 // Copies the 4 KiB pages of [off, off+n) that differ from the shadow into the shadow and the mirror; returns bytes copied.
 static std::uint64_t ce_hm_copy_diff(CeHeapMirror& m, std::size_t off, std::size_t n) {
     std::uint64_t c = 0;
@@ -128,6 +129,7 @@ static std::uint64_t ce_hm_copy_diff(CeHeapMirror& m, std::size_t off, std::size
         if (std::memcmp(m.shadow.get() + p, m.title + p, k) == 0) continue;
         std::memcpy(m.shadow.get() + p, m.title + p, k);
         std::memcpy(m.arena + p, m.shadow.get() + p, k);
+        ce_pool_rebase(m.arena + p, k);
         c += k;
     }
     g_hm_cmp_pages.fetch_add(n / 0x1000, std::memory_order_relaxed);
@@ -168,7 +170,7 @@ static void ce_heap_mirror_sync() {
     static const std::size_t roll_n = [] { const char* e = std::getenv("LEONIDA_CE_HEAP_MIRROR_ROLL"); return e ? std::size_t(std::strtoull(e, nullptr, 0)) : std::size_t(32); }();
     std::vector<std::size_t> copy, cmp;
     for (auto& m : g_hm) {
-        if (!m.tracked) { std::memcpy(m.arena, m.title, m.bytes); copied += m.bytes; continue; }
+        if (!m.tracked) { std::memcpy(m.arena, m.title, m.bytes); ce_pool_rebase(m.arena, m.bytes); copied += m.bytes; continue; }
         copy.clear();
         cmp.clear();
         AcquireSRWLockExclusive(&g_hm_track);
@@ -201,6 +203,7 @@ static void ce_heap_mirror_sync() {
             const std::size_t off = i * kHmChunk, n = std::min(m.bytes, off + kHmChunk) - off;
             std::memcpy(m.shadow.get() + off, m.title + off, n);
             std::memcpy(m.arena + off, m.shadow.get() + off, n);
+            ce_pool_rebase(m.arena + off, n);
             copied += n;
         }
         for (const std::size_t i : cmp) {
@@ -410,6 +413,7 @@ static struct CePoolGpu {
     std::uint32_t family = 0;
     std::vector<VkBuffer> pieces;      // agA24 build 84: the window in pieces of `piece` bytes; piece i covers lo + i*piece..
     std::uint64_t piece = 0;
+    std::uint64_t base = 0;            // the VA at buffer offset 0 (lo when placed; the arena end when ADJACENT)
     VkSemaphore timeline = VK_NULL_HANDLE;
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
@@ -427,6 +431,26 @@ static struct CePoolGpu {
     std::atomic<std::uint64_t> refreshes{0};
     std::atomic<std::uint64_t> binds{0}, unbinds{0}, flushes{0}, import_fail{0}, device_bytes{0}, copies{0};
 } g_pool;
+
+// Fallback (LEONIDA_CE_POOL_GPU_REBASE, default 1): when no placement at heap_base + VA works, the window buffer goes where
+// the driver puts it (device D > heap_base) and delta = D - heap_base - LO is added to every qword in the descriptor-heap
+// mirror copies whose top 16 bits are 0 and whose value lies in [LO, END) (raw pool pointers and 48-bit V# bases with stride 0,
+// the rp6 shapes). Raw pointers inside other buffers and CB-embedded ones are NOT reached.
+static std::atomic<std::uint64_t> g_pool_delta{0}, g_pool_rebased{0};
+static void ce_pool_rebase(std::uint8_t* p, std::size_t n) {
+    const std::uint64_t delta = g_pool_delta.load(std::memory_order_relaxed);
+    if (!delta) return;
+    const std::uint64_t lo = g_pool.lo, hi = g_pool.hi;
+    auto* q = reinterpret_cast<std::uint64_t*>(p);
+    std::uint64_t k = 0;
+    for (std::size_t i = 0; i < n / 8; ++i)
+        if (q[i] >= lo && q[i] < hi) { q[i] += delta; ++k; }
+    if (k) {
+        const std::uint64_t t = g_pool_rebased.fetch_add(k, std::memory_order_relaxed) + k;
+        if ((t & (t - 1)) == 0 || t < k * 2)
+            std::fprintf(stderr, "[hack] POOL_GPU rebase: %llu pool-window qwords rewritten in heap mirrors so far\n", (unsigned long long)t);
+    }
+}
 
 static void ce_pool_page_hook(std::uint64_t address, void* host) {
     if (g_pool.mode < 2 || address < g_pool.lo || address >= g_pool.hi) return;
@@ -534,17 +558,17 @@ static void ce_pool_sync() {
                     if (copied.insert(host).second) {
                         if (!copies.empty() && copies.back().first == c->host_buffer &&
                             copies.back().second.srcOffset + copies.back().second.size == offset &&
-                            copies.back().second.dstOffset + copies.back().second.size == va - g_pool.lo)
+                            copies.back().second.dstOffset + copies.back().second.size == va - g_pool.base)
                             copies.back().second.size += 0x10000;
                         else
-                            copies.push_back({c->host_buffer, VkBufferCopy{offset, va - g_pool.lo, 0x10000}});
+                            copies.push_back({c->host_buffer, VkBufferCopy{offset, va - g_pool.base, 0x10000}});
                     }
                 }
                 ++g_pool.binds;
             } else {
                 ++g_pool.unbinds;
             }
-            const VkDeviceSize at = va - g_pool.lo;
+            const VkDeviceSize at = va - g_pool.base;
             if (!binds.empty()) {
                 auto& b = binds.back();
                 if (b.resourceOffset + b.size == at && b.memory == memory && (!memory || b.memoryOffset + b.size == offset)) {
@@ -560,7 +584,7 @@ static void ce_pool_sync() {
             const auto w = g_pool.where.find(host);
             if (w == g_pool.where.end() || w->second.empty()) continue;  // not shown: copied at its next map
             if (const CePoolChunk* c = ce_pool_chunk(host)) {
-                copies.push_back({c->host_buffer, VkBufferCopy{host - c->base, *w->second.begin() - g_pool.lo, 0x10000}});
+                copies.push_back({c->host_buffer, VkBufferCopy{host - c->base, *w->second.begin() - g_pool.base, 0x10000}});
                 ++g_pool.refreshes;
             }
         }
@@ -7047,14 +7071,13 @@ public:
                 : nullptr;
             if (!vk.vkQueueBindSparse || !state_.info.features.sparseBinding || !state_.info.features.sparseResidencyBuffer ||
                 !state_.info.features.sparseResidencyAliased) why = "no sparse buffer support";
-            else if (!ce_capture_replay_enabled()) why = "bufferDeviceAddressCaptureReplay not enabled";
             else if (mode == 2 && !host_props) why = "no VK_EXT_external_memory_host";
             else if (lo < arena.size || hi <= lo || (lo & 0xffff) || (hi & 0xffff) || (chunk & 0xffff) || !chunk ||
                      (state_.info.host_pointer_alignment && chunk % state_.info.host_pointer_alignment)) why = "bad LO/END/CHUNK";
             // Pieces: try one buffer for the whole window, then smaller pieces (LEONIDA_CE_POOL_GPU_PIECES, a comma list of
             // sizes; rq1 on the Windows driver refused the 48 GiB sparse buffer at heap_base + LO). Each failure is logged.
             std::vector<VkBuffer> pieces;
-            std::uint64_t piece = 0;
+            std::uint64_t piece = 0, rebase_delta = 0, adjacent_base = 0;
             if (!why) {
                 std::string sizes = std::getenv("LEONIDA_CE_POOL_GPU_PIECES") ? std::getenv("LEONIDA_CE_POOL_GPU_PIECES")
                                                                                : "0,0x200000000,0x100000000,0x40000000,0x10000000";
@@ -7080,15 +7103,30 @@ public:
                     a.buffer = b;
                     return vk.vkGetBufferDeviceAddress(state_.info.device, &a);
                 };
-                // Diagnostic: can the driver make a sparse buffer this big at all (no placement)?
+                // ADJACENT (build 85): rq2 showed the Windows driver puts an unplaced sparse buffer right after the arena
+                // (0x3ffe10000 = heap_base + arena size) and refuses every opaque capture address it did not hand out. So ask for
+                // one sparse buffer of END - arena size (+ slack): if it starts at heap_base + X with X <= LO and ends at or past
+                // END, heap_base + VA is inside it for every window VA (buffer offset = VA - X). No capture replay, no rewriting.
                 {
-                    VkBuffer probe = VK_NULL_HANDLE;
-                    const VkResult r = make(lo, hi - lo, false, probe);
-                    std::fprintf(stderr, "[hack] POOL_GPU: probe: unplaced sparse buffer of 0x%llx bytes -> %d at 0x%llx\n",
-                                 (unsigned long long)(hi - lo), int(r), probe ? (unsigned long long)address_of(probe) : 0ull);
-                    if (probe) vk.vkDestroyBuffer(state_.info.device, probe, nullptr);
+                    const std::uint64_t slack = 1ull << 30, size = hi - arena.size + slack;
+                    VkBuffer b = VK_NULL_HANDLE;
+                    const VkResult r = make(lo, size, false, b);
+                    const VkDeviceAddress d = b ? address_of(b) : 0;
+                    const bool covers = b && d >= arena.address && d - arena.address <= lo && d - arena.address + size >= hi;
+                    std::fprintf(stderr, "[hack] POOL_GPU: adjacent sparse buffer of 0x%llx bytes -> %d at 0x%llx = heap_base + 0x%llx: %s\n",
+                                 (unsigned long long)size, int(r), (unsigned long long)d,
+                                 (unsigned long long)(d >= arena.address ? d - arena.address : 0), covers ? "COVERS the window" : "does not cover it");
+                    if (covers) {
+                        pieces.push_back(b);
+                        piece = size;
+                        adjacent_base = d - arena.address;
+                    } else if (b) {
+                        vk.vkDestroyBuffer(state_.info.device, b, nullptr);
+                    }
                 }
-                for (std::size_t at = 0; at <= sizes.size() && pieces.empty();) {
+                if (pieces.empty() && !ce_capture_replay_enabled())
+                    std::fprintf(stderr, "[hack] POOL_GPU: bufferDeviceAddressCaptureReplay not enabled: no placed pieces\n");
+                for (std::size_t at = 0; at <= sizes.size() && pieces.empty() && ce_capture_replay_enabled();) {
                     std::size_t comma = sizes.find(',', at);
                     if (comma == std::string::npos) comma = sizes.size();
                     std::uint64_t p = std::strtoull(sizes.substr(at, comma - at).c_str(), nullptr, 0);
@@ -7117,10 +7155,25 @@ public:
                         piece = p;
                     }
                 }
-                if (pieces.empty()) why = "no piece size gave buffers at heap_base + VA (see the piece lines)";
-                else {
+                if (pieces.empty()) {
+                    const char* rb = std::getenv("LEONIDA_CE_POOL_GPU_REBASE");
+                    VkBuffer b = VK_NULL_HANDLE;
+                    if (rb && rb[0] == '0') why = "no piece size gave buffers at heap_base + VA (see the piece lines); REBASE=0";
+                    else if (make(lo, hi - lo, false, b) != VK_SUCCESS) why = "no placement, and the unplaced fallback buffer failed";
+                    else if (address_of(b) <= arena.address + lo || address_of(b) - arena.address - lo >= (1ull << 47)) {
+                        vk.vkDestroyBuffer(state_.info.device, b, nullptr);
+                        why = "no placement, and the unplaced buffer lies below heap_base + LO (cannot rebase)";
+                    } else {
+                        pieces.push_back(b);
+                        piece = hi - lo;
+                        rebase_delta = address_of(b) - arena.address - lo;
+                        std::fprintf(stderr, "[hack] POOL_GPU: no placement; REBASE fallback: window buffer at 0x%llx, heap-mirror "
+                                     "pool qwords get +0x%llx\n", (unsigned long long)address_of(b), (unsigned long long)rebase_delta);
+                    }
+                }
+                if (!pieces.empty()) {
                     sparse = pieces[0];
-                    got = arena.address + lo;
+                    got = adjacent_base ? arena.address + adjacent_base : arena.address + lo + rebase_delta;
                     vk.vkGetBufferMemoryRequirements(state_.info.device, sparse, &sreq);
                     if (!sreq.memoryTypeBits || !sreq.alignment || 0x10000 % sreq.alignment) why = "sparse requirements";
                 }
@@ -7157,6 +7210,8 @@ public:
                 g_pool.family = state_.info.queue_family;
                 g_pool.pieces = pieces;
                 g_pool.piece = piece;
+                g_pool.base = adjacent_base ? adjacent_base : lo;
+                g_pool_delta.store(rebase_delta);
                 g_pool.timeline = timeline;
                 g_pool.pool = cpool;
                 g_pool.cmd = cmd;
@@ -7166,9 +7221,9 @@ public:
                 g_pool.device_type = dtype;
                 g_pool.host_props = host_props;
                 g_pool.mode = mode;
-                std::fprintf(stderr, "[hack] POOL_GPU=%d: window buffer [0x%llx, 0x%llx) at device 0x%llx = heap_base + 0x%llx "
+                std::fprintf(stderr, "[hack] POOL_GPU=%d: window [0x%llx, 0x%llx), buffer at device 0x%llx = heap_base + 0x%llx "
                              "(%zu piece(s) of 0x%llx, sparse alignment 0x%llx, memory types 0x%x -> %u)%s\n", mode, (unsigned long long)lo,
-                             (unsigned long long)hi, (unsigned long long)got, (unsigned long long)lo,
+                             (unsigned long long)hi, (unsigned long long)got, (unsigned long long)(got - arena.address),
                              pieces.size(), (unsigned long long)piece, (unsigned long long)sreq.alignment, sreq.memoryTypeBits, dtype,
                              mode == 2 ? "; mapped pool pages get device-local copies" : "; nothing bound (reads 0, writes dropped)");
                 if (mode == 2) {
