@@ -1657,3 +1657,34 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   cannot be DEVICE_LOCAL+HOST_VISIBLE without ReBAR, so it sits in system RAM, and a 48 GiB GPU runs every buffer access over PCIe.
   NEXT (needs user approval for VM changes): enable ReBAR for the passthrough GPU or raise TdrDelay; code-side: a DEVICE_LOCAL arena
   with host writes staged (largest job), or first time per-submit GPU work with timestamp queries to confirm >2 s submissions.
+- USER APPROVED + APPLIED TdrDelay=60 / TdrDdiDelay=60 on the VM (rebooted 09:30). Receiver gen 14 = ab6cc60c6208b83d3 (runs rmN).
+- rm1 (build 72 + re74, TDR 60 s): boot slow after the reboot (13->0 at 294 s). STILL LOST: Event 153 at ~Confirm +184 s. Presents
+  STOPPED right after the first BVH build (list slot 148 first call, SLOT80 #1), "[hang] no present for 15718 / 30187 ms", then the
+  loss ~60 s later = the new TDR limit. => NOT slow work: the GPU makes no progress at all (a real hang or a wait that never ends).
+  SLOW-WORK THEORY REFUTED (Very likely). Checkpoints direct + 2 compute: cs_d80e80ca (top) / cs_d5613de2 (0x2000); FaultInfo empty.
+- Build 73 (md5 d368a866, 54adace4c): LEONIDA_CE_GPU_TIME=1 (+ _MS threshold): GPU timestamp pair per replayed command buffer on
+  direct/compute queues, read back without waiting; logs slow submissions and per-queue summaries (avg/max per 512).
+- Build 74 (md5 67164d7e, 2770f26f3): WAIT_DUMP (always on): queue Wait/Signal and CPU fence Signal noted per (queue, fence); the hang
+  watch prints every recent wait with the fence completed value and the highest signal issued ("^ BLOCKED - NO signal of that value
+  was ever issued" marks a wait nobody will satisfy). Handed rm3 = build 74 + re82 (GPU_TIME on).
+- Device-local arena (the requested "real fix" for the slow theory) NOT started: rm1 refuted the theory it was meant to fix. Design
+  notes for later (perf, not the loss): CPU writes to the arena come from many places (descriptor heaps written in place, Map() of
+  upload buffers, upload ring written by the title through CPU pointers, heap mirror, shader code, ring sync); a device-local arena
+  needs a host shadow (VirtualAlloc MEM_WRITE_WATCH + VK_EXT_external_memory_host import) and per-submit page uploads limited to
+  CPU-writable allocations, plus readbacks for READBACK-heap buffers; placed buffers imported from title pages stay in system RAM.
+- rm3 (build 74 + re82, TDR 60, last run before the tools agent takes the VM): Confirm 143.0 s. GPU_TIME: direct queue submissions
+  are SHORT - avg 0.03-1.3 ms, max 11-13 ms per 512-submission window, 0 submissions >= 250 ms, up to 11264 timed (no compute-queue
+  summary line: fewer than 512 timed there). => the GPU is not slow per submission; the low fps is CPU-side (Very likely).
+  Hang again right after the first BVH build (slot 148 first call at log line 16159, "[hang] no present for 15312 ms" at 16311).
+  WAIT_DUMP: "0 (queue, fence) waits, 164 signal sources" - the title never calls ID3D12CommandQueue::Wait, so no D3D-level fence
+  wait cycle (Likely). Internal runtime waits (storage-init / bindless-upload / ordered-timestamp semaphores, vkCmdWaitEvents) are
+  not covered by the dump.
+  Between the BVH start and the hang: many GPU-driven INDIRECT DRAWS (args in the big placed-buffer stand-in 0x8c2cdb0 and in
+  0xffdc0400.., all zero at record time, written by the GPU later) with "RECTLIST miss". Indirect draws are NOT covered by
+  INDIRECT_CLAMP (dispatches only): a draw with GPU-written garbage counts (title-VA vs stand-in split, agA20 rk64) could run for
+  minutes => candidate for the hang (Plausible). ri53/54 already saw FE exceptions at the first indirect draw.
+- FOR THE TOOLS AGENT (validation / GPU-AV / sync validation / Aftermath): (1) Aftermath dump of the hang: which draw/dispatch is
+  active on the direct queue after the first BVH build; check indirect DRAW argument values at execution (GPU-AV indirect checks).
+  (2) GPU-AV on the XboxBvhBuilder dispatches (ROOT_SPILL compute signature) and the indirect draws right after them. (3) Sync
+  validation across direct/compute queues around the BVH build (global UAV barrier slot 146 -> GCL7 Barrier). (4) Internal waits:
+  vkCmdWaitEvents (order_timestamp_copy), timeline waits on storage_init / bindless_upload semaphores.
