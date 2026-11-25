@@ -3864,6 +3864,46 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                                      cb ? "yes" : "no", (unsigned long long)prepared_draw.cnt_offset, hs,
                                      a[0], a[1], a[2], int(a[3]), a[4]);
                     if (clamp && have && (a[0] > (1u << 24) || a[1] > (1u << 24))) prepared_draw.skip = true;
+                    // agA20: compare the three places the arguments may be: the stand-in in the arena (what the GPU
+                    // reads), the title CPU memory at its placed VA, and the arena at the title VA (where GPU writes
+                    // through a title VA land). LEONIDA_CE_INDIRECT_SRC=1: read the args from arena[title VA];
+                    // =2: copy the title CPU bytes into the stand-in before the submit; =3: pick 2 when the title bytes
+                    // look like draw args, else 1 when arena[title VA] does, else leave; =4: like 3, but skip the draw
+                    // when no source (stand-in included) looks valid.
+                    static const int src_mode = [] { const char* e = std::getenv("LEONIDA_CE_INDIRECT_SRC"); return e ? std::atoi(e) : 0; }();
+                    std::uint8_t* const A = ::leonida::ce::arena_host().load(std::memory_order_relaxed);
+                    const std::uint64_t AS = ::leonida::ce::arena_bytes().load(std::memory_order_relaxed);
+                    const std::uint64_t tva = draw->ind_title_va;
+                    const VkDeviceSize span = VkDeviceSize(draw->ind_max - 1) * draw->ind_stride + rec;
+                    std::uint32_t s_[5] = {}, t_[5] = {}, g_[5] = {};
+                    const bool s_ok = A && prepared_draw.ind_offset + rec <= AS && (std::memcpy(s_, A + prepared_draw.ind_offset, rec), true);
+                    const bool t_ok = tva && detail::copy_title_bytes(tva, t_, rec);
+                    const bool g_ok = A && tva && tva + span <= AS && (std::memcpy(g_, A + tva, rec), true);
+                    auto plausible = [&](const std::uint32_t* v) {
+                        return (v[0] | v[1]) && v[0] <= (1u << 24) && v[1] <= (1u << 16) && v[2] <= (1u << 26);
+                    };
+                    int used = 0;
+                    if (src_mode) {
+                        const bool want_t = src_mode == 2 || (src_mode >= 3 && t_ok && plausible(t_));
+                        const bool want_g = !want_t && (src_mode == 1 || (src_mode >= 3 && g_ok && plausible(g_)));
+                        if (want_t && A && tva && prepared_draw.ind_offset + span <= AS &&
+                            detail::copy_title_bytes(tva, A + prepared_draw.ind_offset, std::size_t(span))) {
+                            used = 2;
+                        } else if (want_g && g_ok && vk.buffer_at) {
+                            std::uint64_t sz = span;
+                            VkBuffer gb = VK_NULL_HANDLE;
+                            VkDeviceSize go = 0;
+                            if (vk.buffer_at(tva, sz, gb, go) && gb) { prepared_draw.ind_buffer = gb; prepared_draw.ind_offset = go; used = 1; }
+                        }
+                        if (!used && src_mode == 4 && !(s_ok && plausible(s_))) { prepared_draw.skip = true; used = -1; }
+                    }
+                    static std::atomic<int> told_src{0};
+                    if (told_src++ < 48)
+                        std::fprintf(stderr, "[hack] INDIRECT_SRC: %s stand-in@0x%llx %s[%u %u %u %d %u] title@0x%llx %s[%u %u %u %d %u] "
+                                     "arena@title %s[%u %u %u %d %u] -> mode %d used %d\n", draw->indexed ? "indexed" : "draw",
+                                     (unsigned long long)prepared_draw.ind_offset, s_ok ? "" : "(n/a)", s_[0], s_[1], s_[2], int(s_[3]), s_[4],
+                                     (unsigned long long)tva, t_ok ? "" : "(n/a)", t_[0], t_[1], t_[2], int(t_[3]), t_[4],
+                                     g_ok ? "" : "(n/a)", g_[0], g_[1], g_[2], int(g_[3]), g_[4], src_mode, used);
                 }
             }
         }

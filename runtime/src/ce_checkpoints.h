@@ -44,6 +44,15 @@ inline std::atomic<HeapSyncFn>& heap_sync_fn() {
     static std::atomic<HeapSyncFn> f{nullptr};
     return f;
 }
+// agA20 (LEONIDA_CE_INDIRECT_SRC diagnostics): the arena host mapping, for raw reads of GPU-only (DEFAULT) buffers.
+inline std::atomic<std::uint8_t*>& arena_host() {
+    static std::atomic<std::uint8_t*> p{nullptr};
+    return p;
+}
+inline std::atomic<std::uint64_t>& arena_bytes() {
+    static std::atomic<std::uint64_t> n{0};
+    return n;
+}
 inline void checkpoint(VkCommandBuffer cb, std::uint64_t marker) {
     if (auto f = set_checkpoint_fn().load(std::memory_order_relaxed)) f(cb, reinterpret_cast<const void*>(marker));
 }

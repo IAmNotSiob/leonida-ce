@@ -857,6 +857,19 @@ public:
         cmd.argument_offset = argument_buffer_offset;
         cmd.count_buffer = count_buffer ? resource_id(count_buffer) : 0;
         cmd.count_offset = count_buffer ? count_buffer_offset : 0;
+        {  // agA20: is the argument buffer a placed-resource stand-in? Then the title wrote/expects the args at its VA.
+            std::uint64_t pva = 0, psize = 0;
+            const bool placed = rt::d3d12_xs::placed_title_of(argument_buffer, pva, psize);
+            if (placed) cmd.title_va = pva + argument_buffer_offset;
+            static std::atomic<int> told_pl{0};
+            if (told_pl++ < 16) {
+                std::fprintf(stderr, "[hack] INDIRECT_SRC: kind %d args res %p +0x%llx gpu va 0x%llx width 0x%llx: placed %d title va 0x%llx (size 0x%llx)\n",
+                             int(kind), (void*)argument_buffer, (unsigned long long)argument_buffer_offset,
+                             (unsigned long long)argument_buffer->GetGPUVirtualAddress(), (unsigned long long)arg_desc.Width,
+                             int(placed), (unsigned long long)cmd.title_va, (unsigned long long)psize);
+                std::fflush(stderr);
+            }
+        }
         // HACK (agA19, LEONIDA_CE_INDIRECT_DRAW=1, default ON; =0 old path): ri53/54/55 lost the device at the first
         // ExecuteIndirect draw with an NVIDIA FE exception. The old replay emitted vkCmdDraw*Indirect with no
         // rendering scope and no graphics pipeline/root arguments bound (each Draw opens and closes its own scope), so
@@ -1530,6 +1543,7 @@ private:
             draw.ind_stride = ind->stride;
             draw.ind_count_buffer = ind->count_buffer;
             draw.ind_count_offset = ind->count_offset;
+            draw.ind_title_va = ind->title_va;  // agA20
         }
         check(list_.draw(std::move(draw)));
     }

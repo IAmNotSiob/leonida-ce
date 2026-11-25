@@ -451,6 +451,7 @@ struct Draw {
     std::uint32_t ind_max = 0, ind_stride = 0;
     ResourceId ind_count_buffer = 0;
     std::uint64_t ind_count_offset = 0;
+    std::uint64_t ind_title_va = 0;  // agA20 (LEONIDA_CE_INDIRECT_SRC): title VA of the arguments (placed stand-in)
 };
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
@@ -613,6 +614,7 @@ struct ExecuteIndirect {
     // as it is.
     std::uintptr_t pipeline = 0;
     std::array<std::uint32_t, 32> user_data{};
+    std::uint64_t title_va = 0;  // agA20: title VA of the arguments when the buffer is a placed-resource stand-in
 };
 
 // Triangle geometry descriptor for a BLAS build (ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure).

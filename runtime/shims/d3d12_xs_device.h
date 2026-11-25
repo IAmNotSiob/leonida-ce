@@ -96,6 +96,8 @@ bool set_device_adapter_provider(void* device, DxgiAdapterProvider provider);
 // Leonida CE: whether [va, va + bytes) lies in a placed BUFFER the title created (its GPU copy lives in the arena at
 // the same offset; the title writes the bytes at that VA in its own memory).
 bool placed_buffer_holds(std::uint64_t va, std::uint64_t bytes);
+// agA20: the title VA and size of the newest placed-resource record whose stand-in is `resource` (false: none).
+bool placed_title_of(const void* resource, std::uint64_t& va, std::uint64_t& size);
 
 // Creates a descriptor heap whose storage is the title's memory at `console_address` (the console-extended slot 14
 // description, issue #313). The Vulkan layer registers rt::d3d12::create_console_descriptor_heap here; without a

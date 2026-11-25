@@ -5776,6 +5776,13 @@ void set_console_descriptor_heap_factory(ConsoleDescriptorHeapFactory factory) {
     g_console_heap_factory = factory;
 }
 
+bool placed_title_of(const void* resource, std::uint64_t& va, std::uint64_t& size) {
+    std::lock_guard lock(g_placed_mu);
+    for (auto it = g_placed.rbegin(); it != g_placed.rend(); ++it)
+        if (it->resource == resource) { va = it->va; size = it->size; return true; }
+    return false;
+}
+
 bool placed_buffer_holds(std::uint64_t va, std::uint64_t bytes) {
     std::lock_guard lock(g_placed_mu);
     for (const auto& p : g_placed)
