@@ -4248,6 +4248,12 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
         const auto& p = prepared.commands[i];
+        // agA22 LEONIDA_CE_CP_FINE=1: a checkpoint before EVERY command: 0xCE03 | variant index << 32 | command index,
+        // so the device-lost checkpoint dump names the command the queue is stuck in (not only the last pipeline).
+        static const bool cp_fine = [] { const char* e = std::getenv("LEONIDA_CE_CP_FINE"); return e && e[0] == '1'; }();
+        if (cp_fine)
+            ::leonida::ce::checkpoint(command_buffer, 0xCE03000000000000ull | (std::uint64_t(command.index() & 0xffff) << 32) |
+                                                          std::uint64_t(i & 0xffffffffu));
         if (next_query < prepared.queries.size() && prepared.queries[next_query].command == i) {
             emit_query(prepared, prepared.queries[next_query++], command_buffer, vk, predicate);
             continue;

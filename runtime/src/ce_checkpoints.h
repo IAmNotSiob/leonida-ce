@@ -113,7 +113,10 @@ inline void print_checkpoints() {
         for (const auto& d : data) {
             const auto m = reinterpret_cast<std::uint64_t>(d.pCheckpointMarker);
             std::fprintf(stderr, "[hack]   stage 0x%x marker 0x%llx %s\n", unsigned(d.stage), (unsigned long long)m,
-                         (m >> 48) == 0xCE00 ? "(ce marker: list begin = 0xCE00, indirect = 0xCE01 + kind)" : pipeline_name(m).c_str());
+                         (m >> 48) == 0xCE03 ? ("(CP_FINE: before command #" + std::to_string(m & 0xffffffffu) + " of its list, variant index " +
+                                                  std::to_string((m >> 32) & 0xffff) + ")").c_str()
+                         : (m >> 48) == 0xCE00 ? "(ce marker: list begin = 0xCE00 | command count, indirect = 0xCE01 + kind)"
+                                               : pipeline_name(m).c_str());
         }
         std::fflush(stderr);
     }

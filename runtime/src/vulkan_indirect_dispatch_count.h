@@ -12,6 +12,9 @@
 #include <memory>
 #include <vector>
 #include "indirect_dispatch_count_spv.h"
+#include <cstdlib>
+#include <cstdio>
+#include <iterator>
 #include "indirect_dispatch_clamp_spv.h"  // agA21
 
 namespace leonida {
@@ -199,8 +202,20 @@ private:
         VkPipeline clamp_pipeline = VK_NULL_HANDLE;  // agA21
         if (ok) {
             VkShaderModule clamp_module = VK_NULL_HANDLE;
-            shader.codeSize = sizeof(indirect_dispatch_clamp_spirv);
-            shader.pCode = indirect_dispatch_clamp_spirv;
+            // agA22 LEONIDA_CE_INDIRECT_CLAMP_MAX=N: the per-dimension limit (OpConstant %uint 65535, id 0x25) becomes N.
+            std::vector<std::uint32_t> clamp_code(std::begin(indirect_dispatch_clamp_spirv), std::end(indirect_dispatch_clamp_spirv));
+            if (const char* e = std::getenv("LEONIDA_CE_INDIRECT_CLAMP_MAX")) {
+                const std::uint32_t limit = std::uint32_t(std::strtoul(e, nullptr, 0));
+                for (std::size_t w = 0; w + 3 < clamp_code.size(); ++w)
+                    if (clamp_code[w] == 0x0004002bu && clamp_code[w + 1] == 0x0000000du && clamp_code[w + 2] == 0x00000025u &&
+                        clamp_code[w + 3] == 0x0000ffffu && limit) {
+                        clamp_code[w + 3] = limit;
+                        std::fprintf(stderr, "[hack] INDIRECT_CLAMP_MAX: indirect dispatch records with a group count > %u become (0,0,0)\n", limit);
+                        break;
+                    }
+            }
+            shader.codeSize = clamp_code.size() * sizeof(std::uint32_t);
+            shader.pCode = clamp_code.data();
             ok = fn<PFN_vkCreateShaderModule>("vkCreateShaderModule")(device_, &shader, nullptr, &clamp_module) == VK_SUCCESS;
             info.stage.module = clamp_module;
             ok = ok && fn<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(
