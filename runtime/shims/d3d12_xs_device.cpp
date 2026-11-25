@@ -40,6 +40,7 @@
 #include "../src/xg_texture.h"
 #include "rtdiag_probe.h"  // agD hack
 #include "startup_trace.h"  // agA3 hang watch
+#include "../src/ce_checkpoints.h"  // agA21 local_size_fn
 
 #include <windows.h>
 #include <dxgi1_4.h>
@@ -473,6 +474,8 @@ struct XsDeferredWrite { std::uint64_t address, value; unsigned bytes, what; }; 
 std::atomic<IUnknown*> g_placeholder_pso{nullptr};  // slot 57 stand-in (see the HACK there)
 struct XsListExtras { std::vector<XsDeferredWrite> writes; std::vector<std::unique_ptr<std::uint8_t[]>> uploads; };
 std::mutex g_list_extras_mu;
+std::mutex g_list_pso_mu;                          // agA21: last SetPipelineState per console list proxy
+std::map<const void*, std::uint64_t> g_list_pso;
 std::map<const void*, XsListExtras> g_list_extras;  // keyed by the console list proxy
 struct XsPendingWrites { ID3D12Fence* fence; std::uint64_t value; std::vector<XsDeferredWrite> writes; };
 std::vector<XsPendingWrites> g_pending_writes;      // under g_fence_mirror_mu
@@ -2945,6 +2948,7 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
     } else {
         note_list_slot(Slot, a1, a2, a3, a4);
         if constexpr (Slot == 25) {  // HACK diagnostic: which pipelines the title sets (first 12 distinct)
+            { std::lock_guard pl(g_list_pso_mu); g_list_pso[self] = a1; }  // agA21 (slot 80 thread dims)
             static std::mutex m;
             static std::set<std::uint64_t> seen;
             std::lock_guard g(m);
@@ -3000,14 +3004,31 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
             if (on) {
                 static std::atomic<std::uint64_t> calls{0};
                 const std::uint64_t k = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+                // W is the console DISPATCH_INITIATOR: bit 5 USE_THREAD_DIMENSIONS = x, y, z count THREADS (the
+                // hardware masks the partial last group), bit 15 CS_W32_EN. LEONIDA_CE_SLOT80_THREADS (default on)
+                // turns thread counts into group counts with the bound PSO workgroup size.
+                static const bool threads = [] { const char* e = std::getenv("LEONIDA_CE_SLOT80_THREADS"); return !e || e[0] != '0'; }();
+                std::uint64_t g[3] = {a1, a2, a3};
+                std::uint32_t ls[3] = {0, 0, 0};
+                bool sized = false;
+                if (threads && (a4 & 0x20)) {
+                    std::uint64_t pso = 0;
+                    { std::lock_guard pl(g_list_pso_mu); auto it = g_list_pso.find(self); if (it != g_list_pso.end()) pso = it->second; }
+                    if (auto f = ::leonida::ce::local_size_fn().load(std::memory_order_relaxed); f && pso &&
+                        f(reinterpret_cast<const void*>(pso), ls)) {
+                        for (int i = 0; i < 3; ++i) g[i] = (g[i] + ls[i] - 1) / ls[i];
+                        sized = true;
+                    }
+                }
                 if (k <= 4 || (k & (k - 1)) == 0) {
-                    std::fprintf(stderr, "[hack] SLOT80_DISPATCH #%llu from %p: Dispatch(%llu, %llu, %llu) W=0x%llx\n",
+                    std::fprintf(stderr, "[hack] SLOT80_DISPATCH #%llu from %p: (%llu, %llu, %llu) W=0x%llx -> groups (%llu, %llu, %llu)%s ls %u,%u,%u\n",
                                  (unsigned long long)k, _ReturnAddress(), (unsigned long long)a1, (unsigned long long)a2,
-                                 (unsigned long long)a3, (unsigned long long)(a4 & 0xffffffffull));
+                                 (unsigned long long)a3, (unsigned long long)(a4 & 0xffffffffull), (unsigned long long)g[0],
+                                 (unsigned long long)g[1], (unsigned long long)g[2], sized ? " thread-dims" : "", ls[0], ls[1], ls[2]);
                     std::fflush(stderr);
                 }
-                if (a1 && a2 && a3 && a1 <= 65535 && a2 <= 65535 && a3 <= 65535)
-                    self->real->Dispatch(static_cast<UINT>(a1), static_cast<UINT>(a2), static_cast<UINT>(a3));
+                if (g[0] && g[1] && g[2] && g[0] <= 65535 && g[1] <= 65535 && g[2] <= 65535)
+                    self->real->Dispatch(static_cast<UINT>(g[0]), static_cast<UINT>(g[1]), static_cast<UINT>(g[2]));
                 return 0;
             }
         }

@@ -457,6 +457,7 @@ static void ce_ptr_check(const std::uint32_t* s, std::uint32_t vm, std::uint32_t
 }
 
 namespace rt::d3d12 {
+bool ce_pipeline_local_size(const void* pso, std::uint32_t out[3]);  // agA21
 namespace {
 
 // Every descriptor slot is this many bytes; an RTV or DSV slot holds a leonida::TargetView. The console's own
@@ -4129,6 +4130,7 @@ public:
     bool compute() const { return registered_ && !is_graphics_; }
     bool graphics() const { return registered_ && is_graphics_; }
     const std::vector<leonida::SubgroupRequest>& subgroup_requests() const { return subgroup_requests_; }
+    const std::array<std::uint32_t, 3>& cs_local_size() const { return cs_local_size_; }  // agA21
 
     // A VS (+ GS) (+ PS) pipeline for dynamic rendering. Vertex input comes from the input layout matched to the
     // VS's input signature by semantic name and index: location = the element's register, the translator's rule
@@ -4999,6 +5001,7 @@ public:
         pipeline_info.stage.pName = "main";
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
         subgroup_size_for(*entry, required_size, pipeline_info.stage);
+        cs_local_size_ = entry->local_size;  // agA21
         pipeline_info.layout = pipeline_.layout;
         // HACK (Leonida CE boot): some translated compute programs (ray-traced shadow traces, strand interpolation)
         // take the host driver minutes to compile, or longer, and the title creates pipelines on its job workers: a
@@ -5378,6 +5381,7 @@ private:
     bool registered_ = false;
     bool is_graphics_ = false;
     std::vector<leonida::SubgroupRequest> subgroup_requests_;  // one per stage, in creation order
+    std::array<std::uint32_t, 3> cs_local_size_{0, 0, 0};  // agA21: compute workgroup size (0 = unknown)
     leonida::cached_pso::Key cache_key_;
 };
 
@@ -6633,6 +6637,7 @@ public:
         }
         std::fprintf(stderr, "[hack] arena: device address 0x%llx size 0x%llx (console VA 0 = this address)\n",
                      (unsigned long long)arena.address, (unsigned long long)arena.size);
+        leonida::ce::local_size_fn().store(&ce_pipeline_local_size);  // agA21
         if (const char* pc = std::getenv("LEONIDA_CE_PTR_CHECK"); pc && pc[0] >= '1' && pc[0] <= '9') {  // agA16
             g_pc_mapped = arena.mapped;
             g_pc_size = arena.size;
@@ -10244,6 +10249,14 @@ std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline) {
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline) {
     const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
     return p && p->graphics() ? p->id() : 0;
+}
+
+bool ce_pipeline_local_size(const void* pso, std::uint32_t out[3]) {  // agA21
+    if (!pso) return false;
+    const PipelineState* p = PipelineState::from<PipelineState>(reinterpret_cast<ID3D12PipelineState*>(const_cast<void*>(pso)));
+    if (!p || !p->compute() || !p->cs_local_size()[0]) return false;
+    for (int i = 0; i < 3; ++i) out[i] = p->cs_local_size()[i] ? p->cs_local_size()[i] : 1;
+    return true;
 }
 
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline) {

@@ -39,6 +39,12 @@ inline std::atomic<PtrCheckFn>& ptr_check_fn() {
     static std::atomic<PtrCheckFn> f{nullptr};
     return f;
 }
+// agA21 (LEONIDA_CE_SLOT80_DISPATCH): the workgroup size of a compute PSO of this device (false if unknown).
+using LocalSizeFn = bool (*)(const void* pso, std::uint32_t out[3]);
+inline std::atomic<LocalSizeFn>& local_size_fn() {
+    static std::atomic<LocalSizeFn> f{nullptr};
+    return f;
+}
 // HACK (agA17, LEONIDA_CE_HEAP_MIRROR): copies mirrored console descriptor heaps into the arena (ExecuteCommandLists).
 using HeapSyncFn = void (*)();
 inline std::atomic<HeapSyncFn>& heap_sync_fn() {
