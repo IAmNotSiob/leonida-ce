@@ -1630,3 +1630,24 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   IndexBuffer, Transform3x4, AABBs.StartAddress, instance descs) from title VA to the placed buffer stand-in arena VA
   (xs_placed_buffer_va), docs/xdxr.md + d3d12_command_objects.md 3.3b have the layouts. TLAS instance descs hold BLAS addresses in
   GPU memory (written by the title) - those need the same translation (CPU pass over the instance buffer, or identity placement).
+- rl78 (build 71 + re78, DISPATCH_LOG): Confirm 177.8 s, LOST 130 s after Confirm; 12 DISPATCH_LOG lines, largest 65536 groups, none
+  for the checkpoint shaders => no giant direct dispatch (Likely). FaultInfo 332 IP-only records in one 8 KiB code range.
+- rl79 (build 72 + re79, SKIP_BVH=1): builder dispatches dropped (slot 14 callers 0x180021057/1cba2/209af/1d3e7/1bdb8, slot 80
+  0x1800149c0/153ba/15263, >1024 each). STILL LOST, 164 s after Confirm (later than the 130-148 s of the other runs, 1 run). Between
+  the first builder call and the loss the game now records ~40 new world-render compute passes (DISPATCH_LOG: 160x90, 320x180,
+  40x23x17 froxels, 23400/57600-group 1-D passes) => the BVH build is NOT the cause either (Likely); the loss follows whatever heavy
+  GPU work starts when the world load completes. Probe target0 changed tint (ff2e1e23 vs navy ff2c2020); screen still dark navy.
+- EVERY checkpoint shader of every run is loop-free (d80e80ca, d5613de2, c5b1005e, f39d1d8b, 4ae22e7a, 956fdcc6, 00f50ab8, 752cc8dc,
+  344692c2, cee65a2d, edc5d4c7, a039b209: 0 backward branches in the disasm). With no giant dispatch (rl78) and no bad descriptors
+  (rl77), a true hang is hard to explain.
+- NEW THEORY (Plausible): a TDR from SLOW work, not a hang. The arena (every buffer, heap mirror, upload ring) is ONE 4 GiB
+  HOST_VISIBLE|COHERENT allocation (d3d12_vulkan_device.cpp ~6621, DEVICE_LOCAL only preferred) and the VM GPU has no Resizable BAR
+  ("upload heaps in system memory (no Resizable BAR)"), so all buffer traffic goes over PCIe from system RAM. Pace is already 4-8 fps
+  on a loading screen; when world rendering starts, one submission can exceed the 2 s TDR => Event 153, IP-only FaultInfo, all
+  busy queues sitting in ordinary shaders, ~constant time after Confirm (= load time).
+  Tests (not done; need the user): raise TdrDelay/TdrDdiDelay in the VM (HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers,
+  then reboot) - my request to the receiver for this VM registry change was refused by the permission classifier, so it needs the
+  user's OK; or enable Resizable BAR for the passthrough GPU. Code-side: an arena whose GPU-only part is DEVICE_LOCAL (split CPU-
+  written ranges - upload ring, heap mirror - into a small host-visible region and keep the rest device-local, with staging copies
+  for CPU writes), or measure per-submit GPU time with timestamp queries first.
+- Recommended env: build 72 (default switches = build 68 behaviour + diagnostics off) + /root/handoff/re74.env (= re69).
