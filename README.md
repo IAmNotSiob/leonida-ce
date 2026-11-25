@@ -1,3 +1,21 @@
+# Leonida CE
+
+> [!CAUTION]
+> **WE DON'T HAVE AN OFFICIAL DISCORD OR WEBSITE. PEOPLE CLAIMING WE DO ARE FAKES.**
+
+**Leonida CE is now based on [VIctory](https://github.com/Marvisak/VIctory) by Marvisak and the VIctory
+contributors.** VIctory gets much further than our own runtime did (it reaches the prologue), so from 2026-11-25
+`main` follows VIctory's history and Leonida CE's work continues on top of it: NVIDIA testing and fixes, Linux
+(Wine with vkd3d-proton), and debugging tooling.
+
+The previous Leonida CE runtime (static recompilation on a D3D12-to-Vulkan runtime, which reaches the legal terms
+screen) is preserved unchanged on the [`legacy`](https://github.com/IAmNotSiob/leonida-ce/tree/legacy) branch;
+`first-light` and `experimental` also build on it.
+
+Everything below is VIctory's own README. VIctory is licensed under GPL-3.0-or-later, as was Leonida CE.
+
+---
+
 # VIctory
 
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
