@@ -1272,3 +1272,90 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
 - Handed re40 = re36 + VA_GUARD=cs_bedf0201,cs_25d19264,cs_87dac0f8,cs_1bc231e4,cs_e8c1251e,cs_c5b1005e,cs_f33ac9e9 (result pending).
 - Recommended env now: build 53 + /root/handoff/re40.env. NEXT: model the root-argument spill (the real cause of the
   post-Confirm fspx faults, Likely); then the one-colour navy screen (try CXFORM_FORCE=1; per-draw dumps of the 189-draw target).
+
+## agA15 (sender gen 15, 2026-11-25)
+- re40 (build 53, VA_GUARD on 7 shaders, B): Confirm t=130.5; loss t~196-199 (66 s after Confirm) in NEW fspx cs_86e6e299 on a
+  DIRECT queue, READ_INVALID 0x28fea0f000 (arena 0x300010000 + ~152 GiB: inside the 256 GiB VA_GUARD window, so a guard would
+  not catch it). Again right after the first "SetComputeRootSignature(signature that does not fit the compute layout)". The 24
+  "ExecuteCommandLists failed: unsupported" lines come AFTER the loss (re36 as well); "list is invalid; refusing batch" was never
+  printed in any run. Screens: picker, flat black, flat navy (re37 the same).
+- The unfit signature (Definite, Wine so1 log): 8 root views then one 14-dword constant parameter (8V + C14). Console layout:
+  V@s4..s18 fits (28 SGPRs), C14 does not. pack() (from s0) fits it, so it was "graphics only"; bound for compute, every compute
+  offset was kNoSgpr -> ALL root data dropped (zero) + list marked invalid.
+- Census (index.json, user_sgpr_reads): no game (26,503) or fspx (1,536) compute shader reads s0..s3 as a pointer; max read s13.
+  So the spill array is never read by translated game shaders (Very likely); only the inline part matters. (bvh/ = driver BVH
+  shaders read s[0:1] as their own table, unrelated.)
+- Build 54 (md5 7ec3077f): LEONIDA_CE_ROOT_SPILL (default ON, =0 old refusal). d3d12_vulkan_device.cpp CreateRootSignature:
+  when pack_stage(Compute) refuses, lay out the console spill layout (parameters inline from s4 while each fits, the first that
+  does not and all after it packed into a spill array: constant 4 B, root view 8 B, table 4 B (table size NOT measured)).
+  RootArgumentLayout::Parameter.compute_spill / RootArgumentLayout.compute_spill_dwords (d3d12_com.h). d3d12_com.cpp:
+  RootState.spill, put() routes a parameter dword inline or to the spill array, finish_spill() on Dispatch and indirect dispatch
+  copies the array into the console upload ring (rt::d3d12_xs::upload_snapshot) and puts its 40-bit VA in s[0:1].
+  Logs "[hack] ROOT_SPILL: compute signature spills N dwords behind s[0:1]: <shape>" and "...dispatch #N ...".
+  Wine so1: signature accepted ("V@s4 ... V@s18 C14@spill+0"), no "usable for graphics only", no validation errors; Wine does not
+  reach Confirm in 150 s.
+- Handed re42.env (build 54; = re40 without LOOP_CAP/SKIP_UNFIT/VA_GUARD, + ROOT_SPILL=1, rtdump62), re43.env (+LOOP_CAP).
+- re42 (build 54, no LOOP_CAP): spill signature created, 0 "dispatch #N" lines before the loss (cs_f33ac9e9 hang again, type-4
+  faults, ~65 s after Confirm). re43 (+LOOP_CAP): spill WORKS (512+ "ROOT_SPILL: dispatch", ring VAs 0xc49800..), no "does not fit",
+  but STILL a loss at t~184 (69 s after Confirm): direct queue cs_86e6e299 (top=bottom), compute queue bottom cs_e8c1251e, READ_INVALID
+  0xd0d80f000. => the missing spill was NOT the cause of the losses (Very likely); it only coincides with the same phase.
+- Trigger (Likely): in every lost run, the loss follows within ~1-8 s the scripted PRESS 12 / PRESS 0 that follows the 8th
+  A press after Confirm (re34 205.2, re36 190.2, re40 195.5, re42 193.9, re43 ~181-189). The scripted menu input starts a new phase
+  (world load / story start) whose fspx passes fault. re37 (no loss up to t=205) made no press after t=169.
+- cs_e8c1251e (bindless) was in flight on the compute queue in re35/re40/re43. It loads 64-bit pointers from buffers (s_load from
+  s[42:43]). LEAD (Plausible): the title stores console GPU VAs from its physical pool in GPU-visible data. The log says "pool cpu
+  1800e0000 size 600000000 gpu 7800e0000" (re43; in re40 gpu a32000000). re43: fault VA 0xd0d80f000 minus
+  heap_base 0x300010000 = 0xa0d7ff000, INSIDE that pool's GPU range: a title GPU-pool pointer the arena does not map
+  (re40's 0x25ea9ff000 is not in its range, so this is not the whole story).
+  Next: check whether pool-GPU VAs can be mapped (the arena is only 4 GiB, the pool 24 GiB), or translate them in VA_GUARD
+  (va in [pool_gpu, pool_gpu+size) -> the matching arena VA, if the pool's CPU side is mirrored there).
+- re44.env (build 54) = re43 + SKIP_CS=cs_e8c1251e80f7e330 + CXFORM_FORCE=1 (rtdump64), with B.
+- re44 (build 54, re43 + SKIP_CS=cs_e8c1251e + CXFORM_FORCE=1): Confirm t=113.9; loss t~179.5 (66 s after Confirm), right after
+  PRESS 12 (#7). Direct queue top cs_00f50ab8 / bottom cs_d9ea3225, compute queue cs_a039b209; READ_INVALID 0x748b80f000.
+  The low bits match across runs: re35 0xd0c680f000, re43 0xd0d80f000, re44 0x748b80f000 all end in ...80f000. That points to ONE bad
+  pointer source (same offset 0x80f000 into differently based blocks) read by whichever shader runs, not to per-shader bugs
+  (Plausible). Skipping shaders one by one will not converge. Next: find what holds base+0x80f000. Log every DEFAULT/placed buffer
+  whose title VA or arena VA is near such an address, or dump the 64-bit pointers cs_e8c1251e reads (s[42:43]) via a debug
+  printf / readback.
+  CXFORM_FORCE: 6 lines, all before Confirm; post-Confirm frames are still flat navy (re44_frames: 8 picker, 16 black, 18 navy).
+- Recommended env now: build 54 + /root/handoff/re43.env (spill + LOOP_CAP); add SKIP_CS=cs_e8c1251e80f7e330 if wanted. ROOT_SPILL
+  stays default ON (correct per the console layout, verified working on Windows; harmless).
+
+## agA16 (sender gen 16, 2026-11-25)
+- ri45 (B; build 54, re45.env = re43 with PRESS trimmed to A@s3+20/15x4,DOWN@s3+27/15x3): Confirm t=112.4, last press t=128.2 (3 presses after
+  Confirm), DEVICE LOST t~176 = 64 s after Confirm and 48 s after the last press. => hypothesis (b) "a press triggers it" DROPPED (Likely): the
+  loss is tied to Confirm + ~65 s, not to the presses. Checkpoints: cs_86e6e299 (direct + compute), cs_c5b1005e (compute). READ_INVALID
+  0x50700010000 = EXACTLY the re36 address. Screens unchanged (navy+hint, gray 17, flat navy 32,32,44 after Confirm).
+- Fault addresses form two families: 0x50700010000 (re36, ri45) and ...80f000 (re35 0xd0c680f000, re43 0xd0d80f000, re44 0x748b80f000; re40
+  0x28fea0f000). As VA (minus arena 0x300010000): 0x504_0000_0000 exactly, or the last 4K page below a 2 MiB boundary (...7ff000/...9ff000).
+  None is an arena CPU pointer (arena cpu 0x25DF5240000 etc. per run), none lies in the title pool windows (re43 pool gpu a32000000).
+- cs_86e6e299 (disasm, 42 lines): table at s4 (1 dword); T#s at table+0x00..0x7f (image_store only), CB V# at table+0x80 (slot 4), one
+  s_buffer_load_dwordx2 at CB+0x18. Its only memory reads are the table and that CB => the 0x50700010000 READ is the CB V# base
+  (d0=0, d1&0xffff=0x504, num_records>0 since translated s_buffer_loads are bounded) (Likely). Either a garbage descriptor in the slot, or a
+  V# to an own-memory buffer (VA = devaddr - arena) that was freed (0x507_0001_0000 is a plausible VkBuffer device address) (Plausible).
+- Build 55 (md5 2eb29e5b): LEONIDA_CE_PTR_CHECK=1|2 (d3d12_vulkan_device.cpp ce_ptr_check; hook leonida::ce::ptr_check_fn in ce_checkpoints.h,
+  called from vulkan_replay.h prepare() for every Dispatch; Dispatch.ce_view_mask/ce_table_mask (command_list.h) filled in d3d12_com.cpp
+  record_dispatch from the root layout). Scans root views, the first 32 slots of each table (V# bases; T# at 2) and at 2 the first 1 KiB of
+  reachable in-arena buffers for pointer-like qwords; anything >= arena size that va_known() does not know is logged with a class and "dev"
+  (= fault-comparable device address). Wine sp1/sp2 fine (Wine scans only a handful of dispatches before Confirm).
+- Lead (Plausible): PLACED_EVICT/PLACED_CAP release stand-ins (arena census: ~56k arena buffers freed by the loss) whose descriptors the title
+  may still use; their arena ranges get reused -> garbage V#s/pointers. Env-only test re48 = re46 without EVICT/CAP.
+- ri46 (build 55, PTR_CHECK=2): DEADLOCK before state 3. ce_ptr_check runs in replay prepare(), which holds resource_mutex_ shared;
+  va_known() locked it shared again behind a waiting writer (CreateCommittedResource -> add_resource). ri47 (level 1) hung the same way.
+  Build 56 (md5 dbd1235d): VulkanContext::va_known_locked (no lock), used by the check.
+  ri46 data before the hang: cs_87dac0f8 s5 tables hold HOST STACK/heap garbage; one slot = [00000014 07060504 00000003 000002aa] =
+  V# base 0x504_0000_0014 -> dev 0x50700010014 = EXACTLY the re36/ri45 READ_INVALID (family A explained, Very likely).
+- ri49 (build 56, re49 = PTR_CHECK=2, EVICT/CAP on): Confirm t=114.0, loss ~t 137-154, checkpoint (direct) = cs_87dac0f8, READ_INVALID
+  0x8aa4020d000. 400 PTR_CHECK lines (cap hit), ALL from cs_87dac0f8 (209), cs_25d19264 (105), cs_1bc231e4 (86) = the re30/re31/re32 faulters.
+  The slots cs_87dac0f8 really reads (T# slot 0, CBVs slot 2/3 at +0x40/+0x60) hold FLOATS (3f79f9fe x3, 3f800000), and cs_1bc231e4 slot 2
+  holds (1.0,-1.0,0,ffffffff,..). => the s5 descriptor-table VA points at memory that is NOT a descriptor table (constants/stack copies) -
+  the ONE bad pointer source is the s5 table pointer of these fspx dispatches (Very likely), not the descriptors themselves.
+  Table VAs 0x306af4a0..0x31acd340 step 0x20000-0x40000 (a ring). Candidates: compute tables keep only the LOW DWORD of the VA
+  (d3d12_com.cpp address(): one_dword_table) -> a title table above 4 GiB is truncated into an unrelated arena range; or the title's
+  transient descriptor ring is not copied into the arena before the dispatch runs (ring/snapshot timing).
+- Build 57 (md5 607c9c9c): logs "PTR_CHECK: compute table N VA 0x.. does not fit 32 bits" (first 32). Handed ri50 = build 57 + re50.env.
+  ri48 (build 56, EVICT/CAP off) was running at hand-back.
+- NEXT: from ri50, if tables >4 GiB: translate them (xs_va_from_cpu on the table handle in the proxy, or keep tables in the arena).
+  If not: find who writes the ring at 0x30xxxxxx-0x31xxxxxx (log the slot-14/CopyDescriptors destinations around those VAs and the
+  title SetComputeRootDescriptorTable handles for cs_87dac0f8); compare to the title handle before translation.
+- Recommended env: build 54/56 + re43.env (no PTR_CHECK; it slows boot). Press theory (b) dropped.

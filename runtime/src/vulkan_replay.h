@@ -3694,6 +3694,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!pipeline || !pipeline->pipeline) { static bool told_ = false; if (!told_) { told_ = true; std::fprintf(stderr, "[hack] replay: unresolved resource at vulkan_replay.h:%d (command %zu of %zu)\n", __LINE__, i, commands.size()); } return ReplayResult::unresolved_resource; }
             if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
             p.pipeline = *pipeline;
+            if (auto f = ::leonida::ce::ptr_check_fn().load(std::memory_order_relaxed))  // agA16
+                f(dispatch->user_data.data(), dispatch->ce_view_mask, dispatch->ce_table_mask,
+                  reinterpret_cast<std::uint64_t>(pipeline->pipeline));
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
             if (out.draw_count == out.draws.size()) out.draws.emplace_back();
             auto& prepared_draw = out.draws[out.draw_count];

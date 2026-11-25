@@ -93,6 +93,134 @@ static void ce_arena_tally_report() {
     std::fprintf(stderr, "\n");
 }
 
+// HACK (agA16): LEONIDA_CE_PTR_CHECK=1|2. Six post-Confirm device losses (re35..re44) were READ_INVALIDs at device
+// addresses far outside the arena, in a different fspx compute each time. Before the replay records a dispatch, this
+// scans what the shader will see: its root views (64-bit VAs), the V#s (and, at 2, T#s) of the first
+// LEONIDA_CE_PTR_CHECK_SLOTS (default 32) slots of each descriptor table, and (at 2) the first 1 KiB of every in-arena
+// buffer those reach for qwords that look like 40/48-bit pointers. Anything outside the arena that no buffer holds
+// is logged once per (shader, source, 1 MiB of address) with a class: arena-cpu (a title CPU pointer into the arena),
+// pool-cpu / pool-gpu (the title texture pool windows [0x149e1dac0] / [0x149e1dad0]), page-pool ([0x1471bfaa8]), else
+// other. Counters at the end of each burst: "[hack] PTR_CHECK: N dispatches scanned, M bad".
+#include <set>
+static std::uint8_t* g_pc_mapped = nullptr;
+static std::uint64_t g_pc_size = 0;
+static std::uint64_t g_pc_dev = 0;
+static leonida::VulkanContext* g_pc_ctx = nullptr;
+static int g_pc_level = 0;
+static std::uint32_t g_pc_slots = 32;
+static std::mutex g_pc_mu;
+static std::set<std::uint64_t> g_pc_seen;
+static std::unordered_map<std::uint64_t, std::uint64_t> g_pc_per_pipe;
+static int g_pc_lines = 0;
+static std::atomic<std::uint64_t> g_pc_dispatches{0}, g_pc_bad{0};
+
+static std::uint64_t ce_pc_read_title(std::uint64_t at) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(reinterpret_cast<const void*>(at), &mbi, sizeof mbi) || mbi.State != MEM_COMMIT ||
+        (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+        return 0;
+    return *reinterpret_cast<const volatile std::uint64_t*>(at);
+}
+static const char* ce_pc_class(std::uint64_t v, std::uint64_t& rel) {
+    const std::uint64_t m = reinterpret_cast<std::uint64_t>(g_pc_mapped);
+    rel = 0;
+    if (v >= m && v - m < g_pc_size) { rel = v - m; return "arena-cpu"; }
+    const std::uint64_t pcpu = ce_pc_read_title(0x149e1dac0ull), psz = ce_pc_read_title(0x149e1dac8ull),
+                        pgpu = ce_pc_read_title(0x149e1dad0ull), ppool = ce_pc_read_title(0x1471bfaa8ull);
+    if (pcpu && v >= pcpu && v - pcpu < psz) { rel = v - pcpu; return "pool-cpu"; }
+    if (pgpu && v >= pgpu && v - pgpu < psz) { rel = v - pgpu; return "pool-gpu"; }
+    if (ppool && v >= ppool && v - ppool < 99776ull * 65536) { rel = v - ppool; return "page-pool"; }
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (v < (1ull << 47) && VirtualQuery(reinterpret_cast<const void*>(v), &mbi, sizeof mbi) && mbi.State == MEM_COMMIT) {
+        rel = v - reinterpret_cast<std::uint64_t>(mbi.AllocationBase);
+        return "host-committed";
+    }
+    return "other";
+}
+// Called from replay prepare(), which holds resource_mutex_ shared (va_known would lock it again: ri46 deadlock).
+static bool ce_pc_bad(std::uint64_t va) { return va >= g_pc_size && !g_pc_ctx->va_known_locked(va); }
+static void ce_pc_report(std::uint64_t pipe, const char* what, unsigned sgpr, unsigned slot, std::uint64_t at,
+                         std::uint64_t v, const std::uint32_t* words, unsigned nwords) {
+    ++g_pc_bad;
+    const std::uint64_t key = (pipe * 0x9e3779b97f4a7c15ull) ^ (std::uint64_t(sgpr) << 56) ^ (std::uint64_t(slot) << 44) ^
+                              (v >> 20) ^ (std::uint64_t(reinterpret_cast<std::uintptr_t>(what)) << 32);
+    {
+        std::lock_guard lock(g_pc_mu);
+        if (g_pc_lines >= 400 || !g_pc_seen.insert(key).second) return;
+        ++g_pc_lines;
+    }
+    std::uint64_t rel = 0;
+    const char* cls = ce_pc_class(v, rel);
+    char wbuf[128] = {};
+    int o = 0;
+    for (unsigned i = 0; i < nwords && o < 110; ++i) o += std::snprintf(wbuf + o, sizeof wbuf - o, " %08x", words[i]);
+    std::fprintf(stderr, "[hack] PTR_CHECK: %s %s s%u slot %u at VA 0x%llx: 0x%llx (%s +0x%llx) dev 0x%llx [%s ]\n",
+                 leonida::ce::pipeline_name(pipe).c_str(), what, sgpr, slot, (unsigned long long)at,
+                 (unsigned long long)v, cls, (unsigned long long)rel, (unsigned long long)(g_pc_dev + v),
+                 wbuf);
+    std::fflush(stderr);
+}
+// Pointer-looking qwords in the first bytes of an in-arena buffer.
+static void ce_pc_scan_buffer(std::uint64_t pipe, unsigned sgpr, unsigned slot, std::uint64_t va, std::uint64_t bytes) {
+    if (!va || va >= g_pc_size) return;
+    bytes = (std::min)(bytes, std::uint64_t(1024));
+    bytes = (std::min)(bytes, g_pc_size - va);
+    const auto* q = reinterpret_cast<const std::uint64_t*>(g_pc_mapped + (va & ~7ull));
+    for (std::uint64_t i = 0; i < bytes / 8; ++i) {
+        const std::uint64_t v = q[i];
+        const std::uint32_t hi = std::uint32_t(v >> 32);
+        if (hi == 0 || hi > 0xffff || (v & 7)) continue;
+        if (!ce_pc_bad(v)) continue;
+        const std::uint32_t w[2] = {std::uint32_t(v), hi};
+        ce_pc_report(pipe, "qword in buffer", sgpr, slot, (va & ~7ull) + i * 8, v, w, 2);
+    }
+}
+static void ce_ptr_check(const std::uint32_t* s, std::uint32_t vm, std::uint32_t tm, std::uint64_t pipe) {
+    if (!g_pc_ctx || !g_pc_mapped) return;
+    const std::uint64_t n = ++g_pc_dispatches;
+    bool deep = g_pc_level >= 2;
+    if (deep) {
+        std::lock_guard lock(g_pc_mu);
+        const std::uint64_t k = ++g_pc_per_pipe[pipe];
+        deep = k <= 64 || (k & 63) == 0;
+    }
+    for (unsigned b = 0; b < 31; ++b) {
+        if (!(vm >> b & 1)) continue;
+        const std::uint64_t va = s[b] | (std::uint64_t(s[b + 1]) << 32);
+        if (!va) continue;
+        if (ce_pc_bad(va)) ce_pc_report(pipe, "root view", b, 0, 0, va, s + b, 2);
+        else if (deep) ce_pc_scan_buffer(pipe, b, 0, va, 1024);
+    }
+    for (unsigned b = 0; b < 32; ++b) {
+        if (!(tm >> b & 1)) continue;
+        const std::uint64_t va = s[b];
+        if (!va) continue;
+        if (va >= g_pc_size) { ce_pc_report(pipe, "table outside arena", b, 0, 0, va, s + b, 1); continue; }
+        for (std::uint32_t k = 0; k < g_pc_slots; ++k) {
+            const std::uint64_t at = va + std::uint64_t(k) * 32;
+            if (at + 32 > g_pc_size) break;
+            std::uint32_t d[8];
+            std::memcpy(d, g_pc_mapped + at, sizeof d);
+            if (!(d[0] | d[1] | d[2] | d[3])) continue;
+            if ((d[3] >> 30) == 0) {  // buffer V#
+                const std::uint64_t base = d[0] | (std::uint64_t(d[1] & 0xffff) << 32);
+                if (!base || !d[2]) continue;
+                if (ce_pc_bad(base)) ce_pc_report(pipe, "table V#", b, k, at, base, d, 4);
+                else if (deep) {
+                    const std::uint32_t stride = (d[1] >> 16) & 0x3fff;
+                    ce_pc_scan_buffer(pipe, b, k, base, stride ? std::uint64_t(d[2]) * stride : d[2]);
+                }
+            } else if (deep && (d[3] >> 28) >= 8) {  // image T#
+                const std::uint64_t base = (d[0] | (std::uint64_t(d[1] & 0xff) << 32)) << 8;
+                if (base && ce_pc_bad(base)) ce_pc_report(pipe, "table T#", b, k, at, base, d, 8);
+            }
+        }
+    }
+    if ((n & (n - 1)) == 0 && (n == 1 || n >= 64))
+        std::fprintf(stderr, "[hack] PTR_CHECK: %llu dispatches scanned, %llu bad\n", (unsigned long long)n,
+                     (unsigned long long)g_pc_bad.load());
+}
+
 namespace rt::d3d12 {
 namespace {
 
@@ -6203,6 +6331,17 @@ public:
         }
         std::fprintf(stderr, "[hack] arena: device address 0x%llx size 0x%llx (console VA 0 = this address)\n",
                      (unsigned long long)arena.address, (unsigned long long)arena.size);
+        if (const char* pc = std::getenv("LEONIDA_CE_PTR_CHECK"); pc && pc[0] >= '1' && pc[0] <= '9') {  // agA16
+            g_pc_mapped = arena.mapped;
+            g_pc_size = arena.size;
+            g_pc_dev = arena.address;
+            g_pc_ctx = state_.context.get();
+            g_pc_level = pc[0] - '0';
+            if (const char* sl = std::getenv("LEONIDA_CE_PTR_CHECK_SLOTS")) g_pc_slots = std::uint32_t(std::strtoul(sl, nullptr, 0));
+            leonida::ce::ptr_check_fn().store(&ce_ptr_check);
+            std::fprintf(stderr, "[hack] PTR_CHECK: level %d, %u table slots, arena cpu %p\n", g_pc_level, g_pc_slots,
+                         (void*)arena.mapped);
+        }
         arena.peak_end = kArenaReserved;
         char log[4] = {};
         length = 0;
@@ -6827,19 +6966,66 @@ public:
         // layout pack_stage() measured (D3D-448). The signature is refused only when neither can place it.
         const rt::rootsig::PackResult packed = rt::rootsig::pack(parsed.sig);
         const rt::rootsig::StagePackResult compute = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Compute);
-        if (!packed.ok && !compute.ok) {
+        // HACK (agA15): LEONIDA_CE_ROOT_SPILL (default on; =0 = old refusal). A signature that does not fit from s4
+        // gets the console spill layout for compute: the parameters that fit stay inline, the rest go to the spill
+        // array behind s[0:1]. Before, such a signature was "graphics only": binding it for compute made the list
+        // invalid and ExecuteCommandLists refused the whole batch (re36: "nothing was submitted" right before the loss).
+        static const bool root_spill = [] { const char* e = std::getenv("LEONIDA_CE_ROOT_SPILL"); return !e || e[0] != '0'; }();
+        std::vector<std::uint32_t> spill_first;  // per parameter: first spill dword, kNoSgpr when inline
+        std::vector<std::uint32_t> spill_inline;  // per parameter: first user SGPR, kNoSgpr when spilled
+        std::uint32_t spill_dwords = 0;
+        if (!compute.ok && root_spill && parsed.sig.params.size() <= 64) {
+            std::uint64_t next = rt::rootsig::stage_base(rt::rootsig::Stage::Compute), cost = 0;
+            bool spilling = false, bad = false;
+            for (const auto& p : parsed.sig.params) {
+                if (p.type == rt::rootsig::ParamType::Constants && p.num_values == 0) bad = true;
+                cost += rt::rootsig::param_cost(p.type, p.num_values);
+                const std::uint32_t dwords = rt::rootsig::stage_dwords(p.type, p.num_values);
+                if (!spilling && next + dwords > rt::rootsig::kMaxUserSgprs) spilling = true;
+                if (spilling) {
+                    spill_inline.push_back(rt::rootsig::kNoSgpr);
+                    spill_first.push_back(spill_dwords);
+                    spill_dwords += p.type == rt::rootsig::ParamType::Descriptor ? 2 : dwords;
+                } else {
+                    spill_inline.push_back(std::uint32_t(next));
+                    spill_first.push_back(rt::rootsig::kNoSgpr);
+                    next += dwords;
+                }
+            }
+            if (bad || cost > rt::rootsig::kMaxD3d12Cost || !spill_dwords) {
+                spill_first.clear();
+                spill_inline.clear();
+                spill_dwords = 0;
+            } else {
+                static std::atomic<int> told{0};
+                if (told++ < 32) {
+                    std::string shape;
+                    for (std::size_t i = 0; i < parsed.sig.params.size(); ++i) {
+                        const auto& p = parsed.sig.params[i];
+                        shape += p.type == rt::rootsig::ParamType::Table ? "T" : p.type == rt::rootsig::ParamType::Descriptor ? "V" : "C" + std::to_string(p.num_values);
+                        shape += spill_first[i] == rt::rootsig::kNoSgpr ? "@s" + std::to_string(spill_inline[i]) : "@spill+" + std::to_string(spill_first[i] * 4);
+                        shape += " ";
+                    }
+                    std::fprintf(stderr, "[hack] ROOT_SPILL: compute signature spills %u dwords behind s[0:1]: %s\n",
+                                 spill_dwords, shape.c_str());
+                }
+            }
+        }
+        const bool compute_spilled = spill_dwords != 0;
+        if (!packed.ok && !compute.ok && !compute_spilled) {
             std::fprintf(stderr, "[rt] d3d12: root signature refused: %s (compute: %s)\n", packed.error.c_str(),
                          compute.error.c_str());
             return E_INVALIDARG;
         }
         if (!packed.ok)
             std::fprintf(stderr, "[rt] d3d12: root signature usable for compute only: %s\n", packed.error.c_str());
-        if (!compute.ok)
+        if (!compute.ok && !compute_spilled)
             std::fprintf(stderr, "[rt] d3d12: root signature usable for graphics only: %s\n", compute.error.c_str());
         RootArgumentLayout layout;
         layout.flags = parsed.sig.flags;
         layout.graphics_ok = packed.ok;
-        layout.compute_ok = compute.ok;
+        layout.compute_ok = compute.ok || compute_spilled;
+        layout.compute_spill_dwords = spill_dwords;
         // HACK (agG): the translated VS/PS read their root arguments from s8 in the console layout (one-dword tables):
         // the UI shaders load their table pointer from s[8:9] with s9 forced 0. pack() put it in s0, so they read VA 0.
         static const bool gfx_s8 = [] { const char* v = std::getenv("LEONIDA_CE_GFX_S8"); return !v || v[0] != '0'; }();
@@ -6862,7 +7048,9 @@ public:
                 }
             if (vertex.ok) first = vertex.first_sgpr[i];
             layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values,
-                                         compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr});
+                                         compute.ok ? compute.first_sgpr[i]
+                                         : compute_spilled ? spill_inline[i] : rt::rootsig::kNoSgpr,
+                                         compute_spilled ? spill_first[i] : rt::rootsig::kNoSgpr});
         }
         register_static_samplers(parsed.sig);
         auto* signature = new RootSignature(

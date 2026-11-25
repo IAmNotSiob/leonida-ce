@@ -31,6 +31,13 @@ inline std::string pipeline_name(std::uint64_t p) {
     const auto it = names().find(p);
     return it == names().end() ? std::string("?") : it->second;
 }
+// HACK (agA16, LEONIDA_CE_PTR_CHECK): the device installs a scan of the root views / descriptor tables of a dispatch.
+using PtrCheckFn = void (*)(const std::uint32_t* user_data, std::uint32_t view_mask, std::uint32_t table_mask,
+                            std::uint64_t pipeline);
+inline std::atomic<PtrCheckFn>& ptr_check_fn() {
+    static std::atomic<PtrCheckFn> f{nullptr};
+    return f;
+}
 inline void checkpoint(VkCommandBuffer cb, std::uint64_t marker) {
     if (auto f = set_checkpoint_fn().load(std::memory_order_relaxed)) f(cb, reinterpret_cast<const void*>(marker));
 }

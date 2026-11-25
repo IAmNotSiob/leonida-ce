@@ -860,6 +860,7 @@ public:
             if (!compute_pipeline_ || !compute_.layout) return check(false);
             if (unfit(compute_)) return;
             cmd.pipeline = compute_pipeline_;
+            finish_spill(compute_);
             cmd.user_data = compute_.data;
         }
         check(list_.execute_indirect(cmd));
@@ -1159,6 +1160,7 @@ private:
         const RootArgumentLayout* layout = nullptr;
         std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> data{};
         bool overflow = false;  // agA14: a root argument landed past the 32 user-data dwords (dropped)
+        std::vector<std::uint32_t> spill;  // agA15: compute spill array behind s[0:1] (LEONIDA_CE_ROOT_SPILL)
     };
     // HACK (agA14): LEONIDA_CE_SKIP_UNFIT=1. re35 lost the device (READ_INVALID in fspx cs_e8c1251e) right after the
     // first "SetComputeRootSignature(signature that does not fit the compute layout)" / "root arguments beyond 32
@@ -1198,6 +1200,7 @@ private:
         state.layout = layout;
         state.data = {};
         state.overflow = false;
+        state.spill.assign(is_compute(state) && layout ? layout->compute_spill_dwords : 0, 0u);
         // CreateRootSignature accepted it for the other bind point only (its log line says why).
         if (layout && !(is_compute(state) ? layout->compute_ok : layout->graphics_ok)) {
             stub(is_compute(state) ? "SetComputeRootSignature(signature that does not fit the compute layout)"
@@ -1237,6 +1240,38 @@ private:
         }
     }
 
+    // HACK (agA15): one dword of a parameter, inline or (compute, LEONIDA_CE_ROOT_SPILL) in the spill array.
+    void put(RootState& state, const RootArgumentLayout::Parameter& p, std::uint32_t sub, std::uint32_t value) {
+        if (is_compute(state) && p.compute_spill != rt::rootsig::kNoSgpr) {
+            const std::uint64_t at = std::uint64_t(p.compute_spill) + sub;
+            if (at < state.spill.size()) state.spill[at] = value;
+            else state.overflow = true;
+            return;
+        }
+        write(state, first_dword(state, p) + sub, value);
+    }
+
+    // HACK (agA15): before a dispatch records its root data, a signature with a spill array copies the array into
+    // the console upload ring (in the arena) and puts its 40-bit VA into s[0:1], where console-compiled shaders look.
+    void finish_spill(RootState& state) {
+        if (state.spill.empty()) return;
+        const std::uint64_t va =
+            rt::d3d12_xs::upload_snapshot(state.spill.data(), state.spill.size() * sizeof(std::uint32_t));
+        static std::atomic<std::uint64_t> made{0}, failed{0};
+        if (!va) {
+            if (failed++ < 8) std::fprintf(stderr, "[hack] ROOT_SPILL: upload of %zu dwords failed; s[0:1] = 0\n", state.spill.size());
+            state.data[0] = state.data[1] = 0;
+            return;
+        }
+        state.data[0] = std::uint32_t(va);
+        state.data[1] = std::uint32_t(va >> 32) & 0xffu;
+        const std::uint64_t n = ++made;
+        if (n <= 8 || (n & (n - 1)) == 0)
+            std::fprintf(stderr, "[hack] ROOT_SPILL: dispatch #%llu: %zu spill dwords at VA 0x%llx (s0 %08x s1 %08x)\n",
+                         static_cast<unsigned long long>(n), state.spill.size(), static_cast<unsigned long long>(va),
+                         state.data[0], state.data[1]);
+    }
+
     void constants(RootState& state, UINT index, UINT count, const void* data, UINT offset) {
         if (list_.closed()) return;
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
@@ -1256,8 +1291,7 @@ private:
         if (!p) return;
         if ((count && !data) || std::uint64_t(offset) + count > p->constant_count) return check(false);
         const auto* values = static_cast<const std::uint32_t*>(data);
-        const std::uint32_t first = first_dword(state, *p);
-        for (UINT i = 0; i < count; ++i) write(state, first + offset + i, values[i]);
+        for (UINT i = 0; i < count; ++i) put(state, *p, offset + i, values[i]);
     }
 
     void address(RootState& state, UINT index, std::uint64_t va, rt::rootsig::ParamType type) {
@@ -1268,12 +1302,19 @@ private:
             return;
         const RootArgumentLayout::Parameter* p = parameter(state, index, type);
         if (!p) return;
-        const std::uint32_t first = first_dword(state, *p);
-        write(state, first, std::uint32_t(va));
+        // HACK (agA16, LEONIDA_CE_PTR_CHECK): a compute table keeps only the low dword of its VA; ri49 tables held floats
+        // and stack bytes, so log any table VA that does not fit 32 bits (first 32).
+        if (type == rt::rootsig::ParamType::Table && (va >> 32) && std::getenv("LEONIDA_CE_PTR_CHECK")) {
+            static std::atomic<int> told{0};
+            if (told++ < 32)
+                std::fprintf(stderr, "[hack] PTR_CHECK: %s table %u VA 0x%llx does not fit 32 bits (kept 0x%x)\n",
+                             is_compute(state) ? "compute" : "graphics", index, (unsigned long long)va, std::uint32_t(va));
+        }
+        put(state, *p, 0, std::uint32_t(va));
         // In the compute layout a descriptor table is one dword, the 32-bit VA of its first descriptor (the heaps
         // live below 4 GiB); a root view keeps both halves. The graphics layout gives every address two dwords.
         const bool one_dword_table = is_compute(state) || (state.layout && state.layout->graphics_console);  // agG
-        if (!(one_dword_table && type == rt::rootsig::ParamType::Table)) write(state, first + 1, std::uint32_t(va >> 32));
+        if (!(one_dword_table && type == rt::rootsig::ParamType::Table)) put(state, *p, 1, std::uint32_t(va >> 32));
     }
 
     D3D12_COMMAND_LIST_TYPE type_;
@@ -1422,7 +1463,15 @@ private:
         if (!compute_pipeline_ || !compute_.layout) return check(false);
         if (unfit(compute_)) return;
         note_direct_heap_indexing(compute_.layout);
-        check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
+        finish_spill(compute_);
+        leonida::Dispatch d{compute_pipeline_, compute_.data, x, y, z};
+        // HACK (agA16, LEONIDA_CE_PTR_CHECK): which user dwords hold root views and tables, for the replay-time scan.
+        for (const auto& p : compute_.layout->parameters) {
+            if (p.compute_spill != rt::rootsig::kNoSgpr || p.compute_offset >= 32) continue;
+            if (p.type == rt::rootsig::ParamType::Descriptor) d.ce_view_mask |= 1u << p.compute_offset;
+            else if (p.type == rt::rootsig::ParamType::Table) d.ce_table_mask |= 1u << p.compute_offset;
+        }
+        check(list_.dispatch(d));
     }
 
     // The views block a draw records. Rebuilt only when the render targets or the bound vertex buffers change.

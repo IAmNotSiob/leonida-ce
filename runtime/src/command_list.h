@@ -380,6 +380,9 @@ struct Dispatch {
     std::uint32_t x;
     std::uint32_t y;
     std::uint32_t z;
+    // HACK (agA16, LEONIDA_CE_PTR_CHECK): bit n = user dword n starts a root view (64-bit VA) / a descriptor table.
+    std::uint32_t ce_view_mask = 0;
+    std::uint32_t ce_table_mask = 0;
 };
 
 // D3D12_VIEWPORT.

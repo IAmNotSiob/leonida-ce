@@ -382,11 +382,18 @@ struct RootArgumentLayout {
         std::uint32_t user_offset;     // graphics: first dword; unused for a parameter with no dwords
         std::uint32_t constant_count;  // constants only
         std::uint32_t compute_offset = rt::rootsig::kNoSgpr;  // compute: first user SGPR
+        // HACK (agA15, LEONIDA_CE_ROOT_SPILL): compute: first dword in the spill array behind s[0:1] (kNoSgpr: inline)
+        std::uint32_t compute_spill = rt::rootsig::kNoSgpr;
     };
     std::vector<Parameter> parameters;
     std::uint32_t flags = 0;  // D3D12_ROOT_SIGNATURE_FLAGS from the serialized blob
     bool graphics_ok = true;
     bool compute_ok = true;
+    // HACK (agA15, LEONIDA_CE_ROOT_SPILL): dwords of the compute spill array (0: the signature fits inline). The
+    // console layout (docs/d3d12_vulkan.md section 7): the first parameter that does not fit from s4, and every later
+    // one, go packed into an array addressed by a 40-bit pointer in s[0:1] (constant 4 B, root view 8 B; a table is
+    // taken as 4 B like its inline form -- not measured).
+    std::uint32_t compute_spill_dwords = 0;
     // HACK (agG, LEONIDA_CE_GFX_S8, default on): graphics uses pack_stage(Vertex) -- the console layout from s8, one
     // dword per table -- instead of pack(). graphics_end is one past its last SGPR; when it is <= 16 every graphics
     // write is mirrored 8 dwords up as well, so a mesh shader (root arguments from s16) sees the same arguments.

@@ -1182,6 +1182,12 @@ public:
     }
 
     // HACK (agA13): true when a buffer of a live resource holds `va` (the buffer_at index), for CBV checks.
+    // HACK (agA16): the same without taking resource_mutex_, for callers that already hold it (replay prepare);
+    // a second shared lock on the same thread deadlocks behind a waiting writer (ri46 hang).
+    bool va_known_locked(std::uint64_t va) {
+        BufferVaIndex<ResourceId>::Hit hit{};
+        return buffer_vas_.find(va, hit);
+    }
     bool va_known(std::uint64_t va) {
         std::shared_lock lock(resource_mutex_);
         BufferVaIndex<ResourceId>::Hit hit{};
