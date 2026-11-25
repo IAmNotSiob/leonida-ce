@@ -348,6 +348,7 @@ static const char* ce_pc_class(std::uint64_t v, std::uint64_t& rel) {
 }
 // Called from replay prepare(), which holds resource_mutex_ shared (va_known would lock it again: ri46 deadlock).
 static bool ce_pc_bad(std::uint64_t va) { return va >= g_pc_size && !g_pc_ctx->va_known_locked(va); }
+namespace rt::d3d12 { namespace { bool ce_copy_title(void* dst, std::uint64_t va, std::uint64_t bytes); } }  // agA21
 static void ce_pc_report(std::uint64_t pipe, const char* what, unsigned sgpr, unsigned slot, std::uint64_t at,
                          std::uint64_t v, const std::uint32_t* words, unsigned nwords) {
     ++g_pc_bad;
@@ -368,6 +369,17 @@ static void ce_pc_report(std::uint64_t pipe, const char* what, unsigned sgpr, un
                  (unsigned long long)v, cls, (unsigned long long)rel, (unsigned long long)(g_pc_dev + v),
                  wbuf);
     std::fflush(stderr);
+    // agA21: a table entry inside the heap mirror: what does the TITLE heap hold at the same offset?
+    const std::uint64_t mlo = leonida::ce::mirror_lo().load(), mhi = leonida::ce::mirror_hi().load(),
+                        mt = leonida::ce::mirror_title().load();
+    if (at && mt && at >= mlo && at + 32 <= mhi) {
+        std::uint32_t t[8] = {};
+        const bool ok = rt::d3d12::ce_copy_title(t, mt + (at - mlo), sizeof t);
+        std::fprintf(stderr, "[hack] PTR_CHECK:   mirror offset 0x%llx: title heap %s [ %08x %08x %08x %08x %08x %08x %08x %08x ]%s\n",
+                     (unsigned long long)(at - mlo), ok ? "holds" : "UNREADABLE", t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7],
+                     ok && std::memcmp(t, g_pc_mapped + at, 32) == 0 ? " (= mirror)" : " (DIFFERS from mirror)");
+        std::fflush(stderr);
+    }
 }
 // Pointer-looking qwords in the first bytes of an in-arena buffer.
 static void ce_pc_scan_buffer(std::uint64_t pipe, unsigned sgpr, unsigned slot, std::uint64_t va, std::uint64_t bytes) {
