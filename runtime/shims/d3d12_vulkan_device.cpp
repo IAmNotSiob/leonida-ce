@@ -220,8 +220,26 @@ static void ce_heap_mirror_sync() {
                      (unsigned long long)g_hm_protect_fail.load(), (unsigned long long)(g_hm_cmp_pages.load() * 4));
     }
 }
+// agA19: host ranges of the arena mirrors, so the title-VA ring sync (set_title_sync) never copies title bytes over a
+// mirror (a translated table handle in a draw's root words names a mirror VA; the sync copied title[VA] there).
+static std::atomic<std::uintptr_t> g_hm_arena_lo[8], g_hm_arena_hi[8];
+static std::atomic<std::uint64_t> g_hm_guard_hits{0};
+static bool ce_hm_guard_hit(const std::uint8_t* host, std::uint64_t bytes) {
+    const std::uintptr_t a = reinterpret_cast<std::uintptr_t>(host), b = a + bytes;
+    for (int i = 0; i < 8; ++i) {
+        const std::uintptr_t lo = g_hm_arena_lo[i].load(std::memory_order_acquire);
+        if (lo && a < g_hm_arena_hi[i].load(std::memory_order_acquire) && b > lo) return true;
+    }
+    return false;
+}
 static void ce_heap_mirror_add(const std::uint8_t* title, std::uint8_t* arena, std::size_t bytes, int mode) {
     std::lock_guard lock(g_hm_mu);
+    for (int i = 0; i < 8; ++i)
+        if (!g_hm_arena_lo[i].load()) {
+            g_hm_arena_hi[i].store(reinterpret_cast<std::uintptr_t>(arena) + bytes);
+            g_hm_arena_lo[i].store(reinterpret_cast<std::uintptr_t>(arena));
+            break;
+        }
     CeHeapMirror m{title, arena, bytes};
     MEMORY_BASIC_INFORMATION mbi{};
     VirtualQuery(title, &mbi, sizeof(mbi));
@@ -265,6 +283,8 @@ static void ce_heap_mirror_remove(const std::uint8_t* title) {
     std::lock_guard lock(g_hm_mu);
     for (auto it = g_hm.begin(); it != g_hm.end(); ++it)
         if (it->title == title) {
+            for (int i = 0; i < 8; ++i)
+                if (g_hm_arena_lo[i].load() == reinterpret_cast<std::uintptr_t>(it->arena)) { g_hm_arena_lo[i].store(0); g_hm_arena_hi[i].store(0); }
             if (it->tracked) {
                 for (auto& g : g_hm_ranges)
                     if (g.lo.load() == reinterpret_cast<std::uintptr_t>(title)) { g.lo.store(0); g.hi.store(0); }
@@ -6585,6 +6605,15 @@ public:
             state_.context->set_title_sync([host, arena_bytes](std::uint64_t va, std::uint64_t bytes) {
                 if (!bytes || va >= arena_bytes || bytes > arena_bytes - va) return;
                 if (!rt::d3d12_xs::placed_buffer_holds(va, bytes)) return;
+                // agA19 LEONIDA_CE_MIRROR_GUARD (default on, =0 off): never ring-sync into a heap mirror.
+                static const bool guard = [] { const char* e = std::getenv("LEONIDA_CE_MIRROR_GUARD"); return !e || e[0] != '0'; }();
+                if (ce_hm_guard_hit(host + va, bytes)) {
+                    const std::uint64_t k = g_hm_guard_hits.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if ((k & (k - 1)) == 0)
+                        std::fprintf(stderr, "[hack] MIRROR_GUARD: ring sync of %llu bytes at VA 0x%llx lands in a heap mirror (%llu hits, %s)\n",
+                                     (unsigned long long)bytes, (unsigned long long)va, (unsigned long long)k, guard ? "skipped" : "COPIED");
+                    if (guard) return;
+                }
                 if (!ce_copy_title(host + va, va, bytes)) return;
                 static std::atomic<int> told{0};
                 if (told++ < 3)

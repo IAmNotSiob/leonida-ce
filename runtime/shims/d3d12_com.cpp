@@ -857,6 +857,29 @@ public:
         cmd.argument_offset = argument_buffer_offset;
         cmd.count_buffer = count_buffer ? resource_id(count_buffer) : 0;
         cmd.count_offset = count_buffer ? count_buffer_offset : 0;
+        // HACK (agA19, LEONIDA_CE_INDIRECT_DRAW=1, default ON; =0 old path): ri53/54/55 lost the device at the first
+        // ExecuteIndirect draw with an NVIDIA FE exception. The old replay emitted vkCmdDraw*Indirect with no
+        // rendering scope and no graphics pipeline/root arguments bound (each Draw opens and closes its own scope), so
+        // the draw ran outside vkCmdBeginRendering with whatever (compute) pipeline was bound. Record it as a Draw
+        // carrying the indirect buffer instead; replay emits the indirect call inside the draw's own scope.
+        static const bool ind_draw = [] { const char* e = std::getenv("LEONIDA_CE_INDIRECT_DRAW"); return !e || e[0] != '0'; }();
+        if (ind_draw && kind != leonida::IndirectKind::dispatch) {
+            if (!max_command_count) return;
+            static std::atomic<int> told{0};
+            if (told++ < 8) {
+                std::fprintf(stderr, "[hack] INDIRECT_DRAW: kind %d stride %u max %u args res %p +0x%llx count %p +0x%llx -> Draw\n",
+                             int(kind), stride, max_command_count, (void*)argument_buffer,
+                             (unsigned long long)argument_buffer_offset, (void*)count_buffer,
+                             (unsigned long long)count_buffer_offset);
+                std::fflush(stderr);
+            }
+            if (defer([=](GraphicsCommandList& l) {
+                    l.record_draw(kind == leonida::IndirectKind::draw_indexed, 1, 1, 0, 0, 0, &cmd);
+                }, true))
+                return;
+            record_draw(kind == leonida::IndirectKind::draw_indexed, 1, 1, 0, 0, 0, &cmd);
+            return;
+        }
         if (kind == leonida::IndirectKind::dispatch && max_command_count) {  // the pipeline and root arguments a Dispatch would record
             if (!compute_pipeline_ || !compute_.layout) return check(false);
             if (unfit(compute_)) return;
@@ -1489,7 +1512,8 @@ private:
     }
 
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
-    void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
+    void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance,
+                     const leonida::ExecuteIndirect* ind = nullptr) {
         if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
         if (unfit(graphics_)) return;
         note_direct_heap_indexing(graphics_.layout);
@@ -1499,6 +1523,14 @@ private:
         leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, index_, topology_, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances,
                            first, base_vertex, first_instance};
+        if (ind) {  // agA19 LEONIDA_CE_INDIRECT_DRAW
+            draw.ind_buffer = ind->argument_buffer;
+            draw.ind_offset = ind->argument_offset;
+            draw.ind_max = ind->max_count;
+            draw.ind_stride = ind->stride;
+            draw.ind_count_buffer = ind->count_buffer;
+            draw.ind_count_offset = ind->count_offset;
+        }
         check(list_.draw(std::move(draw)));
     }
 };
