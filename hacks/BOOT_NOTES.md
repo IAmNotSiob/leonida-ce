@@ -896,3 +896,81 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   - target0/1 dumps are in /root/rb/re16t.
 - Build 33 = build 32 + "[hack] slot buddy" watch (see /root/handoff/build-33.txt). Wine sh2 OK. re17 (build 33, 300 s) was handed to
   B at the end of agA8.
+
+## agA9 (sender gen 9, 2026-11-25)
+- re17 (build 33, B): Confirm at t=137.7. An A press at t=163.5 (state 0, "PLAYER (A)" screen) was followed 4 s later by
+  CopyPageMappings call 125 (t=167.6). At that call the slot buddy heads were order 0 = 0xab1e8 and order 20 = 0x1f5b80,
+  and the pool page free-list head was 0x124949 (> 99776). All were bad at once, and calls 1-124 were clean. Then the
+  usual cascade: Scatter "unknown page 0xab5550", which is a consequence (the bad pool head indexed past the page array,
+  Likely), f7c5c, f2cc4b, dstorage memcpy AVs into reserved stream heaps (0xc31fxxxxx) and reads of -1. Presents
+  stopped at f1829 and the process exited at 243 s.
+- Allocator facts (Definite, disassembly):
+  - alloc 0x145238780(slots, power of 2), pop/split 0x145238830, free 0x14221b7d0, unlink 0x14221b910, push 0x145238960.
+  - decref 0x1400e8890(slot): refcount in bits 0-14 of the block head; at 0 it tail-jumps to free.
+  - sub-slot (4K) alloc 0x145238590 with 16 lists at 0x1471bfb7c; entries are marked 0xc0000 with a bitmap in bits 2-17.
+    Sub-free is 0x144f8f0a0.
+  - Lock 0x1471bfad8 is a recursive lock: owner = TLS[0]+0x1454 thread id, with a kernel semaphore slow path. It is held
+    at every alloc and free caller (0x14221b9e0, 0x14014c640, 0x140f2c5xx unmap loop, 0x144f658c8, 0x144f8f330). So a
+    lock race is unlikely (Likely). TLS is per-thread: 53246 gs:[58h] sites are patched and the tls sweep shows 0 shared.
+  - The heap layout is table1 (count*8), then table2 [0x1471bfb10] (count*8), then the pool links: Wine shows
+    table 0xd84479810, links 0xd84a79830. So slot >= 0x60000 reads table2, and slot >= 0xc0000 reads the pool links.
+  - The free path's unlink 0x14221b9bb picks the list head to update from the entry's own order field. An entry whose order
+    field disagrees with its list therefore corrupts another list's head. That is how an order-20 head can appear.
+  - 0x144f8f330 (free by address) has an int3 for an address outside the pool, then falls into the free anyway:
+    LEONIDA_SKIP_INT3 would free an out-of-range slot there. It was not seen in re17.
+- dstorage is not the writer (Likely): every "odd dst" request is comp=1 with option word 1 (plain memory destination).
+  comp=14 (BCPack) requests are refused and write nothing. Their "dst" values (0xd849a7b58.., 0x30 apart) fall inside
+  table2's range, so the BCPack destination looks like a pointer to a per-slot descriptor (Plausible).
+- Build 34: runtime/src/slot_guard.h, LEONIDA_CE_SLOT_GUARD (0 off, 1 default, 2 full).
+  - It hooks the direct callers of alloc, free, decref, suballoc and subfree (remap thunks, arg 0 unchanged).
+  - Before each op it drops bad buddy heads. Mode 2 also walks every list and cuts at the first bad node.
+  - It walks the pool list every 32 ops, from head to tail (the title never writes the tail's link). A bad pool list is
+    rebuilt from the slot table (pages named by refcounted slots are used, the rest are free), only from alloc, suballoc
+    or subfree, never inside the unmap loop.
+  - At the first bad state it prints the last 32 ops (kind, arg, tid, tick), which separates an allocator op from an outside writer.
+  - Wine si2/si3: 0 problems.
+- re18 (build 34, SLOT_GUARD=2, B):
+  - Confirm at t=129.5, crash at about t=162, exit at 231 s.
+  - The FIRST problem (op 33447, t~154-161) was not a bad list. It was "decref of a slot past the count": slot 0xcf400,
+    then 0xcf401.. consecutively, all entry 0. The 32 ops before it were sane D/F of slots 0x409f0-0x474b1 on one thread.
+  - Later args were 0x8cc88, 0x1aadb3, 0x14d564 and 0x14d52e. The pool list was rebuilt once (free 90076 -> 90125).
+  - The same cascade followed: Scatter unknown page, f2cc4b, dstorage memcpy AVs, reads of -1 at +0x4d9eac7/+0x52df9a4.
+- Root path (Very likely):
+  - 0x144f658c0(handle) releases a range handle: handle = slot | n<<21, n consecutive decrefs, no bounds check, a no-op
+    when handle < 0x200000.
+  - It is called by 0x1400e8960 / 0x144f65820, which drain a deferred-release object: state byte +0x78 == 1, a fence-like
+    object at +0x30 with vtbl+0x18(0) true, retains at +0x70[+0x6c] via 0x144f65910, and releases from the vector at
+    +0x20..+0x28.
+  - Garbage handles walk the decref/free past the 3 MiB slot table into table2 and the pool links. That explains the
+    re15-re17 list and pool corruption and the "consecutive" nature.
+  - Why the handles are garbage is unknown: a stale or reused deferred-release object, or memory overwritten by a
+    texture or stream write (Plausible). Next: log the object address, its +0x20/+0x28 vector and the caller when a bad
+    handle is seen, and watch who writes it.
+- Build 35: the range guard. Handles whose range leaves the table become 0 (no-op) and are logged ("range handle ..
+  skipped"). It hooks 0x144f658c0 (2 calls) and 0x144f65910 (3 calls). Wine si5: 7 hooks, no problems.
+  LEONIDA_CE_SLOT_WATCH=1 makes the slot table and pool links read-only and logs foreign writers through a VEH. It is not
+  run-tested: in Wine si4 no allocator op came within 120 s.
+- Black/navy after Confirm (Job 2), Likely:
+  - target0 itself is navy and then all zero (re16t f2400). So it is the game's own render, not a present problem.
+  - The "ACCOUNT PICKER (Y) / PLAYER (A)" landing screen draws 282 draws to target0 (re17 f1770) but only the navy clear
+    shows. Its art comes from streamed textures in the slot pool, and BCPack (comp=14) requests are refused.
+  - The near-black and navy phases are the load transition started by the A press. The load dies in the allocator
+    corruption above, so no loading screen or menu appears.
+- re19 (build 35, 300 s, B):
+  - Confirm at t=142.2. Presents stopped at f1870 (t~173); exit at 261 s.
+  - The guard held: no list or pool problems, no CopyPageMappings or Scatter failures, no odd dst, no f7c5c/f2cc4b, and
+    none of the read-of--1 AVs.
+  - 5 range-handle skips at op 33580 (t=169-173). The handles were 0xaaaaaaac, 0xf5d5d454, 0xaaad3500, 0x9f5aaaaa,
+    0xf59f59f5: fill or data patterns. So the deferred-release object's retain/release arrays (+0x70, +0x20) were already
+    overwritten or freed when it was drained. This is the real bug upstream of re15-re18 (Likely).
+  - New crash: AV reading 0x88 at game+0x2593576 <- +0x2592d69 <- worker +0x2215eca. The same worker (+0x2592d0f) was in
+    the earlier f7c5c and f2cc4b stacks.
+  - Screens unchanged: navy+footer, near-black, navy; at f1860 presented/target1/2 are zero while target0 stays navy.
+- NEXT (agA10):
+  1. Decompile the drain functions' owner (0x144f657c5 queues 0x144f65820 as a callback; 0x1400e88f0 maps via
+     0x140f2c460(obj+0x38) and then retains) and the worker frames +0x2592d0f/+0x2592d69/+0x2593576. Find who allocates and
+     frees these objects.
+  2. Pattern-0xaa memory suggests a freed or debug-filled block: check whether the object is freed while queued
+     (a race between the worker and the main thread, or a fence completing early: the vtbl+0x18 at obj+0x30 may be OUR
+     fence/sync shim reporting complete too soon, or never resetting).
+  3. LEONIDA_CE_SLOT_WATCH=1 is implemented but untested on Windows.
