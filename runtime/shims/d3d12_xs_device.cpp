@@ -972,6 +972,7 @@ std::uint64_t g_cbv_pool_va = 0, g_cbv_pool_size = 0, g_cbv_pool_used = 0;
 bool g_cbv_pool_failed = false;
 std::atomic<std::uint64_t> g_cbv_syncs{0}, g_cbv_changed_bytes{0}, g_cbv_changed_views{0};
 
+bool xs_cbv_title_of(std::uint64_t va, std::uint64_t* title, std::uint32_t* size, std::uint64_t* shadow_va);  // agA25
 // Under g_cbv_mu. A DEFAULT buffer lands in the arena (VA = arena offset), so g_arena_mapped + VA is its CPU view.
 bool xs_cbv_pool_ready(ID3D12Device* dev) {
     if (g_cbv_pool) return true;
@@ -1002,12 +1003,25 @@ bool xs_cbv_pool_ready(ID3D12Device* dev) {
         return false;
     }
     g_cbv_pool = r;  // held for the life of the process
+    leonida::ce::cbv_title_fn().store(&xs_cbv_title_of);  // agA25
     g_cbv_pool_va = va;
     g_cbv_pool_size = d.Width;
     std::fprintf(stderr, "[hack] CBV_SHADOW: pool %llu MiB at arena VA 0x%llx\n", (unsigned long long)mib,
                  (unsigned long long)va);
     std::fflush(stderr);
     return true;
+}
+
+// agA25: which shadow holds arena VA va (linear; diagnostics only).
+bool xs_cbv_title_of(std::uint64_t va, std::uint64_t* title, std::uint32_t* size, std::uint64_t* shadow_va) {
+    std::lock_guard lock(g_cbv_mu);
+    if (!g_cbv_pool || va < g_cbv_pool_va || va >= g_cbv_pool_va + g_cbv_pool_size) return false;
+    for (const XsCbvShadow& e : g_cbv)
+        if (va >= e.va && va < e.va + e.size) {
+            *title = e.title; *size = e.size; *shadow_va = e.va;
+            return true;
+        }
+    return false;
 }
 
 // The arena VA a CBV on title memory [title, title + size) should name, or 0 (caller falls back to the ring).

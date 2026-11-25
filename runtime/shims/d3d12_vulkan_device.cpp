@@ -800,16 +800,114 @@ static void ce_cb_peek(const std::uint32_t* s, std::uint64_t pipe) {
     if (in_mirror)
         std::snprintf(tail + tl, sizeof tail - tl, "; title heap [ %08x %08x %08x %08x ]%s", t[0], t[1], t[2], t[3],
                       !tok ? " UNREADABLE" : std::memcmp(t, d, 16) == 0 ? " (= mirror)" : " (DIFFERS)");
+    // agA25: where the CB came from. If the V# base is a CBV_SHADOW copy: its title address, and that address relative to
+    // the title descriptor heap and to this table entry's title address; plus the title bytes there NOW vs the shadow.
+    char src[512] = {};
+    {
+        std::uint64_t ct = 0, sva = 0;
+        std::uint32_t csz = 0;
+        auto fn = leonida::ce::cbv_title_fn().load();
+        if (base && fn && fn(base, &ct, &csz, &sva)) {
+            const std::uint64_t heap_bytes = mhi > mlo ? mhi - mlo : 0;
+            const std::uint64_t ctb = ct + (base - sva);  // title address of the V# base
+            int l = std::snprintf(src, sizeof src, " | SRC shadow 0x%llx = title 0x%llx size 0x%x (base at title 0x%llx)",
+                                  (unsigned long long)sva, (unsigned long long)ct, csz, (unsigned long long)ctb);
+            if (mt && ct < mt + heap_bytes && ct + csz > mt)
+                l += std::snprintf(src + l, sizeof src - l, " INSIDE title heap [0x%llx +0x%llx) at heap+0x%llx", (unsigned long long)mt,
+                                   (unsigned long long)heap_bytes, (unsigned long long)(ct - mt));
+            else
+                l += std::snprintf(src + l, sizeof src - l, " not in title heap [0x%llx +0x%llx)", (unsigned long long)mt,
+                                   (unsigned long long)heap_bytes);
+            if (in_mirror) {
+                const std::uint64_t et = mt + (at - mlo);
+                l += std::snprintf(src + l, sizeof src - l, "; entry title 0x%llx, CBtitle-entry = %lld", (unsigned long long)et,
+                                   (long long)(ctb - et));
+            }
+            std::uint32_t now[4] = {}, sh[4] = {};
+            const bool nok = rt::d3d12::ce_copy_title(now, ctb + pk.cboff, 16);
+            if (base + pk.cboff + 16 <= g_pc_size) std::memcpy(sh, g_pc_mapped + base + pk.cboff, 16);
+            std::snprintf(src + l, sizeof src - l, "; title now [ %08x %08x %08x %08x ]%s shadow [ %08x %08x %08x %08x ]", now[0], now[1],
+                          now[2], now[3], nok ? "" : " UNREADABLE", sh[0], sh[1], sh[2], sh[3]);
+        } else {
+            std::snprintf(src, sizeof src, " | SRC not a CBV_SHADOW (fn %s)", fn ? "set" : "unset");
+        }
+    }
     std::fprintf(stderr,
-                 "[hack] CB_PEEK: %s s%u=0x%llx +0x%x (entry %s) V# [ %08x %08x %08x %08x ] base 0x%llx -> %s +0x%x = %08x %08x (%g %g)%s\n",
+                 "[hack] CB_PEEK: %s s%u=0x%llx +0x%x (entry %s) V# [ %08x %08x %08x %08x ] base 0x%llx -> %s +0x%x = %08x %08x (%g %g)%s%s\n",
                  pk.name.c_str(), pk.sgpr, (unsigned long long)table, pk.off, in_mirror ? "in heap mirror" : "not mirrored",
                  d[0], d[1], d[2], d[3], (unsigned long long)base, where, pk.cboff, val[0], val[1], double(f[0]),
-                 double(f[1]), tail);
+                 double(f[1]), tail, src);
     std::fflush(stderr);
+}
+// agA25 LEONIDA_CE_CB_VSHARP_GUARD=name:sgpr:off:cboff[,..] (needs PTR_CHECK>=1; same target format as CB_PEEK): the shader
+// s_buffer_loads a buffer V# from its CB at +cboff (cs_edc5d4c7: CB+0, CB V# at s5+0x40). When that V#'s base lies outside
+// the arena and every known mapping (rq3: 0xc80400008008, the table-slot-3 bytes), zero the 16 bytes in the arena copy of
+// the CB (num_records 0 => the shader's loads return 0) instead of letting the GPU fault far away. The title copy is not
+// touched; CBV_SHADOW re-copies it only when the title changes it, and the guard runs again at the next dispatch.
+static void ce_cb_vsharp_guard(const std::uint32_t* s, std::uint64_t pipe) {
+    static const std::vector<CePeek> targets = [] {
+        std::vector<CePeek> r;
+        const char* e = std::getenv("LEONIDA_CE_CB_VSHARP_GUARD");
+        if (!e) return r;
+        const std::string t = e;
+        std::size_t p = 0;
+        while (p < t.size()) {
+            std::size_t q = t.find(',', p);
+            if (q == std::string::npos) q = t.size();
+            const std::string one = t.substr(p, q - p);
+            const std::size_t a = one.find(':');
+            const std::size_t b = a == std::string::npos ? a : one.find(':', a + 1);
+            const std::size_t c = b == std::string::npos ? b : one.find(':', b + 1);
+            if (c != std::string::npos)
+                r.push_back({one.substr(0, a), unsigned(std::strtoul(one.c_str() + a + 1, nullptr, 0)),
+                             std::uint32_t(std::strtoul(one.c_str() + b + 1, nullptr, 0)),
+                             std::uint32_t(std::strtoul(one.c_str() + c + 1, nullptr, 0)), ~0ull, 0});
+            p = q + 1;
+        }
+        std::fprintf(stderr, "[hack] CB_VSHARP_GUARD: %zu target(s)\n", r.size());
+        return r;
+    }();
+    if (targets.empty()) return;
+    static std::mutex mu;
+    static std::unordered_map<std::uint64_t, std::vector<int>> which;
+    static std::uint64_t checked = 0, zeroed = 0;
+    std::lock_guard lock(mu);
+    auto it = which.find(pipe);
+    if (it == which.end()) {
+        const std::string nm = leonida::ce::pipeline_name(pipe);
+        std::vector<int> w;
+        for (std::size_t i = 0; i < targets.size(); ++i)
+            if (nm.find(targets[i].name) != std::string::npos) w.push_back(int(i));
+        it = which.emplace(pipe, std::move(w)).first;
+    }
+    for (int i : it->second) {
+        const CePeek& g = targets[std::size_t(i)];
+        if (g.sgpr >= 32) continue;
+        const std::uint64_t at = std::uint64_t(s[g.sgpr]) + g.off;
+        if (at + 16 > g_pc_size) continue;
+        std::uint32_t d[4];
+        std::memcpy(d, g_pc_mapped + at, sizeof d);
+        const std::uint64_t cb = d[0] | (std::uint64_t(d[1] & 0xffff) << 32);
+        if (!cb || cb + g.cboff + 16 > g_pc_size) continue;
+        std::uint8_t* const p = g_pc_mapped + cb + g.cboff;
+        std::uint32_t v[4];
+        std::memcpy(v, p, sizeof v);
+        ++checked;
+        const std::uint64_t vb = v[0] | (std::uint64_t(v[1] & 0xffff) << 32);
+        if (!v[2] || !vb || !ce_pc_bad(vb)) continue;
+        std::memset(p, 0, 16);
+        const std::uint64_t z = ++zeroed;
+        if (z <= 32 || (z & (z - 1)) == 0)
+            std::fprintf(stderr, "[hack] CB_VSHARP_GUARD: %s CB 0x%llx +0x%x V# [ %08x %08x %08x %08x ] base 0x%llx unmapped -> zeroed (%llu zeroed / %llu checked)\n",
+                         g.name.c_str(), (unsigned long long)cb, g.cboff, v[0], v[1], v[2], v[3], (unsigned long long)vb,
+                         (unsigned long long)z, (unsigned long long)checked);
+        std::fflush(stderr);
+    }
 }
 static void ce_ptr_check(const std::uint32_t* s, std::uint32_t vm, std::uint32_t tm, std::uint64_t pipe) {
     if (!g_pc_ctx || !g_pc_mapped) return;
     ce_cb_peek(s, pipe);  // agA23
+    ce_cb_vsharp_guard(s, pipe);  // agA25
     // agA18: LEONIDA_CE_PTR_CHECK_ONLY=sub1,sub2,..: only pipelines whose name contains one of the substrings.
     static const std::vector<std::string> only = [] {
         std::vector<std::string> v;

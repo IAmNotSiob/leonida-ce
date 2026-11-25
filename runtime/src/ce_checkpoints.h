@@ -67,6 +67,12 @@ inline std::atomic<HeapSyncFn>& pool_sync_fn() {
     static std::atomic<HeapSyncFn> f{nullptr};
     return f;
 }
+// agA25 (CB_PEEK): arena VA -> the CBV_SHADOW entry holding it (title address, size, shadow VA). nullptr until a pool exists.
+using CbvTitleFn = bool (*)(std::uint64_t va, std::uint64_t* title, std::uint32_t* size, std::uint64_t* shadow_va);
+inline std::atomic<CbvTitleFn>& cbv_title_fn() {
+    static std::atomic<CbvTitleFn> f{nullptr};
+    return f;
+}
 // agA20 (LEONIDA_CE_INDIRECT_SRC diagnostics): the arena host mapping, for raw reads of GPU-only (DEFAULT) buffers.
 inline std::atomic<std::uint8_t*>& arena_host() {
     static std::atomic<std::uint8_t*> p{nullptr};
