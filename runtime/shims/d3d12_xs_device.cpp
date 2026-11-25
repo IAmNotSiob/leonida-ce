@@ -1292,6 +1292,7 @@ long xs_game_thread_index(HANDLE th) {
     struct { LONG status; PVOID teb; void* pid; void* tid; ULONG_PTR mask; LONG prio, base; } info{};
     if (query(th, 0 /* ThreadBasicInformation */, &info, sizeof(info), nullptr) != 0 || !info.teb) return -2;
     const auto slot = *reinterpret_cast<const volatile std::uint32_t*>(0x146e08b2cull);  // title TLS index
+    if (!xs_readable(static_cast<std::uint8_t*>(info.teb) + 0x58, 8)) return -2;  // agA23: the thread may have exited
     const auto* tls = *reinterpret_cast<std::uint8_t* const* const*>(static_cast<std::uint8_t*>(info.teb) + 0x58);
     if (!tls || !xs_readable(tls + slot, 8)) return -2;
     const std::uint8_t* block = tls[slot];
@@ -1399,7 +1400,45 @@ void xs_tls_sweep(std::uint64_t frame) {
     last.swap(now);
 }
 
+// agA23: the unwind of a RESUMED thread reads its live stack. rn9 crashed here (AV in ntdll RtlVirtualUnwind via
+// KERNEL32, read of a stack address) when the walked thread exited mid-walk (background compute threads finish
+// during the dump) or was itself another concurrent dumper. The walk now runs under SEH and dumps are serialized.
+// No C++ objects in this function: it is a __try frame.
+int xs_unwind_into(CONTEXT* ctx, char* line, int len, int cap, std::uint64_t lo, std::uint64_t hi, bool* any_game) {
+    __try {
+        for (int depth = 0; depth < 40 && ctx->Rip; ++depth) {
+            const std::uint64_t rip = ctx->Rip;
+            const bool game = rip >= lo && rip < hi;
+            *any_game |= game;
+            if (len < cap - 40)
+                len += std::snprintf(line + len, cap - len, game ? " G+%llx" : " %llx",
+                                     static_cast<unsigned long long>(game ? rip - lo : rip));
+            DWORD64 image_base = 0;
+            PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(rip, &image_base, nullptr);
+            if (!fn) {  // leaf: return address at [rsp]
+                if (!xs_readable(reinterpret_cast<void*>(ctx->Rsp), 8)) break;
+                ctx->Rip = *reinterpret_cast<DWORD64*>(ctx->Rsp);
+                ctx->Rsp += 8;
+            } else {
+                void* handler_data = nullptr;
+                DWORD64 establisher = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, rip, fn, ctx, &handler_data, &establisher, nullptr);
+            }
+            if (ctx->Rip == rip) break;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (len < cap - 16) len += std::snprintf(line + len, cap - len, " <fault>");
+    }
+    return len;
+}
+
 void xs_dump_thread_stacks() {
+    static std::atomic<bool> dumping{false};  // agA23: one dump at a time (two dumpers walked each other in rn9)
+    if (dumping.exchange(true)) {
+        std::fprintf(stderr, "[stacks] dump already running, skipped\n");
+        return;
+    }
+    struct Clear { ~Clear() { dumping.store(false); } } clear_on_exit;
     static int dump_calls = 0;
     const int dumped_call = ++dump_calls;
     const DWORD self_tid = GetCurrentThreadId(), pid = GetCurrentProcessId();
@@ -1425,26 +1464,7 @@ void xs_dump_thread_stacks() {
         ResumeThread(th);
         if (got_ctx) {
             bool any_game = false;
-            for (int depth = 0; depth < 40 && ctx.Rip; ++depth) {
-                const std::uint64_t rip = ctx.Rip;
-                const bool game = rip >= lo && rip < hi;
-                any_game |= game;
-                if (len < static_cast<int>(sizeof(line)) - 40)
-                    len += std::snprintf(line + len, sizeof(line) - len, game ? " G+%llx" : " %llx",
-                                         static_cast<unsigned long long>(game ? rip - lo : rip));
-                DWORD64 image_base = 0;
-                PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(rip, &image_base, nullptr);
-                if (!fn) {  // leaf: return address at [rsp]
-                    if (!xs_readable(reinterpret_cast<void*>(ctx.Rsp), 8)) break;
-                    ctx.Rip = *reinterpret_cast<DWORD64*>(ctx.Rsp);
-                    ctx.Rsp += 8;
-                } else {
-                    void* handler_data = nullptr;
-                    DWORD64 establisher = 0;
-                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, rip, fn, &ctx, &handler_data, &establisher, nullptr);
-                }
-                if (ctx.Rip == rip) break;
-            }
+            len = xs_unwind_into(&ctx, line, len, static_cast<int>(sizeof(line)), lo, hi, &any_game);
             if (any_game) {
                 const long game_index = xs_game_thread_index(th);
                 const void* tls_block = t_last_tls_block;
