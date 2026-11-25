@@ -700,6 +700,19 @@ void hang_write(const char* text, std::size_t n) {
     HANDLE err = GetStdHandle(STD_ERROR_HANDLE);  // straight to the handle: no CRT lock
     if (err && err != INVALID_HANDLE_VALUE) WriteFile(err, text, static_cast<DWORD>(n), &wr, nullptr);
 }
+__declspec(noinline) void hang_stack_fill(const CONTEXT* c, char* out, std::size_t cap) {
+    const std::string st = ::rt::startup_trace::detail::stack_from(*c);
+    std::snprintf(out, cap, "%s", st.c_str());
+}
+// agA23: no C++ objects here (a __try frame). A fault inside the walk skips hang_stack_fill's string destructor (a leak).
+void hang_stack_safe(const CONTEXT* c, char* out, std::size_t cap) {
+    out[0] = 0;
+    __try {
+        hang_stack_fill(c, out, cap);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        std::snprintf(out, cap, "<walk faulted>");
+    }
+}
 void hang_dump_threads(std::uint64_t idle_ms) {
     if (g_hang_file == INVALID_HANDLE_VALUE) {
         char path[260] = "C:\\zroot\\logs\\hang.txt";
@@ -737,8 +750,11 @@ void hang_dump_threads(std::uint64_t idle_ms) {
         n = std::snprintf(line, sizeof line, "[hang]   tid %lu rip %s\n", te.th32ThreadID,
                           ::rt::startup_trace::where(c.Rip).c_str());
         hang_write(line, n);
-        const std::string st = ::rt::startup_trace::detail::stack_from(c);
-        n = std::snprintf(line, sizeof line, "[hang]   tid %lu: %s\n", te.th32ThreadID, st.c_str());
+        // agA23: the walk reads the RESUMED thread's live stack; rp3 crashed here (ntdll, read of 0xff..f0), so it
+        // runs under SEH (hang_stack_safe) and a fault prints "<walk faulted>".
+        char st[3072];
+        hang_stack_safe(&c, st, sizeof st);
+        n = std::snprintf(line, sizeof line, "[hang]   tid %lu: %s\n", te.th32ThreadID, st);
         hang_write(line, n);
     }
     CloseHandle(snap);
