@@ -714,6 +714,7 @@ void hang_dump_threads(std::uint64_t idle_ms) {
                           (unsigned long long)idle_ms, (unsigned long long)g_hang_last_frame.load());
     hang_write(line, n);
     if (auto wd = ::leonida::ce::wait_dump_fn().load()) wd();  // agA21: queue waits / fence signals
+    if (auto qd = ::leonida::ce::queue_dump_fn().load()) qd();  // agA22: Vulkan timeline semaphores / submissions
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snap == INVALID_HANDLE_VALUE) return;
     THREADENTRY32 te{};

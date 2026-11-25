@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -124,6 +125,22 @@ struct VulkanDeviceFunctions {
 #define LEONIDA_VK_LOAD(name) name = reinterpret_cast<PFN_##name>(leonida::device_proc_or_khr(get, device, #name));
         LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_LOAD)
 #undef LEONIDA_VK_LOAD
+        // HACK (agA22, LEONIDA_CE_QUERY_NOWAIT=1, default off): query result copies without VK_QUERY_RESULT_WAIT_BIT.
+        // A copy that waits for a query that never becomes available (reset, never ended) stalls its queue on the GPU
+        // forever with no warp running - a candidate for the post-Confirm hang. Unavailable queries are then left
+        // unwritten instead.
+        if (vkCmdCopyQueryPoolResults) {
+            static const bool nowait = [] { const char* e = std::getenv("LEONIDA_CE_QUERY_NOWAIT"); return e && e[0] == '1'; }();
+            if (nowait) {
+                static PFN_vkCmdCopyQueryPoolResults original = nullptr;
+                original = vkCmdCopyQueryPoolResults;
+                vkCmdCopyQueryPoolResults = [](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first, std::uint32_t count,
+                                               VkBuffer dst, VkDeviceSize offset, VkDeviceSize stride, VkQueryResultFlags flags) {
+                    original(cb, pool, first, count, dst, offset, stride, flags & ~VkQueryResultFlags(VK_QUERY_RESULT_WAIT_BIT));
+                };
+                std::fprintf(stderr, "[hack] QUERY_NOWAIT: query result copies run without WAIT_BIT\n");
+            }
+        }
         return vkCreateCommandPool && vkDestroyCommandPool && vkAllocateCommandBuffers && vkResetCommandBuffer &&
                vkBeginCommandBuffer && vkEndCommandBuffer && vkQueueSubmit && vkQueueWaitIdle && vkCreateSemaphore &&
                vkDestroySemaphore && vkGetSemaphoreCounterValue && vkWaitSemaphores && vkSignalSemaphore &&
@@ -1742,6 +1759,140 @@ private:
 #pragma warning(pop)
 #endif
 
+// agA22 (SYNC_DUMP, always on, diagnostic): every timeline semaphore the runtime knows (queue progress timelines,
+// D3D12 fences), the highest value submitted to signal / wait for each, and the recent submissions per queue. The hang
+// watch prints it (ce::queue_dump_fn) with vkGetSemaphoreCounterValue, to find a wait nobody will satisfy.
+namespace ce_sync {
+struct Wait { VkSemaphore s; std::uint64_t v; };
+struct Sub {
+    std::uint64_t ticket = 0, tick = 0;
+    std::vector<Wait> waits;
+    VkSemaphore fence = VK_NULL_HANDLE;
+    std::uint64_t fence_value = 0;
+    bool cb = false, sparse = false;
+};
+struct Sem {
+    char kind = '?';  // Q = queue progress, F = D3D12 fence
+    int id = 0;
+    bool dead = false;
+    std::uint64_t initial = 0, max_signal = 0, max_wait = 0, cpu_signal = 0, wait_tick = 0, signal_tick = 0;
+    int last_waiter = -1, last_signaler = -1;  // queue id, -2 = CPU
+};
+struct Q {
+    void* obj = nullptr;
+    VkSemaphore progress = VK_NULL_HANDLE;
+    int id = 0, kind = 0;
+    std::deque<Sub> recent;
+    std::uint64_t subs = 0;
+};
+struct Reg {
+    std::mutex mu;
+    std::unordered_map<VkSemaphore, Sem> sems;
+    std::vector<Q> queues;
+    int next_queue = 0, next_fence = 0;
+};
+inline Reg& reg() {
+    static Reg r;
+    return r;
+}
+inline std::uint64_t now_ms() {
+    return std::uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+inline void add_fence(VkSemaphore s, std::uint64_t initial) {
+    auto& r = reg();
+    std::lock_guard lock(r.mu);
+    Sem sem;
+    sem.kind = 'F';
+    sem.id = r.next_fence++;
+    sem.initial = sem.max_signal = initial;
+    r.sems[s] = sem;
+}
+inline void remove_sem(VkSemaphore s) {
+    auto& r = reg();
+    std::lock_guard lock(r.mu);
+    const auto it = r.sems.find(s);
+    if (it != r.sems.end()) it->second.dead = true;
+}
+inline int add_queue(void* obj, VkSemaphore progress, int kind) {
+    auto& r = reg();
+    std::lock_guard lock(r.mu);
+    Q q;
+    q.obj = obj;
+    q.progress = progress;
+    q.id = r.next_queue++;
+    q.kind = kind;
+    r.queues.push_back(q);
+    Sem sem;
+    sem.kind = 'Q';
+    sem.id = q.id;
+    r.sems[progress] = sem;
+    return q.id;
+}
+inline void remove_queue(void* obj) {
+    auto& r = reg();
+    std::lock_guard lock(r.mu);
+    for (auto it = r.queues.begin(); it != r.queues.end(); ++it)
+        if (it->obj == obj) {
+            const auto s = r.sems.find(it->progress);
+            if (s != r.sems.end()) s->second.dead = true;
+            r.queues.erase(it);
+            break;
+        }
+}
+inline void note_submit(VkSemaphore progress, std::uint64_t ticket, std::span<const VkSemaphore> waits,
+                        std::span<const std::uint64_t> values, VkSemaphore fence, std::uint64_t fence_value, bool cb,
+                        bool sparse) {
+    auto& r = reg();
+    const std::uint64_t t = now_ms();
+    std::lock_guard lock(r.mu);
+    Q* q = nullptr;
+    for (auto& e : r.queues)
+        if (e.progress == progress) q = &e;
+    const int qid = q ? q->id : -1;
+    Sub sub;
+    sub.ticket = ticket;
+    sub.tick = t;
+    sub.fence = fence;
+    sub.fence_value = fence_value;
+    sub.cb = cb;
+    sub.sparse = sparse;
+    for (std::size_t i = 0; i < waits.size() && i < values.size(); ++i) {
+        sub.waits.push_back({waits[i], values[i]});
+        auto& s = r.sems[waits[i]];
+        if (values[i] >= s.max_wait) {
+            s.max_wait = values[i];
+            s.last_waiter = qid;
+            s.wait_tick = t;
+        }
+    }
+    auto& p = r.sems[progress];
+    p.max_signal = std::max(p.max_signal, ticket);
+    p.last_signaler = qid;
+    p.signal_tick = t;
+    if (fence) {
+        auto& f = r.sems[fence];
+        f.max_signal = std::max(f.max_signal, fence_value);
+        f.last_signaler = qid;
+        f.signal_tick = t;
+    }
+    if (q) {
+        ++q->subs;
+        q->recent.push_back(std::move(sub));
+        while (q->recent.size() > 64) q->recent.pop_front();
+    }
+}
+inline void note_cpu_signal(VkSemaphore s, std::uint64_t value) {
+    auto& r = reg();
+    std::lock_guard lock(r.mu);
+    auto& sem = r.sems[s];
+    sem.cpu_signal = std::max(sem.cpu_signal, value);
+    sem.max_signal = std::max(sem.max_signal, value);
+    sem.last_signaler = -2;
+    sem.signal_tick = now_ms();
+}
+}  // namespace ce_sync
+
 // A Vulkan timeline semaphore with D3D12 fence semantics for the host side.
 class VulkanFence {
 public:
@@ -1753,10 +1904,12 @@ public:
         if (context.vk.vkCreateSemaphore(context.device(), &info, nullptr, &semaphore_) != VK_SUCCESS)
             semaphore_ = VK_NULL_HANDLE;
         if (semaphore_) context.holds().add_fence(semaphore_, initial);
+        if (semaphore_) ce_sync::add_fence(semaphore_, initial);  // agA22
     }
     ~VulkanFence() {
         if (!semaphore_) return;
         context_.holds().remove_fence(semaphore_);  // batches held on it can never run: dropped and reported
+        ce_sync::remove_sem(semaphore_);  // agA22
         context_.vk.vkDestroySemaphore(context_.device(), semaphore_, nullptr);
     }
     VulkanFence(const VulkanFence&) = delete;
@@ -1796,6 +1949,7 @@ public:
         const VkResult result = context_.vk.vkSignalSemaphore(context_.device(), &info);
         if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
         if (result != VK_SUCCESS) return false;
+        ce_sync::note_cpu_signal(semaphore_, value);  // agA22
         context_.holds().signaled(semaphore_, value);  // queues that held a batch for this value run it now
         context_.holds().pump_ready();
         return true;
@@ -1862,6 +2016,8 @@ public:
         type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
         VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
         ok_ = ok_ && vk.vkCreateSemaphore(context.device(), &info, nullptr, &progress_) == VK_SUCCESS;
+        if (ok_) ce_sync::add_queue(this, progress_, int(kind_));  // agA22
+        if (ok_) ::leonida::ce::queue_dump_fn().store(&VulkanQueue::ce_sync_dump);
         try {
             context_.holds().attach(this);
         } catch (...) {
@@ -1875,6 +2031,7 @@ public:
     ~VulkanQueue() {
         auto& vk = context_.vk;
         if (gt_pool_ && vk.vkDestroyQueryPool) vk.vkDestroyQueryPool(context_.device(), gt_pool_, nullptr);  // agA21
+        ce_sync::remove_queue(this);  // agA22
         context_.holds().detach(this);  // no thread releases into this queue from here on
         report_held_at_teardown();
         context_.holds().pump_ready();  // presents queued behind what was just dropped can run
@@ -1898,6 +2055,9 @@ public:
             // finished: the next submission on another queue must not wait on a semaphore that is about to go.
             std::lock_guard lock(context_.storage_mutex_);
             if (context_.storage_init_semaphore_ == progress_) context_.storage_init_semaphore_ = VK_NULL_HANDLE;
+            // agA22: the same for the bindless-upload wait (was missing: a queue made later would wait on a destroyed
+            // semaphore, or on whatever new semaphore reuses the handle).
+            if (context_.bindless_upload_semaphore_ == progress_) context_.bindless_upload_semaphore_ = VK_NULL_HANDLE;
         }
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
         if (progress_) vk.vkDestroySemaphore(context_.device(), progress_, nullptr);
@@ -2053,6 +2213,130 @@ public:
     std::uint32_t gt_next_ = 0;
     std::uint64_t gt_seq_ = 0, gt_done_ = 0, gt_slow_ = 0;
     double gt_max_ = 0, gt_sum_ = 0;
+
+    // agA22 (SYNC_DUMP): called by the hang watch thread. Takes no lock a submitting thread holds across a blocking
+    // call except the registry's own (try_lock for the queue state).
+    static void ce_sync_dump() {
+        auto& r = ce_sync::reg();
+        std::unique_lock reg_lock(r.mu, std::try_to_lock);
+        if (!reg_lock.owns_lock()) {
+            std::fprintf(stderr, "[hack] SYNC_DUMP: registry busy\n");
+            std::fflush(stderr);
+            return;
+        }
+        if (r.queues.empty()) return;
+        VulkanContext& ctx = static_cast<VulkanQueue*>(r.queues.front().obj)->context_;
+        const std::uint64_t now = ce_sync::now_ms();
+        const auto counter = [&](VkSemaphore s) -> std::uint64_t {
+            const auto it = r.sems.find(s);
+            if (it != r.sems.end() && it->second.dead) return ~0ull - 1;
+            if (it == r.sems.end() || it->second.kind == '?') return ~0ull - 2;  // unregistered: never query it
+            std::uint64_t v = ~0ull;
+            if (ctx.vk.vkGetSemaphoreCounterValue(ctx.device(), s, &v) != VK_SUCCESS) return ~0ull;
+            return v;
+        };
+        const auto name = [&](VkSemaphore s) -> std::string {
+            char b[96];
+            const auto it = r.sems.find(s);
+            if (it == r.sems.end()) std::snprintf(b, sizeof b, "UNKNOWN %p", (void*)s);
+            else std::snprintf(b, sizeof b, "%s%c%d%s(%p)", it->second.kind == 'Q' ? "queue" : "fence", ' ',
+                               it->second.id, it->second.dead ? " DESTROYED" : "", (void*)s);
+            return b;
+        };
+        const auto wait_state = [&](VkSemaphore s, std::uint64_t v) -> std::string {
+            const std::uint64_t c = counter(s);
+            const auto it = r.sems.find(s);
+            const std::uint64_t sig = it == r.sems.end() ? 0 : it->second.max_signal;
+            char b[256];
+            const char* tag = c == ~0ull - 1 ? "WAITS ON A DESTROYED SEMAPHORE"
+                              : c == ~0ull - 2 ? "UNREGISTERED SEMAPHORE (destroyed or internal?)"
+                              : c >= v       ? "ok"
+                              : sig >= v     ? "PENDING (signal submitted, not reached)"
+                                             : "BLOCKED - NO SIGNAL OF THAT VALUE SUBMITTED";
+            std::snprintf(b, sizeof b, "%s >= %llu: current %llu, max submitted signal %llu -> %s", name(s).c_str(),
+                          (unsigned long long)v, (unsigned long long)c, (unsigned long long)sig, tag);
+            return b;
+        };
+        std::fprintf(stderr, "[hack] SYNC_DUMP: %zu queues, %zu semaphores\n", r.queues.size(), r.sems.size());
+        {
+            std::unique_lock lock(ctx.storage_mutex_, std::try_to_lock);
+            if (lock.owns_lock()) {
+                std::fprintf(stderr, "[hack] SYNC_DUMP: storage_init %s value %llu version %llu; bindless_upload %s value %llu version %llu\n",
+                             ctx.storage_init_semaphore_ ? name(ctx.storage_init_semaphore_).c_str() : "none",
+                             (unsigned long long)ctx.storage_init_value_, (unsigned long long)ctx.storage_init_version_,
+                             ctx.bindless_upload_semaphore_ ? name(ctx.bindless_upload_semaphore_).c_str() : "none",
+                             (unsigned long long)ctx.bindless_upload_value_, (unsigned long long)ctx.bindless_upload_version_);
+            } else {
+                std::fprintf(stderr, "[hack] SYNC_DUMP: storage_mutex busy\n");
+            }
+        }
+        static const char* kinds[] = {"direct", "compute", "copy"};
+        for (const auto& q : r.queues) {
+            auto* self = static_cast<VulkanQueue*>(q.obj);
+            const std::uint64_t done = counter(q.progress);
+            std::fprintf(stderr, "[hack] SYNC_DUMP: queue %d (%s, VkQueue %p) submitted %llu completed %llu, %llu submissions; seen storage %llu bindless %llu\n",
+                         q.id, kinds[q.kind % 3], (void*)self->queue_, (unsigned long long)self->submitted_,
+                         (unsigned long long)done, (unsigned long long)q.subs,
+                         (unsigned long long)self->storage_init_seen_, (unsigned long long)self->bindless_upload_seen_);
+            bool first = true;
+            for (const auto& sub : q.recent) {
+                if (sub.ticket <= done) continue;
+                bool all_ok = true;
+                std::fprintf(stderr, "[hack] SYNC_DUMP:   outstanding ticket %llu (%llu ms ago)%s%s, %zu waits%s\n",
+                             (unsigned long long)sub.ticket, (unsigned long long)(now - sub.tick),
+                             sub.cb ? " cmdbuf" : " no-cmdbuf", sub.sparse ? " SPARSE" : "", sub.waits.size(),
+                             sub.fence ? (", signals " + name(sub.fence) + " = " + std::to_string(sub.fence_value)).c_str() : "");
+                for (const auto& w : sub.waits) {
+                    const std::string st = wait_state(w.s, w.v);
+                    all_ok &= st.size() >= 4 && st.compare(st.size() - 4, 4, "> ok") == 0;
+                    std::fprintf(stderr, "[hack] SYNC_DUMP:     wait %s\n", st.c_str());
+                }
+                if (first && all_ok)
+                    std::fprintf(stderr, "[hack] SYNC_DUMP:     ^ FIRST OUTSTANDING with every wait satisfied: stalled INSIDE its command buffer (or GPU busy)\n");
+                first = false;
+            }
+            std::unique_lock state(self->state_mutex_, std::try_to_lock);
+            if (!state.owns_lock()) {
+                std::fprintf(stderr, "[hack] SYNC_DUMP:   (queue state busy: held/pending waits not shown)\n");
+                continue;
+            }
+            for (std::size_t i = 0; i < self->waits_.size(); ++i)
+                std::fprintf(stderr, "[hack] SYNC_DUMP:   pending wait (next submission) %s\n",
+                             wait_state(self->waits_[i], self->wait_values_[i]).c_str());
+            if (!self->held_.empty()) std::fprintf(stderr, "[hack] SYNC_DUMP:   %zu HELD operations\n", self->held_.size());
+            std::size_t shown = 0;
+            for (const auto& op : self->held_) {
+                if (++shown > 6) break;
+                std::fprintf(stderr, "[hack] SYNC_DUMP:   held %s seq %llu%s\n",
+                             op.kind == Deferred::Kind::batch ? "batch" : op.kind == Deferred::Kind::signal ? "signal" : "marker",
+                             (unsigned long long)op.seq,
+                             op.kind == Deferred::Kind::signal ? (" of " + name(op.fence) + " = " + std::to_string(op.value)).c_str() : "");
+                for (std::size_t i = 0; i < op.waits.size(); ++i)
+                    std::fprintf(stderr, "[hack] SYNC_DUMP:     held wait %s\n", wait_state(op.waits[i], op.wait_values[i]).c_str());
+            }
+        }
+        std::size_t quiet = 0;
+        for (const auto& [s, sem] : r.sems) {
+            const std::uint64_t c = (sem.dead || sem.kind == '?') ? 0 : counter(s);
+            const bool interesting = sem.kind == 'Q' || sem.max_wait > 0 || sem.kind == '?';
+            if (!interesting) {
+                ++quiet;
+                continue;
+            }
+            const char* tag = sem.dead                                               ? " DESTROYED"
+                              : sem.max_wait > c && sem.max_wait > sem.max_signal ? " <== DEADLOCK: awaited value above current AND above every submitted signal"
+                              : sem.max_wait > c                                    ? " <== awaited, signal submitted but not reached"
+                                                                                    : "";
+            std::fprintf(stderr, "[hack] SYNC_DUMP: sem %s current %llu max-signal %llu (by %d, %llu ms ago%s) max-wait %llu (by queue %d, %llu ms ago) cpu %llu initial %llu%s\n",
+                         name(s).c_str(), (unsigned long long)c, (unsigned long long)sem.max_signal, sem.last_signaler,
+                         (unsigned long long)(sem.signal_tick ? now - sem.signal_tick : 0), sem.last_signaler == -2 ? " CPU" : "",
+                         (unsigned long long)sem.max_wait, sem.last_waiter,
+                         (unsigned long long)(sem.wait_tick ? now - sem.wait_tick : 0), (unsigned long long)sem.cpu_signal,
+                         (unsigned long long)sem.initial, tag);
+        }
+        std::fprintf(stderr, "[hack] SYNC_DUMP: %zu fences never waited on by the GPU not listed\n", quiet);
+        std::fflush(stderr);
+    }
 
     ReplayResult execute(std::span<const CommandList* const> lists, const PinFn& pin = {}) {
         ReplayResult result = ReplayResult::success;
@@ -3050,6 +3334,7 @@ private:
                 return false;
             }
             context_.record_submit_locked(progress_, ticket);
+            ce_sync::note_submit(progress_, ticket, semaphores, values, VK_NULL_HANDLE, 0, false, true);  // agA22
         }
         submitted_ = last_sparse_ = ticket;
         clear_waits(ticket);
@@ -3225,6 +3510,8 @@ private:
             if (res == VK_SUCCESS) {
                 context_.record_submit_locked(progress_, ticket);
                 if (signals_fence) context_.holds().signaled(fence, value);
+                ce_sync::note_submit(progress_, ticket, semaphores, values, signals_fence ? fence : VK_NULL_HANDLE,
+                                     value, command_buffer != VK_NULL_HANDLE, false);  // agA22
             }
         }
         if (res == VK_ERROR_DEVICE_LOST) {

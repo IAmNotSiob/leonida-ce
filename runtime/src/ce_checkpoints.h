@@ -45,6 +45,11 @@ inline std::atomic<WaitDumpFn>& wait_dump_fn() {
     static std::atomic<WaitDumpFn> f{nullptr};
     return f;
 }
+// agA22: the Vulkan queues print every known timeline semaphore and their outstanding submissions (SYNC_DUMP).
+inline std::atomic<WaitDumpFn>& queue_dump_fn() {
+    static std::atomic<WaitDumpFn> f{nullptr};
+    return f;
+}
 // agA21 (LEONIDA_CE_SLOT80_DISPATCH): the workgroup size of a compute PSO of this device (false if unknown).
 using LocalSizeFn = bool (*)(const void* pso, std::uint32_t out[3]);
 inline std::atomic<LocalSizeFn>& local_size_fn() {
