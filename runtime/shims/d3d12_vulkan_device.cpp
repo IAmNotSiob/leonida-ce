@@ -1068,6 +1068,30 @@ static bool ce_ptr_check(const std::uint32_t* s, std::uint32_t vm, std::uint32_t
     return skip;
 }
 
+
+// HACK (agA25) LEONIDA_CE_VSHARP_GUARD_ALL=1: every translated pointer (heap_base + VA, however it was formed: table V#,
+// CB-loaded V#, bindless V#, raw pointer) farther than LEONIDA_CE_VSHARP_GUARD_LIMIT (default 1 TiB) above heap_base, or
+// below it, is redirected to heap_base (src/spirv_va_guard.h spirv_guard_ptr_all), in compute AND graphics modules.
+static void ce_guard_all(std::vector<std::uint32_t>& words, const char* name) {
+    static const bool on = [] { const char* e = std::getenv("LEONIDA_CE_VSHARP_GUARD_ALL"); return e && e[0] == 0x31; }();
+    if (!on) return;
+    static const std::uint64_t limit = [] {
+        const char* v = std::getenv("LEONIDA_CE_VSHARP_GUARD_LIMIT");
+        const std::uint64_t l = v ? std::strtoull(v, nullptr, 0) : (1ull << 40);
+        std::fprintf(stderr, "[hack] VSHARP_GUARD_ALL: on, limit heap_base + 0x%llx\n", (unsigned long long)l);
+        return l;
+    }();
+    const int n = leonida::spirv_guard_ptr_all(words, limit);
+    static std::atomic<std::uint64_t> modules{0}, pointers{0}, untouched{0};
+    if (!n) ++untouched; else { ++modules; pointers += std::uint64_t(n); }
+    const std::uint64_t k = modules.load() + untouched.load();
+    static std::atomic<int> told{0};
+    if ((n && told++ < 8) || (k & (k - 1)) == 0)
+        std::fprintf(stderr, "[hack] VSHARP_GUARD_ALL: %s: %d pointer(s) guarded (%llu modules guarded, %llu pointers, %llu without pointers)\n",
+                     name, n, (unsigned long long)modules.load(), (unsigned long long)pointers.load(),
+                     (unsigned long long)untouched.load());
+}
+
 namespace rt::d3d12 {
 bool ce_pipeline_local_size(const void* pso, std::uint32_t out[3]);  // agA21
 namespace {
@@ -4995,6 +5019,7 @@ public:
                     stage.words = std::move(patched);
                 }
             }
+            ce_guard_all(stage.words, stage.entry->name.c_str());  // agA25
             VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
             module_info.codeSize = stage.words.size() * 4;
             module_info.pCode = stage.words.data();
@@ -5570,7 +5595,9 @@ public:
         // HACK (agA14): LEONIDA_CE_VA_GUARD=sub1,sub2 (or 1 = every compute program): pointers from heap_base + VA with
         // the VA farther than LEONIDA_CE_VA_GUARD_WINDOW (default 2^38) from the arena read the arena start instead of
         // page-faulting (src/spirv_va_guard.h; re29-re36 READ_INVALIDs at VAs terabytes away).
-        if (const char* g = std::getenv("LEONIDA_CE_VA_GUARD")) {
+        ce_guard_all(words, entry->name.c_str());  // agA25 (replaces VA_GUARD when on)
+        static const bool guard_all = [] { const char* e = std::getenv("LEONIDA_CE_VSHARP_GUARD_ALL"); return e && e[0] == 0x31; }();
+        if (const char* g = guard_all ? nullptr : std::getenv("LEONIDA_CE_VA_GUARD")) {
             static const std::uint64_t window = [] { const char* v = std::getenv("LEONIDA_CE_VA_GUARD_WINDOW"); return v ? std::strtoull(v, nullptr, 0) : (1ull << 38); }();
             std::string all(g);
             bool match = false;
