@@ -396,8 +396,100 @@ static void ce_pc_scan_buffer(std::uint64_t pipe, unsigned sgpr, unsigned slot, 
         ce_pc_report(pipe, "qword in buffer", sgpr, slot, (va & ~7ull) + i * 8, v, w, 2);
     }
 }
+// agA23 LEONIDA_CE_CB_PEEK=name:sgpr:off:cboff[,..] (needs PTR_CHECK>=1; runs before PTR_CHECK_ONLY): at replay
+// prepare of a dispatch whose pipeline name contains <name>, read the buffer V# at arena[s<sgpr> + off] (a one-dword
+// table), decode its base, and print the 2 dwords at base + cboff: the value the shader will s_buffer_load (e.g. the
+// fspx blur radius: d5613de2:4:0xca0:0x43c). Also says whether the table entry is in the heap mirror and what the
+// TITLE heap holds there. Lines: the first 16 per target, then only when the value changes (<= 400 in all).
+struct CePeek { std::string name; unsigned sgpr; std::uint32_t off, cboff; std::uint64_t last; int lines; };
+static std::vector<CePeek>& ce_peeks() {
+    static std::vector<CePeek> v = [] {
+        std::vector<CePeek> r;
+        const char* e = std::getenv("LEONIDA_CE_CB_PEEK");
+        if (!e) return r;
+        const std::string t = e;
+        std::size_t p = 0;
+        while (p < t.size()) {
+            std::size_t q = t.find(',', p);
+            if (q == std::string::npos) q = t.size();
+            const std::string one = t.substr(p, q - p);
+            const std::size_t a = one.find(':');
+            const std::size_t b = a == std::string::npos ? a : one.find(':', a + 1);
+            const std::size_t c = b == std::string::npos ? b : one.find(':', b + 1);
+            if (c != std::string::npos)
+                r.push_back({one.substr(0, a), unsigned(std::strtoul(one.c_str() + a + 1, nullptr, 0)),
+                             std::uint32_t(std::strtoul(one.c_str() + b + 1, nullptr, 0)),
+                             std::uint32_t(std::strtoul(one.c_str() + c + 1, nullptr, 0)), ~0ull, 0});
+            p = q + 1;
+        }
+        std::fprintf(stderr, "[hack] CB_PEEK: %zu target(s)\n", r.size());
+        return r;
+    }();
+    return v;
+}
+static void ce_cb_peek(const std::uint32_t* s, std::uint64_t pipe) {
+    auto& peeks = ce_peeks();
+    if (peeks.empty()) return;
+    static std::mutex mu;
+    static std::unordered_map<std::uint64_t, int> which;  // pipe -> peek index or -1
+    static int total = 0;
+    std::lock_guard lock(mu);
+    auto it = which.find(pipe);
+    if (it == which.end()) {
+        const std::string nm = leonida::ce::pipeline_name(pipe);
+        int w = -1;
+        for (std::size_t i = 0; i < peeks.size() && w < 0; ++i)
+            if (nm.find(peeks[i].name) != std::string::npos) w = int(i);
+        it = which.emplace(pipe, w).first;
+    }
+    if (it->second < 0 || total >= 400) return;
+    CePeek& pk = peeks[std::size_t(it->second)];
+    if (pk.sgpr >= 32) return;
+    const std::uint64_t table = s[pk.sgpr], at = table + pk.off;
+    std::uint32_t d[4] = {};
+    std::uint32_t val[2] = {0xdeadbeefu, 0xdeadbeefu};
+    const char* where = "?";
+    std::uint64_t base = 0;
+    if (at + 16 <= g_pc_size) {
+        std::memcpy(d, g_pc_mapped + at, sizeof d);
+        base = d[0] | (std::uint64_t(d[1] & 0xffff) << 32);
+        if (base && base + pk.cboff + 8 <= g_pc_size) {
+            std::memcpy(val, g_pc_mapped + base + pk.cboff, 8);
+            where = "arena";
+        } else if (base && rt::d3d12::ce_copy_title(val, base + pk.cboff, 8)) {
+            where = "TITLE (outside arena)";
+        } else {
+            where = "UNREADABLE";
+        }
+    } else {
+        where = "table outside arena";
+    }
+    const std::uint64_t key = (std::uint64_t(val[1]) << 32) | val[0];
+    if (pk.lines >= 16 && key == pk.last) return;
+    pk.last = key;
+    ++pk.lines;
+    ++total;
+    float f[2];
+    std::memcpy(f, val, 8);
+    const std::uint64_t mlo = leonida::ce::mirror_lo().load(), mhi = leonida::ce::mirror_hi().load(),
+                        mt = leonida::ce::mirror_title().load();
+    const bool in_mirror = mt && at >= mlo && at + 16 <= mhi;
+    std::uint32_t t[4] = {};
+    const bool tok = in_mirror && rt::d3d12::ce_copy_title(t, mt + (at - mlo), sizeof t);
+    char tail[128] = {};
+    if (in_mirror)
+        std::snprintf(tail, sizeof tail, "; title heap [ %08x %08x %08x %08x ]%s", t[0], t[1], t[2], t[3],
+                      !tok ? " UNREADABLE" : std::memcmp(t, d, 16) == 0 ? " (= mirror)" : " (DIFFERS)");
+    std::fprintf(stderr,
+                 "[hack] CB_PEEK: %s s%u=0x%llx +0x%x (entry %s) V# [ %08x %08x %08x %08x ] base 0x%llx -> %s +0x%x = %08x %08x (%g %g)%s\n",
+                 pk.name.c_str(), pk.sgpr, (unsigned long long)table, pk.off, in_mirror ? "in heap mirror" : "not mirrored",
+                 d[0], d[1], d[2], d[3], (unsigned long long)base, where, pk.cboff, val[0], val[1], double(f[0]),
+                 double(f[1]), tail);
+    std::fflush(stderr);
+}
 static void ce_ptr_check(const std::uint32_t* s, std::uint32_t vm, std::uint32_t tm, std::uint64_t pipe) {
     if (!g_pc_ctx || !g_pc_mapped) return;
+    ce_cb_peek(s, pipe);  // agA23
     // agA18: LEONIDA_CE_PTR_CHECK_ONLY=sub1,sub2,..: only pipelines whose name contains one of the substrings.
     static const std::vector<std::string> only = [] {
         std::vector<std::string> v;
