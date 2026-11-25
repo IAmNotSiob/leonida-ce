@@ -3,6 +3,7 @@
 #include <set>
 #include <map>
 #include <vector>
+#include <deque>
 #include <mutex>
 #include <intrin.h>
 // Xbox-ABI proxy around a PC ID3D12Device. See d3d12_xs_device.h for the measured slots and the limits.
@@ -856,12 +857,25 @@ std::uint64_t xs_gpu_address(std::uint64_t address, std::uint64_t size) {
 // magic code, don't wanna deal with hours of plumbing with what these conjured devils of the souls of gpt 6 astra did.. jeez
 struct XsPlaced { std::uint64_t va, size; ID3D12Resource* resource; D3D12_RESOURCE_DESC desc; };
 std::mutex g_placed_mu;
-std::vector<XsPlaced> g_placed;
+std::deque<XsPlaced> g_placed;  // agA5: deque, so xs_find_placed pointers survive push_back
 void xs_record_placed(std::uint64_t va, std::uint64_t size, ID3D12Resource* resource,
                       const D3D12_RESOURCE_DESC* console_desc = nullptr) {
     if (!va || !resource) return;
+    // HACK (agA5): hold a reference, so a stand-in the title releases is never freed under a later view of its VA
+    // (re1: CreateShaderResourceView -> Object::from -> Release -> free of a dead resource, heap corruption).
+    static const bool keep = [] { const char* e = std::getenv("LEONIDA_CE_PLACED_REF"); return !(e && e[0] == 0); }();
+    if (keep) resource->AddRef();
     std::lock_guard lock(g_placed_mu);
     g_placed.push_back({va, size ? size : 1, resource, console_desc ? *console_desc : resource->GetDesc()});
+    {   // DIAGNOSTIC (agA5): small-format 2D textures (glyph-cache hunt)
+        const auto& d = g_placed.back().desc;
+        static std::atomic<int> told{0};
+        const int f = static_cast<int>(d.Format);
+        if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && (f == 60 || f == 61 || f == 62 || f == 65 || f == 49 || f == 28) &&
+            d.Width >= 256 && d.Height >= 256 && told++ < 40)
+            std::fprintf(stderr, "[glyph?] placed 2D va %llx %llux%u fmt %d mips %u layout 0x%x size %llx\n", (unsigned long long)va,
+                         (unsigned long long)d.Width, d.Height, f, d.MipLevels, static_cast<unsigned>(d.Layout), (unsigned long long)size);
+    }
 }
 bool xs_placed_by_resource(const void* resource, XsPlaced& out) {
     std::lock_guard lock(g_placed_mu);
@@ -1568,7 +1582,18 @@ void xs_refresh_placed_textures(ID3D12Device* dev) {
         if (len) rt::xmem::commit_physical_range(reinterpret_cast<const void*>(t.va), len);  // XMem views commit on touch
         if (!len || !xs_readable(reinterpret_cast<const void*>(t.va), static_cast<UINT_PTR>(len))) continue;
         std::uint64_t h = 1469598103934665603ull, nonzero = 0;
-        for (std::uint64_t o = 0; o + 8 <= len; o += 4096) {
+        // HACK (agA5): sampling 8 bytes per 4 KiB missed glyphs Scaleform adds to its glyph-cache textures (re3: most
+        // body-text glyphs missing). Textures up to LEONIDA_CE_REFRESH_FULL_KB (default 4096) are hashed in full.
+        static const std::uint64_t full_bytes = [] {
+            const char* v = std::getenv("LEONIDA_CE_REFRESH_FULL_KB");
+            return (v ? std::strtoull(v, nullptr, 10) : 4096ull) * 1024ull;
+        }();
+        // Only single-channel textures (A8/R8: Scaleform glyph caches): hashing every texture in full ran re4 at ~3 fps.
+        const DXGI_FORMAT ff = t.desc.Format;
+        const bool glyphish = ff == DXGI_FORMAT_A8_UNORM || ff == DXGI_FORMAT_R8_UNORM || ff == DXGI_FORMAT_R8_TYPELESS ||
+                              static_cast<int>(ff) == 65 || static_cast<int>(ff) == 61;
+        const std::uint64_t stride = glyphish && len <= full_bytes ? 8 : 4096;
+        for (std::uint64_t o = 0; o + 8 <= len; o += stride) {
             std::uint64_t w = 0;
             std::memcpy(&w, reinterpret_cast<const void*>(t.va + o), 8);
             h = (h ^ w) * 1099511628211ull;
@@ -1583,7 +1608,13 @@ void xs_refresh_placed_textures(ID3D12Device* dev) {
         }
         if (changed && nonzero) {
             static std::atomic<int> told_rf{0};  // DIAGNOSTIC (bw): which placed textures the refresh re-uploads
-            if (told_rf++ < 60) {
+            static std::atomic<int> told_a8{0};  // agA5: every A8 (glyph cache) re-upload, up to 200
+            if (static_cast<int>(t.desc.Format) == 65 && told_a8++ < 200) {
+                std::fprintf(stderr, "[refresh] A8 re-upload va %llx %llux%u layout 0x%x\n", (unsigned long long)t.va,
+                             (unsigned long long)t.desc.Width, t.desc.Height, static_cast<unsigned>(t.desc.Layout));
+                std::fflush(stderr);
+            }
+            if (told_rf++ < 60 || told_rf % 200 == 0) {
                 std::fprintf(stderr, "[refresh] re-upload va %llx %llux%u fmt %d\n", (unsigned long long)t.va,
                              (unsigned long long)t.desc.Width, t.desc.Height, (int)t.desc.Format);
                 std::fflush(stderr);
@@ -3122,6 +3153,17 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                 }, new Arg{f}, 0, nullptr);
                 if (t) CloseHandle(t);
             }
+            static const std::vector<std::uint64_t> stacks_at = [] {  // agA5: LEONIDA_CE_STACKS_AT=2400,3000
+                std::vector<std::uint64_t> v;
+                char b[256] = {};
+                if (GetEnvironmentVariableA("LEONIDA_CE_STACKS_AT", b, sizeof(b)) > 0)
+                    for (char* p = b; *p;) { v.push_back(std::strtoull(p, &p, 10)); while (*p == ',' || *p == ' ') ++p; }
+                return v;
+            }();
+            if (std::find(stacks_at.begin(), stacks_at.end(), f) != stacks_at.end()) {
+                HANDLE t = CreateThread(nullptr, 0, [](void*) -> DWORD { xs_dump_thread_stacks(); return 0; }, nullptr, 0, nullptr);
+                if (t) CloseHandle(t);
+            }
             if (dump_stacks && (f == 300 || f == 4000 || f == 20000)) {
                 HANDLE t = CreateThread(nullptr, 0, [](void*) -> DWORD { xs_dump_thread_stacks(); return 0; }, nullptr, 0, nullptr);
                 if (t) CloseHandle(t);
@@ -3132,7 +3174,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                 const unsigned count = plane ? *reinterpret_cast<const unsigned*>(plane + 8) : 0;
                 void* const* res = plane ? *reinterpret_cast<void* const* const*>(plane + 0x10) : nullptr;
                 hang_heartbeat(f);  // agA3
-                if (leonida::rtdiag::on() && f % 300 == 0)  // agD: LEONIDA_CE_RTDIAG
+                if (leonida::rtdiag::on())  // agD: LEONIDA_CE_RTDIAG (at_present picks the frames; agA5)
                     leonida::rtdiag::at_present(static_cast<ID3D12CommandQueue*>(static_cast<IUnknown*>(self->real)),
                                                 count && res ? static_cast<ID3D12Resource*>(res[0]) : nullptr, f);
                 if ((pow2 || f % 2000 == 0) && count && res && res[0])

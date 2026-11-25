@@ -2347,16 +2347,25 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
             // matrix rows equal the cxform rows, x == y, and all text collapses onto the screen diagonal (the white
             // line). Give that V# stride 16.
             static const bool sf_stride = [] { const char* v = std::getenv("LEONIDA_CE_SF_STRIDE"); return !v || v[0] != '0'; }();
-            const std::uint32_t root = agg_root_word(draw.user_data);
+            const std::uint32_t root0 = agg_root_word(draw.user_data);
+            // agA5: TexTG batch VSs keep that V# after other descriptors, so look at the first 8 16-byte slots (slot 0
+            // with the agA4 test; later slots only for the exact 0x30014fac word 3 seen on every batch V#).
+            for (std::uint32_t slot = 0; sf_stride && root0 && slot < 8 && ::leonida_is_sf_batch_pso((std::uint64_t)draw.pipeline); ++slot) {
+            const std::uint32_t root = root0 + slot * 16;
             std::uint32_t w[4] = {};
-            if (sf_stride && root && ::leonida_is_sf_batch_pso((std::uint64_t)draw.pipeline) && copy_title_bytes(root, w, sizeof(w)) &&
-                !((w[1] >> 16) & 0x3FFF) && w[2] >= 64 && !(w[2] & 15) && (w[3] >> 30) == 0) {
+            if (!copy_title_bytes(root, w, sizeof(w))) break;
+            if (((w[1] >> 16) & 0x3FFF) == 16 && w[3] == 0x30014facu) break;  // already patched (agA4/agA5)
+            if (
+                !((w[1] >> 16) & 0x3FFF) && w[2] >= 64 && !(w[2] & 15) && (w[3] >> 30) == 0 &&
+                (slot == 0 || w[3] == 0x30014facu)) {
                 bool ok = true;
                 __try {
                     *reinterpret_cast<volatile std::uint32_t*>(std::uint64_t(root) + 4) = w[1] | (16u << 16);
                 } __except (1) { ok = false; }
                 static std::atomic<int> told{0};
-                if (told++ < 4) std::fprintf(stderr, "[hack] SF_STRIDE: root %x V# %08x %08x %08x %08x -> stride 16 (%d)\n", root, w[0], w[1], w[2], w[3], int(ok));
+                if (told++ < 4 || (slot && told < 40)) std::fprintf(stderr, "[hack] SF_STRIDE: root %x slot %u V# %08x %08x %08x %08x -> stride 16 (%d)\n", root0, slot, w[0], w[1], w[2], w[3], int(ok));
+                break;
+            }
             }
         }
         if (cb_fix && agg_root_word(draw.user_data)) {

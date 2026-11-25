@@ -121,13 +121,17 @@ inline void probe_resource(ID3D12Device* dev, ID3D12CommandQueue* queue, ID3D12R
 
 // At present `f` (queue proxy's real queue, presented plane 0 resource, the PC device).
 inline void at_present(ID3D12CommandQueue* queue, ID3D12Resource* presented, std::uint64_t f) {
-    if (!on() || f % 300 != 0) return;
+    static const std::uint64_t every = [] {  // agA5: LEONIDA_CE_RTDIAG_EVERY = probe + dump interval (frames)
+        char v[16] = {};
+        return GetEnvironmentVariableA("LEONIDA_CE_RTDIAG_EVERY", v, sizeof(v)) > 0 ? std::strtoull(v, nullptr, 10) : 0ull;
+    }();
+    if (!on() || f % (every ? every : 300) != 0) return;
     const std::vector<std::uintptr_t> top = dump(reinterpret_cast<std::uintptr_t>(presented), f);
     static const bool deep = [] {
         char v[8] = {};
         return GetEnvironmentVariableA("LEONIDA_CE_RTDIAG_DUMP", v, sizeof(v)) > 0 && v[0] == '1';
     }();
-    if (!deep || f % 600 != 0) return;
+    if (!deep || f % (every ? every : 600) != 0) return;
     ID3D12Device* dev = nullptr;
     if (FAILED(queue->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&dev))) || !dev) return;
     if (ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(dev)) {

@@ -56,6 +56,8 @@
 using namespace gi;
 
 namespace {
+// agA5 HACK: call counters for the scripted-press log
+std::atomic<long> g_ce_reads{0}, g_ce_reads_ok{0}, g_ce_gpstate{0}, g_ce_gpstate_nz{0}, g_ce_devcb{0}, g_ce_rdcb{0};
 
 constexpr uint32_t kBaseKinds =
     GameInputKindControllerAxis | GameInputKindControllerButton | GameInputKindGamepad | GameInputKindUiNavigation;
@@ -173,6 +175,8 @@ rt::gameinput::Config read_config() {
     else if (!k.empty() && k != "0" && k != "off")
         std::fprintf(stderr, "[rt] gameinput: LEONIDA_KEYBOARD_PAD=%s unknown (1, always or off), keyboard pad off\n",
                      k.c_str());
+    if (GetEnvironmentVariableA("LEONIDA_CE_PRESS", nullptr, 0) > 0 || env("LEONIDA_CE_VPAD") == "1")  // agA5 HACK: virtual pad for scripted presses
+        c.keyboard_pad = rt::gameinput::KeyboardPadMode::Always;
     using leonida::InputFamily;
     const std::string p = env("LEONIDA_PROMPTS");
     if (p == "xbox") c.prompts = InputFamily::Xbox;
@@ -276,10 +280,14 @@ public:
     bool STDMETHODCALLTYPE GetGamepadState(GameInputGamepadState* state) override {
         if (!state) return false;
         *state = s_.gamepad;
+        if (g_ce_gpstate++ < 3) std::fprintf(stderr, "[press] title GetGamepadState #%ld buttons 0x%x\n", g_ce_gpstate.load(), static_cast<unsigned>(s_.gamepad.buttons));
+        if (s_.gamepad.buttons && g_ce_gpstate_nz++ < 20)
+            std::fprintf(stderr, "[press] title saw buttons 0x%x\n", static_cast<unsigned>(s_.gamepad.buttons));
         return true;
     }
     bool STDMETHODCALLTYPE GetRacingWheelState(void*) override { return false; }
     bool STDMETHODCALLTYPE GetUiNavigationState(GameInputUiNavigationState* state) override {
+        { static std::atomic<int> n{0}; if (n++ < 4) std::fprintf(stderr, "[press] title GetUiNavigationState from %p\n", __builtin_return_address(0)); }
         if (!state) return false;
         state->buttons = s_.ui;
         return true;
@@ -1841,6 +1849,137 @@ bool attach_keyboard_pad() {
     return true;
 }
 
+
+// ---- agA5 HACK: scripted button presses (LEONIDA_CE_PRESS) -------------------------------------------------------
+// LEONIDA_CE_PRESS="A@s3+8/6x3,Y@200": button@when[/repeat seconds][xN max presses]. when = seconds since the first poll, or "s3+N" =
+// N seconds after boot state 3 (dword 0x1498F828C) is first seen. Buttons: A B X Y UP DOWN LEFT RIGHT LB RB MENU VIEW.
+// Each press holds LEONIDA_CE_PRESS_HOLD_MS (default 250) on the keyboard pad (forced to "always" when this is set).
+struct ScriptPress { int button; bool s3; double at, every; double next; int count; int limit; uint64_t hold_us; };
+std::vector<ScriptPress> g_script;
+bool g_script_parsed = false;
+uint64_t g_script_t0 = 0, g_script_s3 = 0, g_script_last_state_check = 0;
+int g_script_state = -999;
+uint64_t g_script_hold_until = 0;
+int g_script_held = -1;
+uint64_t g_script_hold_us = 250000;
+
+int script_button(const std::string& n) {
+    static const struct { const char* n; int b; } k[] = {
+        {"A", SDL_GAMEPAD_BUTTON_SOUTH}, {"B", SDL_GAMEPAD_BUTTON_EAST}, {"X", SDL_GAMEPAD_BUTTON_WEST},
+        {"Y", SDL_GAMEPAD_BUTTON_NORTH}, {"UP", SDL_GAMEPAD_BUTTON_DPAD_UP}, {"DOWN", SDL_GAMEPAD_BUTTON_DPAD_DOWN},
+        {"LEFT", SDL_GAMEPAD_BUTTON_DPAD_LEFT}, {"RIGHT", SDL_GAMEPAD_BUTTON_DPAD_RIGHT},
+        {"LB", SDL_GAMEPAD_BUTTON_LEFT_SHOULDER}, {"RB", SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER},
+        {"MENU", SDL_GAMEPAD_BUTTON_START}, {"VIEW", SDL_GAMEPAD_BUTTON_BACK}};
+    for (auto& e : k) if (n == e.n) return e.b;
+    return -1;
+}
+
+void parse_script() {
+    g_script_parsed = true;
+    char buf[1024];
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_CE_PRESS", buf, sizeof buf);
+    if (n == 0 || n >= sizeof buf) return;
+    char hb[32];
+    if (DWORD m = GetEnvironmentVariableA("LEONIDA_CE_PRESS_HOLD_MS", hb, sizeof hb); m && m < sizeof hb)
+        g_script_hold_us = std::strtoull(hb, nullptr, 10) * 1000;
+    std::string all(buf, n);
+    for (auto& c : all) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    size_t pos = 0;
+    while (pos <= all.size()) {
+        size_t e = all.find(',', pos);
+        if (e == std::string::npos) e = all.size();
+        std::string t = all.substr(pos, e - pos);
+        pos = e + 1;
+        const size_t at = t.find('@');
+        if (at == std::string::npos) continue;
+        std::string bn = t.substr(0, at);
+        uint64_t hold = 0;  // "A:2500@.." = hold 2500 ms
+        if (size_t c = bn.find(':'); c != std::string::npos) { hold = std::strtoull(bn.c_str() + c + 1, nullptr, 10) * 1000; bn = bn.substr(0, c); }
+        ScriptPress sp{script_button(bn), false, 0, 0, 0, 0, 0, hold};
+        std::string w = t.substr(at + 1);
+        if (w.rfind("S3", 0) == 0) { sp.s3 = true; w = w.substr(2); if (!w.empty() && w[0] == '+') w = w.substr(1); }
+        sp.at = std::atof(w.c_str());
+        if (size_t sl = w.find('/'); sl != std::string::npos) sp.every = std::atof(w.c_str() + sl + 1);
+        if (size_t x = w.find('X'); x != std::string::npos) sp.limit = std::atoi(w.c_str() + x + 1);  // xN = at most N presses
+        if (sp.button < 0) { std::fprintf(stderr, "[press] bad token %s\n", t.c_str()); continue; }
+        sp.next = sp.at;
+        g_script.push_back(sp);
+        std::fprintf(stderr, "[press] scheduled button %d at %s%.1f s every %.1f s\n", sp.button, sp.s3 ? "s3+" : "",
+                     sp.at, sp.every);
+    }
+}
+
+
+bool ce_readable(uint64_t a, size_t n) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(reinterpret_cast<const void*>(a), &mbi, sizeof mbi)) return false;
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return false;
+    return a + n <= reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
+}
+// The state-3 loop (0x1421b7070) waits for FUN_14041e8c0(0x1478ac9c8, [0x1478acba0]): entry[*[obj+400]].+0x18 != 0.
+void log_s3_wait(const char* why, double t) {
+    const uint64_t obj = 0x1478ac9c8ull;
+    if (!ce_readable(obj, 0x1d8) || !ce_readable(0x1478acba0ull, 4)) return;
+    const uint64_t ip = *reinterpret_cast<const volatile uint64_t*>(obj + 400);
+    const int idx = ce_readable(ip, 4) ? *reinterpret_cast<const volatile int32_t*>(ip) : -999;
+    auto d = [&](uint64_t off) { return *reinterpret_cast<const volatile uint32_t*>(obj + off); };
+    std::fprintf(stderr, "[press] t=%.1f %s s3wait: idx %d p2 %d | e0 %x %x %x %x | e1 %x %x %x %x | e2 %x %x %x %x | 1c8 %x 1d0 %x\n",
+                 t, why, idx, *reinterpret_cast<const volatile int32_t*>(0x1478acba0ull), d(0), d(0x10), d(0x18), d(0x1c),
+                 d(0x50), d(0x60), d(0x68), d(0x6c), d(0xa0), d(0xb0), d(0xb8), d(0xbc), d(0x1c8), d(0x1d0));
+}
+// Called each poll (poll thread); ORs the scripted button into down[].
+void apply_script(bool* down) {
+    if (!g_script_parsed) parse_script();
+    if (g_script.empty()) return;
+    const uint64_t now = now_us();
+    if (!g_script_t0) g_script_t0 = now;
+    if (now - g_script_last_state_check > 100000) {
+        g_script_last_state_check = now;
+        MEMORY_BASIC_INFORMATION mbi{};
+        const void* a = reinterpret_cast<const void*>(0x1498F828Cull);
+        int st = -999;
+        if (VirtualQuery(a, &mbi, sizeof mbi) && mbi.State == MEM_COMMIT &&
+            !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+            st = *reinterpret_cast<const volatile int32_t*>(a);
+        if (st != g_script_state) {
+            std::fprintf(stderr, "[press] t=%.1f boot state %d -> %d (reads %ld ok %ld gpstate %ld nz %ld devcb %ld rdcb %ld)\n",
+                         (now - g_script_t0) / 1e6, g_script_state, st, g_ce_reads.load(), g_ce_reads_ok.load(),
+                         g_ce_gpstate.load(), g_ce_gpstate_nz.load(), g_ce_devcb.load(), g_ce_rdcb.load());
+            std::fflush(stderr);
+            g_script_state = st;
+        }
+        if (st == 3 && !g_script_s3) g_script_s3 = now;
+        static uint64_t last_w = 0;
+        if (st == 3 && now - last_w > 5000000) { last_w = now; log_s3_wait("tick", (now - g_script_t0) / 1e6); }
+    }
+    if (g_script_held >= 0) {
+        if (now < g_script_hold_until) { down[g_script_held] = true; return; }
+        std::fprintf(stderr, "[press] t=%.1f release %d (reads %ld ok %ld gpstate %ld nz %ld)\n", (now - g_script_t0) / 1e6,
+                     g_script_held, g_ce_reads.load(), g_ce_reads_ok.load(), g_ce_gpstate.load(), g_ce_gpstate_nz.load());
+        std::fflush(stderr);
+        log_s3_wait("release", (now - g_script_t0) / 1e6);
+        g_script_held = -1;
+        return;  // at least one released poll between presses
+    }
+    for (auto& sp : g_script) {
+        if (sp.every <= 0 && sp.count) continue;
+        if (sp.limit && sp.count >= sp.limit) continue;
+        uint64_t base = g_script_t0;
+        if (sp.s3) { if (!g_script_s3) continue; base = g_script_s3; }
+        if (now < base + static_cast<uint64_t>(sp.next * 1e6)) continue;
+        sp.count++;
+        sp.next += sp.every > 0 ? sp.every : 1e9;
+        g_script_held = sp.button;
+        g_script_hold_until = now + (sp.hold_us ? sp.hold_us : g_script_hold_us);
+        down[sp.button] = true;
+        std::fprintf(stderr, "[press] t=%.1f PRESS %d (#%d, state %d; reads %ld ok %ld gpstate %ld nz %ld devcb %ld rdcb %ld)\n",
+                     (now - g_script_t0) / 1e6, sp.button, sp.count, g_script_state, g_ce_reads.load(),
+                     g_ce_reads_ok.load(), g_ce_gpstate.load(), g_ce_gpstate_nz.load(), g_ce_devcb.load(), g_ce_rdcb.load());
+        std::fflush(stderr);
+        return;
+    }
+}
+
 // Before SDL_UpdateGamepads, so the buttons set here are in this poll's reading.
 void update_keyboard_pad() {
     float sens;
@@ -1889,6 +2028,7 @@ void update_keyboard_pad() {
         g_keyboard.have_cursor = false;
     }
     clip_cursor(active && g_raw_ready && g_cursor_pos.load() == system_cursor_pos && foreground_is_ours());
+    apply_script(down);  // agA5 HACK
     for (const auto& b : kKeyBindings) SDL_SetJoystickVirtualButton(g_keyboard.js, b.sdl_button, down[b.sdl_button]);
     const int reach = lx && ly ? kStickDiagonal : kStickFull;
     SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_LEFTX, static_cast<Sint16>(lx * reach));
@@ -2318,6 +2458,7 @@ Device* as_device(IGameInputDevice* d) { return static_cast<Device*>(d); }
 // is REFERENCE_READING_TOO_OLD rather than a silent skip.
 HRESULT find_reading(IGameInputReading* ref, uint32_t kind, IGameInputDevice* device, IGameInputReading** out,
                      bool forward) {
+    { static std::atomic<int> n{0}; if (n++ < 4) std::fprintf(stderr, "[press] title Get%sReading kind 0x%x\n", 0 ? "" : "Next/Previous", kind); }
     if (!out) return E_POINTER;
     *out = nullptr;
     if (!ref) return E_INVALIDARG;
@@ -2380,6 +2521,9 @@ public:
     uint64_t STDMETHODCALLTYPE GetCurrentTimestamp() override { return now_us(); }
 
     HRESULT STDMETHODCALLTYPE GetCurrentReading(uint32_t kind, IGameInputDevice* device, IGameInputReading** out) override {
+        if (const long n = g_ce_reads++; n < 4 || n % 500 == 0)
+            std::fprintf(stderr, "[press] title GetCurrentReading #%ld kind 0x%x device %p from %p\n", n, kind,
+                         static_cast<void*>(device), __builtin_return_address(0));
         if (!out) return E_POINTER;
         *out = nullptr;
         if (kind != GameInputKindUnknown && !(kind & kSupportedKinds)) return GAMEINPUT_E_READING_NOT_FOUND;
@@ -2408,6 +2552,7 @@ public:
         if (!best) return GAMEINPUT_E_READING_NOT_FOUND;
         best->AddRef();
         *out = best;
+        g_ce_reads_ok++;
         return S_OK;
     }
 
@@ -2429,6 +2574,7 @@ public:
 
     HRESULT STDMETHODCALLTYPE RegisterReadingCallback(IGameInputDevice* device, uint32_t kind, float, void* context,
                                                       GameInputReadingCallback fn, GameInputCallbackToken* token) override {
+        if (g_ce_rdcb++ < 4) std::fprintf(stderr, "[press] title RegisterReadingCallback kind 0x%x\n", kind);
         if (token) *token = kInvalidCallbackToken;
         if (!fn) return E_INVALIDARG;
         if (device && as_device(device)->info.deviceFamily == GameInputFamilyAggregate) return E_NOTIMPL;
@@ -2438,6 +2584,7 @@ public:
     HRESULT STDMETHODCALLTYPE RegisterDeviceCallback(IGameInputDevice* device, uint32_t kind, uint32_t status_filter,
                                                      GameInputEnumerationKind enumeration, void* context,
                                                      GameInputDeviceCallback fn, GameInputCallbackToken* token) override {
+        if (g_ce_devcb++ < 4) std::fprintf(stderr, "[press] title RegisterDeviceCallback kind 0x%x filter 0x%x enum %d\n", kind, status_filter, static_cast<int>(enumeration));
         if (token) *token = kInvalidCallbackToken;
         if (!fn) return E_INVALIDARG;
         if (device && as_device(device)->info.deviceFamily == GameInputFamilyAggregate) return E_NOTIMPL;
@@ -2597,6 +2744,7 @@ GameInput& instance() {
 
 // HRESULT GameInputCreate(IGameInput** gameInput). One instance per process; each call adds a reference.
 HRESULT WINAPI GameInputCreate(IGameInput** out) {
+    std::fprintf(stderr, "[press] GameInputCreate from %p\n", __builtin_return_address(0));
     if (!out) return E_POINTER;
     ensure_started();
     GameInput& gi = instance();

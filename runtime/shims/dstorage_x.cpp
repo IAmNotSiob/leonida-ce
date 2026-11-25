@@ -13,6 +13,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -230,7 +231,17 @@ int32_t run_request(const Req& r) {
                     hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
                 }
             } else {
-                hr = E_NOTIMPL;
+                // HACK (agA5): comp 14 = BCPack (ttdb_graphics.ttpf), no runtime decoder yet. LEONIDA_CE_DS_ZEROFILL=1
+                // answers such requests with a zero-filled destination and success instead of E_NOTIMPL.
+                static const bool zero = [] { const char* e = std::getenv("LEONIDA_CE_DS_ZEROFILL"); return e && e[0] == '1'; }();
+                if (zero) {
+                    std::memset(dst, 0, dst_size);
+                    static std::atomic<int> told{0};
+                    if (told++ < 4) std::fprintf(stderr, "[dstorage] comp=%u zero-filled (%u bytes) [hack]\n", comp, dst_size);
+                    ok = true;
+                } else {
+                    hr = E_NOTIMPL;
+                }
             }
         } else {
             const DWORD err = read_ok ? ERROR_SUCCESS : GetLastError();

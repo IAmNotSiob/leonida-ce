@@ -647,3 +647,99 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
 - Next: input (press A/Y) to move past the prompt; stencil/depth (DB_DEPTH_CONTROL +0x3c, Scaleform mask variants with
   tmask 0) not translated; the stride-0 V# probably affects other idxen shaders too (a generic fix would find where
   the console derives the stride, likely blob #3/#5 resource tables, which carry 0x10 values).
+
+## agA5 (sender gen 5, 2026-11-24/25 night)
+- Input path (Definite, Wine se1): the title registers GameInput device callbacks (kind 0x40000 gamepad, then 0x10,
+  status filter 0x1 connected, blocking enumeration) and once it runs, polls GetCurrentReading(0x40000, <that device>)
+  + GetGamepadState once per frame. No reading callbacks. The account picker itself is already handled: XUserAddAsync
+  without the silent flag returns the offline default user (xgameruntime_user.cpp).
+- Build 19: LEONIDA_CE_PRESS="BTN@when[/every],..." (gameinput.cpp, agA5 HACK): when = seconds since the first poll or
+  "s3+N" = N s after boot state 3 (dword 0x1498F828C, read by the shim with VirtualQuery). Buttons A B X Y UP DOWN LEFT
+  RIGHT LB RB MENU VIEW; hold LEONIDA_CE_PRESS_HOLD_MS (250). Setting it (or LEONIDA_CE_VPAD=1) forces the keyboard pad
+  (SDL virtual gamepad) to "always", so a connected pad exists from the first poll. "[press]" lines log state changes,
+  each press/release with title call counters, and "title saw buttons 0x.." when GetGamepadState returns a press.
+- Wine (se1) reached state 3 at t=97 s, then stops presenting (the known Wine stop), so presses are Windows-only tests.
+- re1 (build 19, receiver B3): the title SAW the presses ("title saw buttons 0x4"); press #2 moved boot state 3 -> 13
+  (Definite). State 3 (0x1421b7070) loops until FUN_14041e8c0(0x1478ac9c8, [0x1478acba0]); state 13 (0x1421b7530)
+  is the loading loop (waits on hash 0xbaab6434 while ticking frames, then 0x10 or 0). A Bink movie pipeline started.
+  Then heap corruption 0xc0000374: proxy_slot<70> (placed SRV) -> CreateShaderResourceView -> Object::from(res) ->
+  QueryInterface+Release on a stand-in the title had already released -> second delete (Definite, symbolized).
+- Build 20: g_placed holds its own reference on every recorded resource (LEONIDA_CE_PLACED_REF=0 off) and is a deque
+  (xs_find_placed pointers used to dangle after push_back). "xN" press limit. LEONIDA_CE_RTDIAG_EVERY (build 21 fixes
+  the caller's own %300 gate).
+- re2 (build 20, receiver B4): NO crash; one A press -> state 13 -> a first-boot settings page (Definite, dump f1800):
+  navy backdrop, centre title "NAVIGATION EXPERIENCE", selector "<  (   )  >" with the option text missing, 3-dot
+  pager (first filled), bottom-left rounded preview box with only a north/player-arrow icon, a caption with most
+  glyphs missing ("Mi i  p di pl y dy  i lly  d  d"), bottom right "CONTINUE (A)". [boot]: state 13, task 4, inner 7.
+  In state 13 the title stops calling GetCurrentReading (reads frozen), so later presses are not seen.
+- The pad poll (Wine se3): GetCurrentReading(0x40000, dev) is called from 0x142211ba3, a method at ~0x142211b40
+  (obj+0x20 device, obj+0x28 lock); GameInputCreate from 0x1459258c8 (singleton getter 0x1459258a0).
+- dstorage comp=14 (= BCPack, ttdb_graphics.ttpf) is unimplemented in the runtime (E_NOTIMPL); tools/bcpack.py has a
+  decoder. Build 21: LEONIDA_CE_DS_ZEROFILL=1 answers them zero-filled with success (untested).
+- Build 21: LEONIDA_CE_STACKS_AT=<frames> dumps all thread stacks at those presents; more [press] call logging.
+- re1 (build 19, receiver B3): the title SAW the presses ("title saw buttons 0x4"); press #2 moved boot state 3 -> 13
+  (Definite). State 3 (0x1421b7070) loops until FUN_14041e8c0(0x1478ac9c8, [0x1478acba0]); state 13 (0x1421b7530)
+  is the loading loop (waits on hash 0xbaab6434 while ticking frames, then 0x10 or 0). A Bink movie pipeline started.
+  Then heap corruption 0xc0000374: proxy_slot<70> (placed SRV) -> CreateShaderResourceView -> Object::from(res) ->
+  QueryInterface+Release on a stand-in the title had already released -> second delete (Definite, symbolized).
+- Build 20: g_placed holds its own reference on every recorded resource (LEONIDA_CE_PLACED_REF=0 off) and is a deque
+  (xs_find_placed pointers used to dangle after push_back). "xN" press limit. LEONIDA_CE_RTDIAG_EVERY (build 21 fixes
+  the caller's own %300 gate).
+- re2 (build 20, receiver B4): NO crash; one A press -> state 13 -> a first-boot settings page (Definite, dump f1800):
+  navy backdrop, centre title "NAVIGATION EXPERIENCE", selector "<  (   )  >" with the option text missing, 3-dot
+  pager (first filled), bottom-left rounded preview box with only a north/player-arrow icon, a caption with most
+  glyphs missing ("Mi i  p di pl y dy  i lly  d  d"), bottom right "CONTINUE (A)". [boot]: state 13, task 4, inner 7.
+  In state 13 the title stops calling GetCurrentReading (reads frozen), so later presses are not seen.
+- The pad poll (Wine se3): GetCurrentReading(0x40000, dev) is called from 0x142211ba3, a method at ~0x142211b40
+  (obj+0x20 device, obj+0x28 lock); GameInputCreate from 0x1459258c8 (singleton getter 0x1459258a0).
+- dstorage comp=14 (= BCPack, ttdb_graphics.ttpf) is unimplemented in the runtime (E_NOTIMPL); tools/bcpack.py has a
+  decoder. Build 21: LEONIDA_CE_DS_ZEROFILL=1 answers them zero-filled with success (untested).
+- Build 21: LEONIDA_CE_STACKS_AT=<frames> dumps all thread stacks at those presents; more [press] call logging.
+- re3 (build 21): presses read in state 13 again (all from 0x142211ba3; never GetUiNavigationState or Next/Previous).
+  One A: state 3 -> 6 -> 13. The presses step through a first-boot setup flow (Definite, dumps): NAVIGATION EXPERIENCE ->
+  UI TEXT SIZE -> SUBTITLES -> BRIGHTNESS (slider, ADJUST / RESTORE DEFAULT / CONTINUE / BACK) -> FINISH SETUP? (pool
+  and flamingo art, SETTINGS / CONTINUE (A) / BACK (B)) -> LEGAL NOTICES ("Photosensitivity Health Warning" item,
+  "Next >" button, COPYRIGHT, purple building art, BACK (B), and a white anti-diagonal again). It stays on LEGAL NOTICES
+  (A presses do nothing visible) to f7800. Boot state stays 13 (task 4, inner 7). ~20 fps. Body text (Scaleform glyph
+  text) misses most glyphs on every page; selector option text is blank. The headings (vector text) are complete.
+- Build 22 hashed every placed texture <= 4 MiB in full for the 30-present refresh: re4 dropped to ~3 fps (abandoned).
+  Build 23: full hash only for A8/R8 (glyph-cache candidates), plus SF_STRIDE looks for the batch V# (word 3 0x30014fac)
+  in root slots 1..7 as well (VBatchTexTG*), for the diagonal on LEGAL NOTICES.
+- The pad-scan for "who pressed" is 0x1406aece0 (GetGamepadState via vtable +0xb0, buttons mask 0xffffffdf); the
+  general pad update 0x1407a4150 is virtual.
+- re5 (build 23): pace 13-19 fps; no diagonal anywhere (also on LEGAL NOTICES); SF_STRIDE only ever hit slot 0. DOWN
+  moves the LEGAL NOTICES list focus (Photosensitivity Health Warning <-> Copyright; the right panel shows the notice:
+  "PHOTOSENSITIVITY HEALTH WARNING / IMPORTANT HEALTH WARNING READ BEFORE PLAYING" + body). Body glyphs NOT fixed by the
+  A8/R8 full hash. Pattern (Very likely, from many captions): the body font draws exactly the glyphs with ascenders or
+  descenders, capitals, digits and (c) (i l t f h y d g p b k, A G R T I V S C ...); every x-height-only lowercase glyph
+  (a e o n s r c u m w v x z) is missing. Suspects: glyph-cache region for short glyphs never uploaded (the packer groups
+  glyphs by height), or a per-glyph size/clip test. Build 24 logs "[glyph?]" candidate textures.
+- re5 continued (B4): LEGAL NOTICES -> (DOWN to "Next >", A) -> ROCKSTAR GAMES LEGAL TERMS & POLICIES (crocodile art;
+  PRIVACY POLICY checkbox, TERMS OF SERVICE checkbox "I have read and agree to the Terms of Service", greyed "Confirm >";
+  right pane shows the policy text; SCROLL / SELECT (A) / BACK (B)). A on an item ticks it and moves focus down; the
+  scripted DOWN then skipped the ToS box, so re5 ended on a greyed Confirm. Some 250 ms presses were never seen.
+- re7 plan (build-25.txt): env-only, same exe as 24: A/DOWN alternation x16, then UP, A, A every 30 s; hold 350 ms.
+- re6 (build 24): no crash; did not get past TERMS. ToS item after an A tap shows a small ring/progress icon that does not
+  stay; Confirm stays greyed (hold-to-confirm suspected, Plausible). Presses after t~484 s were not seen (nz frozen while
+  reads continue; not understood). Glyph-cache candidates: va de17f0000 2048x2048 A8 and de1d4a000 1024x1024 A8 (layout
+  0x100 = linear), both Map()ped by the title (PC side R8); 3840x2160 A8 dd7c40000.
+- BUG found: the shim's env() helper reads at most 63 chars, so a longer LEONIDA_CE_PRESS did not force the virtual pad
+  (re7 wasted). Build 26: the pad check uses the full variable; "BTN:ms@.." per-press hold; "[refresh] A8 re-upload" log.
+- re8 (build 26, 600 s, receiver B4's last run): reached ROCKSTAR GAMES LEGAL TERMS & POLICIES again; ended (f6600-f8400)
+  with focus on the PRIVACY POLICY box (filled square), the ToS row showing the small speaker-like icon, Confirm greyed:
+  the UP / A(2.5 s hold) / A(2.5 s hold) cycle did not enable Confirm. No crash. "[refresh] A8 re-upload": 9 x the
+  2048x2048 A8 at de17f0000 (glyph cache IS re-uploaded; 1024x1024 A8 never), yet the x-height glyphs stay missing, so
+  the glyph problem is not (only) refresh: suspect the A8 upload/detile (layout 0x100, swizzle 0, R8 on PC) or the
+  glyph draw itself.
+- Next for whoever continues: (1) TERMS screen: find the checkbox semantics (try A taps on the ToS item without moving,
+  RIGHT, or scroll the policy text to the end with the right stick first: "SCROLL" prompt; many EULA screens require
+  reading to the bottom before the tick is accepted -> add stick axes to the press script). (2) Body glyphs: dump the
+  de17f0000 texture (title memory vs uploaded) and check which glyphs are present.
+- Recommended env (Windows): RING_IN_ARENA=1, CB_FIX=1, VCOLOR_FIX=sga_dr_vs, SNAP_RESYNC=1, plus for input
+  LEONIDA_CE_PRESS=A@s3+20/15x16,DOWN@s3+27/15x16 (+ LEONIDA_CE_PRESS_HOLD_MS=350).
+- CORRECTION (re8 final from B4): Confirm WAS enabled once (f5400, /root/rb/re8d/p005400.png: both boxes ticked = the
+  speaker-like icon is the TICKED state, Confirm bright and focused). A taps toggle the checkboxes; no hold is needed.
+  The next scripted UP moved focus back to Privacy and the A unticked it, so the UP/A/A cycle kept toggling Privacy.
+  Next script: after the 16 A/DOWN cycles, press A alone (no UP) every 30 s, e.g.
+  LEONIDA_CE_PRESS=A@s3+20/15x16,DOWN@s3+27/15x16,A@s3+272/30  (build 26 exe, env only). The earlier guess that the
+  policy text must be scrolled first is withdrawn.
