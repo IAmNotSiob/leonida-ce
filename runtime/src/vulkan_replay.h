@@ -4935,6 +4935,29 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             }
             vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
             ::leonida::ce::checkpoint(command_buffer, reinterpret_cast<std::uint64_t>(p.pipeline.pipeline));
+            // agA21 LEONIDA_CE_DISPATCH_LOG=1: per pipeline, log a direct dispatch whose group total reaches a new
+            // power-of-two high (>= 4096 groups) with its user data; LEONIDA_CE_DISPATCH_MAX=N skips dispatches over N groups.
+            static const bool dlog = [] { const char* e = std::getenv("LEONIDA_CE_DISPATCH_LOG"); return e && e[0] == '1'; }();
+            static const std::uint64_t dmax = [] { const char* e = std::getenv("LEONIDA_CE_DISPATCH_MAX"); return e ? std::strtoull(e, nullptr, 0) : 0ull; }();
+            const std::uint64_t groups = std::uint64_t(dispatch->x) * dispatch->y * dispatch->z;
+            if (dlog && groups >= 4096) {
+                static std::mutex dmu; static std::unordered_map<std::uint64_t, std::uint64_t> dhigh;
+                const std::uint64_t key = reinterpret_cast<std::uint64_t>(p.pipeline.pipeline);
+                bool tell = false;
+                { std::lock_guard dl(dmu); auto& h = dhigh[key]; if (groups >= 2 * h || h == 0) { h = groups; tell = true; } }
+                if (tell) {
+                    const auto& u = dispatch->user_data;
+                    std::fprintf(stderr, "[hack] DISPATCH_LOG: %s groups %u x %u x %u = %llu  s0-11 %x %x %x %x %x %x %x %x %x %x %x %x\n",
+                                 ::leonida::ce::pipeline_name(key).c_str(), dispatch->x, dispatch->y, dispatch->z,
+                                 (unsigned long long)groups, u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11]);
+                    std::fflush(stderr);
+                }
+            }
+            if (dmax && groups > dmax) {
+                static std::atomic<std::uint64_t> dskip{0};
+                const std::uint64_t k = ++dskip;
+                if ((k & (k - 1)) == 0) { std::fprintf(stderr, "[hack] DISPATCH_MAX: %llu dispatches over %llu groups skipped (last %s %llu)\n", (unsigned long long)k, (unsigned long long)dmax, ::leonida::ce::pipeline_name(reinterpret_cast<std::uint64_t>(p.pipeline.pipeline)).c_str(), (unsigned long long)groups); std::fflush(stderr); }
+            } else
             vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
             const detail::PreparedDraw& d = prepared.draws[p.draw];
