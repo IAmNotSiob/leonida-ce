@@ -100,6 +100,10 @@ bool placed_buffer_holds(std::uint64_t va, std::uint64_t bytes);
 bool placed_title_of(const void* resource, std::uint64_t& va, std::uint64_t& size);
 // agA20 (LEONIDA_CE_MIRROR_GFX=0): the heap mirror's arena VA range, so graphics tables can keep their raw handle.
 void set_heap_mirror_range(std::uint64_t lo, std::uint64_t hi);
+// agA20 (LEONIDA_CE_PLACED_IDENTITY): the Vulkan device's "place the next arena buffer at this VA" hint, called by the
+// slot-133 stand-in path right before CreateCommittedResource (0 clears it).
+using ArenaWantHook = void (*)(std::uint64_t va);
+void set_arena_want_hook(ArenaWantHook hook);
 
 // Creates a descriptor heap whose storage is the title's memory at `console_address` (the console-extended slot 14
 // description, issue #313). The Vulkan layer registers rt::d3d12::create_console_descriptor_heap here; without a

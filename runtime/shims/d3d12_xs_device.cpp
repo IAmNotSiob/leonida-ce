@@ -619,6 +619,7 @@ void xs_register_heap_range(std::uint64_t cpu, std::uint64_t size, std::uint64_t
     g_heap_range_count.store(static_cast<int>(g_heap_ranges.size()), std::memory_order_release);
 }
 static std::atomic<std::uint64_t> g_mirror_lo{0}, g_mirror_hi{0};  // agA20
+static std::atomic<ArenaWantHook> g_arena_want_hook{nullptr};  // agA20
 std::uint64_t xs_gpu_handle_from_console(std::uint64_t v) {
     if (g_heap_range_count.load(std::memory_order_acquire) == 0) return v;
     std::lock_guard lock(g_heap_ranges_mu);
@@ -5025,8 +5026,11 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                                                   : D3D12_TEXTURE_LAYOUT_UNKNOWN;
         D3D12_HEAP_PROPERTIES hp{};
         hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        const ArenaWantHook want = d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? g_arena_want_hook.load() : nullptr;
+        if (want) want(a1);  // agA20 PLACED_IDENTITY (the hook ignores it unless the env is on)
         HRESULT hr = self->real->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d,
                                                          D3D12_RESOURCE_STATE_COMMON, nullptr, *riid, out);
+        if (want) want(0);
         if (FAILED(hr) && (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
             // HACK: formats the PC layer cannot render to (A8_UNORM): keep the texture, drop the render-target bit
             d.Flags = static_cast<D3D12_RESOURCE_FLAGS>(d.Flags & ~D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
@@ -5790,6 +5794,7 @@ void set_console_descriptor_heap_factory(ConsoleDescriptorHeapFactory factory) {
     g_console_heap_factory = factory;
 }
 
+void set_arena_want_hook(ArenaWantHook hook) { g_arena_want_hook.store(hook); }
 void set_heap_mirror_range(std::uint64_t lo, std::uint64_t hi) {
     g_mirror_hi.store(hi);
     g_mirror_lo.store(lo);

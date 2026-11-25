@@ -224,6 +224,17 @@ static void ce_heap_mirror_sync() {
 // mirror (a translated table handle in a draw's root words names a mirror VA; the sync copied title[VA] there).
 static std::atomic<std::uintptr_t> g_hm_arena_lo[8], g_hm_arena_hi[8];
 static std::atomic<std::uint64_t> g_hm_guard_hits{0};
+// agA20 LEONIDA_CE_PLACED_IDENTITY=1: a title-placed buffer (slot 133) whose pages cannot be imported gets its arena
+// stand-in at arena VA == title VA when that range is free, so the title's own V#s (title VAs) and the D3D12-level uses of the
+// resource (ExecuteIndirect args, root views, copies: the stand-in's VA) name the SAME bytes. Without it the stand-in sits
+// elsewhere and shader writes through title VAs land in whatever other allocation owns arena[title VA].
+static thread_local std::uint64_t t_ce_arena_want = 0;
+static bool ce_placed_identity() {
+    static const bool on = [] { const char* e = std::getenv("LEONIDA_CE_PLACED_IDENTITY"); return e && e[0] == '1'; }();
+    return on;
+}
+static std::atomic<std::uint64_t> g_ce_ident_ok{0}, g_ce_ident_miss{0};
+static void ce_arena_want(std::uint64_t va) { t_ce_arena_want = ce_placed_identity() ? va : 0; }
 static bool ce_hm_guard_hit(const std::uint8_t* host, std::uint64_t bytes) {
     const std::uintptr_t a = reinterpret_cast<std::uintptr_t>(host), b = a + bytes;
     for (int i = 0; i < 8; ++i) {
@@ -1225,6 +1236,35 @@ struct DeviceState {
                          (unsigned long long)arena.allocations, (unsigned long long)arena.releases, arena.in_use / 1048576.0,
                          arena.use_in_use[arena_buffer] / 1048576.0, arena.free.size(), largest / 1048576.0);
             std::fflush(stderr);
+        }
+        if (const std::uint64_t want = t_ce_arena_want; want && use == arena_buffer) {  // agA20 PLACED_IDENTITY
+            t_ce_arena_want = 0;
+            bool placed = false;
+            if (want % 256 == 0 && want + bytes <= arena.size) {
+                auto it = arena.free.upper_bound(want);
+                if (it != arena.free.begin()) {
+                    --it;
+                    const VkDeviceSize block = it->first, end = it->first + it->second;
+                    if (block <= want && want + bytes <= end) {
+                        arena.free.erase(it);
+                        if (want > block) arena.free[block] = want - block;
+                        if (want + bytes < end) arena.free[want + bytes] = end - (want + bytes);
+                        out = want;
+                        ++arena.allocations;
+                        arena.in_use += bytes;
+                        arena.peak_in_use = std::max(arena.peak_in_use, arena.in_use);
+                        arena.peak_end = std::max(arena.peak_end, want + bytes);
+                        arena.use_in_use[use] += bytes;
+                        arena.use_peak[use] = std::max(arena.use_peak[use], arena.use_in_use[use]);
+                        placed = true;
+                    }
+                }
+            }
+            const std::uint64_t k = (placed ? g_ce_ident_ok : g_ce_ident_miss).fetch_add(1) + 1;
+            if ((k & (k - 1)) == 0 || (!placed && bytes >= (1u << 20) && k < 64))
+                std::fprintf(stderr, "[hack] PLACED_IDENTITY: %s title VA 0x%llx + 0x%llx (%llu %s)\n", placed ? "placed at" : "NOT free:",
+                             (unsigned long long)want, (unsigned long long)bytes, (unsigned long long)k, placed ? "placed" : "misses");
+            if (placed) return true;
         }
         // HACK (agA12): small buffers (LEONIDA_CE_ARENA_SMALL_ALIGN) are packed downward from the top of the arena,
         // so they never land in (and split) the low holes the large 64 KiB-aligned ranges come from.
@@ -2297,7 +2337,7 @@ public:
                          (unsigned long long)console_address_, (unsigned long long)console_size_,
                          mirror ? " (HEAP_MIRROR on)" : "");
             if (mirror && (desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device.arena.mapped &&
-                device.arena_allocate(bytes, 256, arena_offset_, DeviceState::arena_descriptor_heap)) {
+                device.arena_allocate(bytes, 256, arena_offset_, DeviceState::arena_descriptor_heap, ce_placed_identity())) {
                 mirrored_ = true;
                 std::memcpy(device.arena.mapped + arena_offset_, cpu_, std::size_t(bytes));
                 ce_heap_mirror_add(cpu_, device.arena.mapped + arena_offset_, std::size_t(bytes), mirror);
@@ -6139,6 +6179,7 @@ public:
         // standalone device gta6rt --run uses both come through here (found in review: registering only in
         // create_vulkan_device left the retail path without it).
         rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
+        rt::d3d12_xs::set_arena_want_hook(&ce_arena_want);  // agA20
         rt::d3d12_xs::set_texture_address_hook([](void* resource, std::uint64_t address) {
             if (auto* r = Resource::from<Resource>(static_cast<IUnknown*>(resource))) r->console_va_ = address;
         });
@@ -8470,8 +8511,11 @@ public:
                      "the title's writes do not reach; HRESULT",
                      int(hr));
             const D3D12_HEAP_PROPERTIES fallback{D3D12_HEAP_TYPE_DEFAULT};
-            return d3d12_trace::result(method, create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &desc,
-                                                                D3D12_RESOURCE_STATE_COMMON, 0, nullptr, riid, out));
+            if (ce_placed_identity()) t_ce_arena_want = reinterpret_cast<std::uintptr_t>(address);  // agA20
+            const HRESULT chr = create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, 0,
+                                                 nullptr, riid, out);
+            t_ce_arena_want = 0;
+            return d3d12_trace::result(method, chr);
         }
         return d3d12_trace::result(method, hand_out(resource, riid, out));
     }
