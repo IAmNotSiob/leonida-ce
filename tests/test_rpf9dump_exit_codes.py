@@ -85,11 +85,13 @@ class Rpf9dumpExitCodeTest(unittest.TestCase):
             src = root / "audio.rpf"
             awc_rpf(src)
             wav = root / "out" / "audio" / "xma" / "audio_0001_at_0000000000001000" / "00001234.xma.wav"
-            blocker = Path(str(wav) + ".partial")
-            blocker.mkdir(parents=True)          # the write of this one stream fails
+            # Outputs go to a unique <path>.<pid>.<tid>.<guid>.partial and are renamed into place (Util.WriteAtomic),
+            # so a directory on the old fixed ".partial" name no longer blocks anything: block the final name instead.
+            blocker = wav
+            blocker.mkdir(parents=True)          # the rename of this one stream into place fails
             failed = run("xma", src, root / "out")
             self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
-            self.assertFalse(wav.exists())
+            self.assertFalse(wav.is_file())
             blocker.rmdir()
             retry = run("xma", src, root / "out")
             self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
@@ -106,11 +108,11 @@ class Rpf9dumpExitCodeTest(unittest.TestCase):
             texture_dictionary_rpf(src)
             sub = root / "out" / "textures" / "textures"
             dds = sub / "dictionary_at_0000000000001010" / "000_probe.dds"
-            blocker = Path(str(dds) + ".partial")
-            blocker.mkdir(parents=True)          # the write of this one DDS fails
+            blocker = dds                        # the final name (see the xma test): the rename of this one DDS fails
+            blocker.mkdir(parents=True)
             failed = run("textures", src, root / "out")
             self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
-            self.assertFalse(dds.exists(), failed.stdout)          # the blocked write must not have succeeded
+            self.assertFalse(dds.is_file(), failed.stdout)         # the blocked write must not have succeeded
             self.assertFalse((sub / "manifest.json").exists(), failed.stdout)
             self.assertFalse((sub / "manifest.json.partial").exists())
             blocker.rmdir()
