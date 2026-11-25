@@ -39,6 +39,12 @@ inline std::atomic<PtrCheckFn>& ptr_check_fn() {
     static std::atomic<PtrCheckFn> f{nullptr};
     return f;
 }
+// agA21: the hang watch asks the D3D12 queues to print their outstanding fence waits / last signals.
+using WaitDumpFn = void (*)();
+inline std::atomic<WaitDumpFn>& wait_dump_fn() {
+    static std::atomic<WaitDumpFn> f{nullptr};
+    return f;
+}
 // agA21 (LEONIDA_CE_SLOT80_DISPATCH): the workgroup size of a compute PSO of this device (false if unknown).
 using LocalSizeFn = bool (*)(const void* pso, std::uint32_t out[3]);
 inline std::atomic<LocalSizeFn>& local_size_fn() {

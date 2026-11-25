@@ -8,6 +8,7 @@
 #include "d3d12_xs_device.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/ce_checkpoints.h"  // agA17
+#include <map>
 
 #include <algorithm>
 #include <array>
@@ -1549,6 +1550,37 @@ private:
     }
 };
 
+// agA21: outstanding queue waits and last signals per fence, printed by the hang watch (ce::wait_dump_fn).
+struct CeWaitRec { std::uint64_t value = 0; std::uint64_t tick = 0; };
+std::mutex g_ce_wait_mu;
+std::map<std::pair<const void*, const void*>, CeWaitRec> g_ce_waits;    // (queue, fence) -> last waited value
+std::map<std::pair<const void*, const void*>, CeWaitRec> g_ce_signals;  // (queue or null = CPU, fence) -> last value
+void ce_wait_note(const void* queue, const void* fence, std::uint64_t value, bool wait) {
+    std::lock_guard lock(g_ce_wait_mu);
+    auto& r = (wait ? g_ce_waits : g_ce_signals)[{queue, fence}];
+    r.value = value;
+    r.tick = GetTickCount64();
+}
+void ce_wait_dump() {
+    std::lock_guard lock(g_ce_wait_mu);
+    const std::uint64_t now = GetTickCount64();
+    std::fprintf(stderr, "[hack] WAIT_DUMP: %zu (queue, fence) waits, %zu signal sources\n", g_ce_waits.size(), g_ce_signals.size());
+    for (const auto& [k, r] : g_ce_waits) {
+        if (now - r.tick > 120000) continue;
+        auto* f = reinterpret_cast<ID3D12Fence*>(const_cast<void*>(k.second));
+        const std::uint64_t done = f->GetCompletedValue();
+        std::uint64_t best = 0;
+        const void* by = nullptr;
+        for (const auto& [sk, sr] : g_ce_signals)
+            if (sk.second == k.second && sr.value >= best) { best = sr.value; by = sk.first; }
+        std::fprintf(stderr, "[hack] WAIT_DUMP: queue %p waits fence %p >= %llu (%llu ms ago); completed %llu; highest signal %llu by %s%p%s\n",
+                     k.first, k.second, (unsigned long long)r.value, (unsigned long long)(now - r.tick), (unsigned long long)done,
+                     (unsigned long long)best, by ? "queue " : "", by, by ? "" : " (CPU)");
+        if (done < r.value) std::fprintf(stderr, "[hack] WAIT_DUMP:   ^ BLOCKED%s\n", best < r.value ? " - NO signal of that value was ever issued" : " - signal issued but not reached");
+    }
+    std::fflush(stderr);
+}
+const bool g_ce_wait_dump_reg = (::leonida::ce::wait_dump_fn().store(&ce_wait_dump), true);
 class Fence final
     : public Child<Fence, ID3D12Fence1Stubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Fence,
                     ID3D12Fence1> {
@@ -1591,6 +1623,7 @@ public:
                 std::fflush(stderr);
             }
         }
+        ce_wait_note(nullptr, this, value, false);  // agA21: CPU signal
         std::lock_guard lock(claim_mutex_);
         if (!claim_locked(value, false)) return S_OK;
         const UINT64 queued = queued_;
@@ -1832,6 +1865,7 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE Signal(ID3D12Fence* fence, UINT64 value) override {
+        ce_wait_note(this, fence, value, false);  // agA21
         if (value >= (UINT64(1) << 48)) {  // HACK (agA11): who signals a huge value (re26: a mirror read UINT64_MAX)
             static std::atomic<int> told{0};
             if (told++ < 16) {
@@ -1850,6 +1884,7 @@ public:
 
     HRESULT STDMETHODCALLTYPE Wait(ID3D12Fence* fence, UINT64 value) override {
         constexpr auto method = "ID3D12CommandQueue::Wait";
+        ce_wait_note(this, fence, value, true);  // agA21
         Fence* f = Fence::from(fence);
         if (!f || f->context() != &context_ || f->attached_device() != attached_device())
             return d3d12_trace::result(method, E_INVALIDARG);
