@@ -54,6 +54,11 @@
 #include <memory>
 #include <utility>
 
+// Tests that compile this file without the XMem allocator (shims/xmem.cpp) still link: the commits before reads of
+// title memory (rt::xmem::commit_physical_range) fall back to a no-op there (MSVC / lld-link weak alias).
+extern "C" bool leonida_ce_xmem_commit_fallback(const void*, std::size_t) { return false; }
+#pragma comment(linker, "/alternatename:?commit_physical_range@xmem@rt@@YA_NPEBX_K@Z=leonida_ce_xmem_commit_fallback")
+
 namespace rt::d3d12_xs {
 namespace {
 
