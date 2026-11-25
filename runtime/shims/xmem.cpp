@@ -976,6 +976,7 @@ bool xmem_write_phys(uint64_t va, const void* src, uint64_t n) {
         auto* backing = static_cast<uint8_t*>(it->second.section->scratch) + it->second.offset;
         if (!VirtualAlloc(backing, kPhysicalPageSize, MEM_COMMIT, PAGE_READWRITE)) return false;
         std::memcpy(backing + in, from, static_cast<size_t>(chunk));
+        if (const auto dirty = rt::xmem::page_dirty_hook().load(std::memory_order_acquire)) dirty(backing);  // agA24
         va += chunk;
         from += chunk;
         n -= chunk;
@@ -991,6 +992,7 @@ bool xmem_write_page(uint64_t page, uint64_t off, const void* src, uint64_t n) {
     auto* backing = static_cast<uint8_t*>(it->second.section->scratch) + it->second.offset;
     if (!VirtualAlloc(backing, kPhysicalPageSize, MEM_COMMIT, PAGE_READWRITE)) return false;
     std::memcpy(backing + off, src, static_cast<size_t>(n));
+    if (const auto dirty = rt::xmem::page_dirty_hook().load(std::memory_order_acquire)) dirty(backing);  // agA24
     return true;
 }
 

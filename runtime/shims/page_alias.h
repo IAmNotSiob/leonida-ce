@@ -54,6 +54,13 @@ inline std::atomic<PageMapFn>& page_map_hook() {
     static std::atomic<PageMapFn> hook{nullptr};
     return hook;
 }
+// agA24: told when xmem_write_page / xmem_write_phys (dstorage's page paths) wrote bytes into the 64 KiB host page `host`
+// (its scratch-view address), so a GPU copy of that page can be refreshed.
+using PageDirtyFn = void (*)(void* host);
+inline std::atomic<PageDirtyFn>& page_dirty_hook() {
+    static std::atomic<PageDirtyFn> hook{nullptr};
+    return hook;
+}
 // Calls fn for every page mapped now in [lo, hi) (to catch up a hook installed late).
 using ForEachMappedFn = void (*)(std::uint64_t lo, std::uint64_t hi, PageMapFn fn);
 inline std::atomic<ForEachMappedFn>& for_each_mapped_hook() {

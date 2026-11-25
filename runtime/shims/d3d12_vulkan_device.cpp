@@ -420,6 +420,10 @@ static struct CePoolGpu {
     std::mutex mu;                                   // pending + chunks
     std::map<std::uint64_t, std::uintptr_t> pending; // window address -> host page (0 = unbind)
     std::map<std::uintptr_t, CePoolChunk> chunks;    // host chunk base -> device copy + import
+    std::set<std::uintptr_t> dirty;                  // host pages written by dstorage since their last copy
+    std::map<std::uint64_t, std::uintptr_t> bound;   // window VA -> host page bound there (flush state)
+    std::unordered_map<std::uintptr_t, std::set<std::uint64_t>> where;  // host page -> window VAs showing it
+    std::atomic<std::uint64_t> refreshes{0};
     std::atomic<std::uint64_t> binds{0}, unbinds{0}, flushes{0}, import_fail{0}, device_bytes{0}, copies{0};
 } g_pool;
 
@@ -427,6 +431,12 @@ static void ce_pool_page_hook(std::uint64_t address, void* host) {
     if (g_pool.mode < 2 || address < g_pool.lo || address >= g_pool.hi) return;
     std::lock_guard lock(g_pool.mu);
     g_pool.pending[address] = reinterpret_cast<std::uintptr_t>(host);
+}
+
+static void ce_pool_dirty_hook(void* host) {
+    if (g_pool.mode < 2) return;
+    std::lock_guard lock(g_pool.mu);
+    g_pool.dirty.insert(reinterpret_cast<std::uintptr_t>(host));
 }
 
 // With g_pool.mu held. The chunk holding host page `p` (device copy + host import, made on first use), or null.
@@ -500,12 +510,20 @@ static void ce_pool_sync() {
     std::size_t pages = 0;
     {
         std::lock_guard lock(g_pool.mu);
-        if (g_pool.pending.empty()) return;
+        if (g_pool.pending.empty() && g_pool.dirty.empty()) return;
         std::map<std::uint64_t, std::uintptr_t> work;
         work.swap(g_pool.pending);
         pages = work.size();
         std::set<std::uintptr_t> copied;
         for (const auto& [va, host] : work) {
+            if (auto old = g_pool.bound.find(va); old != g_pool.bound.end()) {
+                if (auto w = g_pool.where.find(old->second); w != g_pool.where.end()) {
+                    w->second.erase(va);
+                    if (w->second.empty()) g_pool.where.erase(w);
+                }
+                g_pool.bound.erase(old);
+            }
+            if (host) { g_pool.bound[va] = host; g_pool.where[host].insert(va); }
             VkDeviceMemory memory = VK_NULL_HANDLE;
             VkDeviceSize offset = 0;
             if (host) {
@@ -535,7 +553,19 @@ static void ce_pool_sync() {
             }
             binds.push_back({at, 0x10000, memory, offset, 0});
         }
+        // dstorage wrote these host pages after (or while) they were mapped: copy them again into one window VA showing each.
+        for (const std::uintptr_t host : g_pool.dirty) {
+            if (copied.count(host)) continue;
+            const auto w = g_pool.where.find(host);
+            if (w == g_pool.where.end() || w->second.empty()) continue;  // not shown: copied at its next map
+            if (const CePoolChunk* c = ce_pool_chunk(host)) {
+                copies.push_back({c->host_buffer, VkBufferCopy{host - c->base, *w->second.begin() - g_pool.lo, 0x10000}});
+                ++g_pool.refreshes;
+            }
+        }
+        g_pool.dirty.clear();
     }
+    if (binds.empty() && copies.empty()) return;
     auto& vk = g_pool.ctx->vk;
     const std::uint64_t bound = ++g_pool.timeline_value;
     VkTimelineSemaphoreSubmitInfo tl{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
@@ -543,7 +573,7 @@ static void ce_pool_sync() {
     tl.pSignalSemaphoreValues = &bound;
     const VkSparseBufferMemoryBindInfo bb{g_pool.buffer, std::uint32_t(binds.size()), binds.data()};
     VkBindSparseInfo info{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO, &tl};
-    info.bufferBindCount = 1;
+    info.bufferBindCount = binds.empty() ? 0 : 1;
     info.pBufferBinds = &bb;
     info.signalSemaphoreCount = 1;
     info.pSignalSemaphores = &g_pool.timeline;
@@ -610,11 +640,11 @@ static void ce_pool_sync() {
     const std::uint64_t k = ++g_pool.flushes;
     if (res != VK_SUCCESS || k <= 4 || (k & (k - 1)) == 0) {
         std::fprintf(stderr, "[hack] POOL_GPU: flush %llu: %zu pages, %zu binds, %zu copy regions (%s%s); %llu binds / %llu unbinds "
-                     "in all, %llu MiB device-local, %llu page copies, %llu chunk failures\n", (unsigned long long)k, pages,
+                     "in all, %llu MiB device-local, %llu copy regions, %llu dstorage refreshes, %llu chunk failures\n", (unsigned long long)k, pages,
                      binds.size(), copies.size(), res == VK_SUCCESS ? "ok" : "FAILED at ", res == VK_SUCCESS ? "" : stage,
                      (unsigned long long)g_pool.binds.load(), (unsigned long long)g_pool.unbinds.load(),
                      (unsigned long long)(g_pool.device_bytes.load() >> 20), (unsigned long long)g_pool.copies.load(),
-                     (unsigned long long)g_pool.import_fail.load());
+                     (unsigned long long)g_pool.refreshes.load(), (unsigned long long)g_pool.import_fail.load());
         std::fflush(stderr);
     }
 }
@@ -7070,6 +7100,7 @@ public:
                 if (mode == 2) {
                     leonida::ce::pool_sync_fn().store(&ce_pool_sync);
                     rt::xmem::page_map_hook().store(&ce_pool_page_hook, std::memory_order_release);
+                    rt::xmem::page_dirty_hook().store(&ce_pool_dirty_hook, std::memory_order_release);
                     if (auto each = rt::xmem::for_each_mapped_hook().load(std::memory_order_acquire)) each(lo, hi, &ce_pool_page_hook);
                 }
             }
