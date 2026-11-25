@@ -1811,3 +1811,15 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
 - Builds: 79 (f6a950a8b, CB_PEEK), 80 (184817dc9, CB_PEEK prints title bytes at the base too), 81 (30a47ce31, hang-watch SEH).
 - CB_PEEK targets that matter: d5613de2:4:0xca0:0x43c, d94af257:4:0xca0:0x43c, f33ac9e9:5:0x40:0x24, 956fdcc6:4:0x380:0x704
   (needs LEONIDA_CE_PTR_CHECK=1 + PTR_CHECK_ONLY on the same shaders to keep the scan cheap).
+- rp5 (build 80, caps OFF, CBV_SHADOW=2, CB_PEEK): THE SHADOW FIXES THE BLUR CB (Very likely). cs_d5613de2 / cs_d94af257 V# =
+  [1158e300 00000000 00000d60 30014fac] (base in the shadow pool at 0x11470000+), radius +0x43c = 0.0, scale 2.7e-12 (was -8e25
+  from the clobbered ring copy); cs_f33ac9e9 CB in the pool too (+0x24 = 0x400, 0x579). Confirm t=184.5, still device lost
+  (last frame 1800) with the rp1/rp2 signature (CP_FINE direct before cmd #1 CopyTexture, compute at barriers), then a game AV
+  (game+0x4dad047) after the loss. So the endless-blur hang is solved without caps; the remaining loss is a different bug.
+- Next blocker (Plausible, main-session analysis of rp2 FaultInfo): a GPU pointer into the title TEXTURE POOL CPU window
+  (reservation 0x1800e0000.., slot 0xFD6D; GPU mirror window 0x7800e0000 = [0x149e1dad0]); neither window has a GPU mapping in
+  the 4 GiB arena. Fix idea: a pool GPU buffer (sparse-bound to the pool pages or a refreshed copy) + rebase pool-window V#s
+  in the heap-mirror pass. Handed rp6 = build 81 + rp6.env (rp5 + PTR_CHECK=2 on every dispatch) to census pool-cpu/pool-gpu
+  bases (ce_pc_class already classifies them).
+- Recommended env (agA23): build 81 + rp5.env minus PTR_CHECK/CB_PEEK, i.e. /root/handoff/rp1.env (caps OFF + CBV_SHADOW=2;
+  CBV_SHADOW=1 once the change log is not needed). LOOP_CAP is no longer needed for the blur shaders. Leave LEONIDA_CE_STACKS unset.
