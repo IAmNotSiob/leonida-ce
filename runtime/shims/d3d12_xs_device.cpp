@@ -1729,14 +1729,25 @@ void xs_trap_tick(std::uint64_t /*frame*/) {
 // one word per 4 KiB). The title fills them after their views are made (streaming, CPU writes).
 std::mutex g_placed_hash_mu;
 std::map<const void*, std::uint64_t> g_placed_hash;
+// HACK (agA13): a reference on each copied record for the refresh passes, which use the resources outside
+// g_placed_mu: PLACED_EVICT / PLACED_CAP may release a record meanwhile (re34: AV in xs_safe_get_desc <-
+// xs_upload_placed_texture <- xs_refresh_placed_textures at t=203.7, a freed stand-in).
+struct XsHold {
+    std::vector<XsPlaced>& v;
+    ~XsHold() { for (auto& p : v) if (p.resource) p.resource->Release(); }
+};
 void xs_refresh_placed_textures(ID3D12Device* dev) {
     static const bool no_refresh = [] { const char* v = std::getenv("LEONIDA_CE_NO_PLACED_REFRESH"); return v && v[0] == '1'; }();  // agA2
     if (no_refresh) return;
     std::vector<XsPlaced> textures;
+    XsHold hold{textures};
     {
         std::lock_guard lock(g_placed_mu);
         for (const auto& p : g_placed)
-            if (p.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) textures.push_back(p);
+            if (p.resource && p.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+                textures.push_back(p);
+                p.resource->AddRef();
+            }
     }
     for (const auto& t : textures) {
         const std::uint64_t len = t.size;
@@ -1800,11 +1811,14 @@ void xs_refresh_placed_buffers(ID3D12CommandQueue* queue) {
     }();
     if (off || !queue) return;
     std::vector<XsPlaced> buffers;
+    XsHold hold{buffers};
     {
         std::lock_guard lock(g_placed_mu);
         for (const auto& p : g_placed)
-            if (p.desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && p.size && p.size <= (8ull << 20))
+            if (p.resource && p.desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && p.size && p.size <= (8ull << 20)) {
                 buffers.push_back(p);
+                p.resource->AddRef();
+            }
     }
     if (buffers.empty()) return;
     std::vector<const XsPlaced*> changed;

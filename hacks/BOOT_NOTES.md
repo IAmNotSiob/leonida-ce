@@ -1224,3 +1224,51 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   65536 allocs / 55966 releases, live 1231 MiB (the leak is stopped). ECL failures 0, SKIP_BAD 24.
 - NEXT: re35.env = re34 + SKIP_CS=cs_f33ac9e947af1490 (rtdump55); then the cs_f33ac9e9 spin (inter-workgroup sync
   on NVIDIA without forward progress, or zeroed inputs). Recommended env: re34.env (+ the re35 skip) with build 51.
+
+## agA14 (sender gen 14, 2026-11-25)
+- re34 AV gta6rt+0xb8fe5 (t=203.7, ~2.5 s before the TDR) = xs_safe_get_desc (inside __try, caught) <- xs_upload_placed_texture
+  <- xs_refresh_placed_textures (+0xece76) <- child_slot<0,32>: a stand-in released by PLACED_EVICT/CAP during the refresh; the
+  execute-AV at 0x0 right after it is the same freed vtable. agA13 had already fixed it in the tree (XsHold AddRef); build 52 is
+  the first build to ship the fix. Plausibly unrelated to the TDR.
+- cs_f33ac9e9 (re34 TDR) disasm: ONE 1024-thread workgroup, LDS 3x1024 dwords, coalescing a free-block heap (buffer table+0x00,
+  block list table+0x20, CB table+0x40: 0x0c shift, 0x10 ?, 0x14 header size, 0x18 base, 0x24 count, 0x28 bucket size).
+  No cross-workgroup sync (glc/dlc loads read stores from the same workgroup) => not a forward-progress issue (Likely). Hang
+  mechanisms: the barrier-pass loop runs s_ff1(count) times, and count 0 -> -1 -> 2^32-1 barrier rounds; the chain walk does not
+  advance when the header size and a header both read 0. A console would hang the same way => our inputs are zero/stale (Plausible).
+- re35 (build 51, SKIP_CS f33ac9e9, B): Confirm t=110.8, loss t~175 in fspx cs_e8c1251e (bindless: loads V#s from buffers at
+  dynamic offsets), READ_INVALID 0xd0c680f000. The line right before it: the FIRST EVER "unimplemented SetComputeRootSignature(signature
+  that does not fit the compute layout)" + "root arguments beyond 32 user-data dwords (spill not modelled)" (d3d12_com.cpp:
+  bind_root/write). The dispatch is still recorded with zero/truncated root data => garbage descriptor tables (Likely).
+  Note: fault precision is 0x1000, so "page aligned" fault addresses are just page-granular reports, NOT proof of an
+  overread at a buffer end (weakens the BUFFER_PAD theory; re34 had no READ_INVALID though).
+- The translator bounds s_buffer_load by num_records (spvasm of f33ac9e9: UGreaterThanEqual size checks), so the
+  "unbounded scalar loads" part of agA13's PAD theory is wrong for that shader at least. Device address = heap_base (push
+  constant dwords 32-33 = arena device address) + 48-bit V# base. Own-memory buffers have VA = devaddr - arena address (anything).
+- Build 52 (md5 c9d72a4d): LEONIDA_CE_LOOP_CAP=subs|1 (src/spirv_loop_cap.h: per-loop counter on structured loops whose continue
+  block ends in OpBranchConditional header/merge; dispatcher loop cap _INNER default 4M blocks, barrier-round loop cap _OUTER default
+  256K rounds; all 1536 fspx modules spirv-val clean; 55 have loops), LEONIDA_CE_SKIP_UNFIT=1 (d3d12_com.cpp: RootState.overflow;
+  dispatch/indirect dispatch/draw skipped when the layout is not ok for the bind point or args overflowed), always-on log lines
+  "[hack] BUFFER_PAD: ..." and "[hack] arena: device address 0x.. size 0x..". Wine sn1: state 3, 55 LOOP_CAP lines, ok.
+- Navy screen (re35 rtdiag frame 2280, state 0 task 5 inner 5): 210 draws/frame, 189 into a 3840x2160 RT (flags 1) and 21 into the
+  two flags-5 targets, one presented; all three probe as solid ff2c2020 (navy) => the draws land but write nothing visible, or
+  only the navy fill (Scaleform cxform/black-fade issue from agA2 is the prime suspect). Post-Confirm the title creates many 2D
+  textures (1024-2560 wide) and big buffers = world/asset streaming; the screen is most likely the loading screen with its UI
+  layer not visible (Plausible). ~13 fps (4656 ms / 60 frames).
+- Handed: re36.env (= re35 without SKIP_CS + LOOP_CAP=fspx_game + SKIP_UNFIT=1, rtdump56); re37.env (+ SKIP_CS=cs_e8c1251e80f7e330).
+- re36 (build 52, LOOP_CAP + SKIP_UNFIT, B): arena device address 0x300010000 size 0xffe00000; 55 LOOP_CAP; Confirm t=124.0;
+  first unfit compute root signature + "beyond 32 user-data" at t~185-190 -> 24+ SKIP_UNFIT dispatches -> DEVICE LOST t~190 in
+  ANOTHER fspx compute cs_c5b1005e, READ_INVALID 0x50700010000 (VA ~5 TB). No hang (LOOP_CAP did its job or the hang input never
+  came). The losses in re35/re36 come ~65 s after Confirm, right after the first unfit (spilled) compute root signature:
+  the fspx effect that starts then needs root-argument spill (>32 user-data dwords), which is not modelled (d3d12_com.cpp write()).
+  REAL FIX (open): model the console's user-data spill (the root arguments past s31 go into a memory table whose pointer
+  is in a user SGPR); see rt::rootsig layout / "spill array not modelled".
+- Build 53 (md5 9cf4e6d7): LEONIDA_CE_VA_GUARD=subs|1 (src/spirv_va_guard.h): every OpConvertUToPtr(OpIAdd(heap_base, va)) gets
+  va' = va within +-LEONIDA_CE_VA_GUARD_WINDOW (default 2^38) of the arena ? heap_base+va : heap_base. 1528/1536 fspx modules
+  guarded, all spirv-val clean. Wine sn2 ok (state 3, 16 VA_GUARD lines). Handed as re39 (= re36 + VA_GUARD=fspx_game).
+- Recommended env: build 53 + /root/handoff/re39.env.
+- re39 (build 53, VA_GUARD=fspx_game): STALLED before boot state 1 (last present 1665, "background compute cs_af640243: 0
+  after 103421 ms"), host AV in an ntdll stack walk (gta6rt+0xef35e) at t=120, exit 220 s. Guarding all ~1528 fspx modules
+  defeats the pipeline cache and the NVIDIA compiles stall boot (Likely). Use a targeted list only.
+- Handed re40 = re36 + VA_GUARD=cs_bedf0201,cs_25d19264,cs_87dac0f8,cs_1bc231e4,cs_e8c1251e,cs_c5b1005e,cs_f33ac9e9 (result pending).
+- Recommended env now: build 53 + /root/handoff/re40.env. NEXT: model the root-argument spill (the real cause of the
+  post-Confirm fspx faults, Likely); then the one-colour navy screen (try CXFORM_FORCE=1; per-draw dumps of the 189-draw target).

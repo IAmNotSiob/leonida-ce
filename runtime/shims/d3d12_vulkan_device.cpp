@@ -30,6 +30,8 @@
 #include "../src/shader_library.h"
 #include "../src/spirv_f16_halves.h"
 #include "../src/spirv_stores.h"
+#include "../src/spirv_loop_cap.h"
+#include "../src/spirv_va_guard.h"
 #include "../src/vulkan_present.h"
 #include "../src/vulkan_device_filter.h"
 #include "../src/vulkan13_features.h"
@@ -4487,10 +4489,62 @@ public:
                 }
             }
         }
-        const std::vector<std::uint32_t> words = library->spirv(*entry);
+        std::vector<std::uint32_t> words = library->spirv(*entry);
         if (words.empty()) {
             std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", entry->name.c_str());
             return E_FAIL;
+        }
+        // HACK (agA14): LEONIDA_CE_LOOP_CAP=sub1,sub2 (or 1 = every compute program): a watchdog counter on each
+        // translated loop (src/spirv_loop_cap.h), so a data-dependent endless loop ends instead of a TDR (re34:
+        // fspx cs_f33ac9e9). LEONIDA_CE_LOOP_CAP_INNER / _OUTER = the caps (blocks per invocation / barrier rounds).
+        {
+            static const std::vector<std::string> cap_cs = [] {
+                std::vector<std::string> v;
+                if (const char* e = std::getenv("LEONIDA_CE_LOOP_CAP")) {
+                    std::string all(e);
+                    for (std::size_t at = 0; at <= all.size();) {
+                        const std::size_t comma = all.find(',', at);
+                        const std::string item = all.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+                        if (!item.empty()) v.push_back(item == "1" ? std::string() : item);
+                        if (comma == std::string::npos) break;
+                        at = comma + 1;
+                    }
+                }
+                return v;
+            }();
+            static const std::uint32_t inner_cap = [] { const char* v = std::getenv("LEONIDA_CE_LOOP_CAP_INNER"); return std::uint32_t(v ? std::strtoul(v, nullptr, 0) : (1u << 22)); }();
+            static const std::uint32_t outer_cap = [] { const char* v = std::getenv("LEONIDA_CE_LOOP_CAP_OUTER"); return std::uint32_t(v ? std::strtoul(v, nullptr, 0) : (1u << 18)); }();
+            for (const std::string& pattern : cap_cs)
+                if (entry->name.find(pattern) != std::string::npos) {
+                    const int n = leonida::spirv_cap_loops(words, inner_cap, outer_cap);
+                    static std::atomic<int> told{0};
+                    if (n && told++ < 64)
+                        std::fprintf(stderr, "[hack] LOOP_CAP: %s: %d loop(s) capped (%u blocks / %u rounds)\n",
+                                     entry->name.c_str(), n, inner_cap, outer_cap);
+                    break;
+                }
+        }
+        // HACK (agA14): LEONIDA_CE_VA_GUARD=sub1,sub2 (or 1 = every compute program): pointers from heap_base + VA with
+        // the VA farther than LEONIDA_CE_VA_GUARD_WINDOW (default 2^38) from the arena read the arena start instead of
+        // page-faulting (src/spirv_va_guard.h; re29-re36 READ_INVALIDs at VAs terabytes away).
+        if (const char* g = std::getenv("LEONIDA_CE_VA_GUARD")) {
+            static const std::uint64_t window = [] { const char* v = std::getenv("LEONIDA_CE_VA_GUARD_WINDOW"); return v ? std::strtoull(v, nullptr, 0) : (1ull << 38); }();
+            std::string all(g);
+            bool match = false;
+            for (std::size_t at = 0; at <= all.size() && !match;) {
+                const std::size_t comma = all.find(0x2c, at);
+                const std::string item = all.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+                if (item == "1" || (!item.empty() && entry->name.find(item) != std::string::npos)) match = true;
+                if (comma == std::string::npos) break;
+                at = comma + 1;
+            }
+            if (match) {
+                const int n = leonida::spirv_guard_va(words, window);
+                static std::atomic<int> told{0};
+                if (n && told++ < 16)
+                    std::fprintf(stderr, "[hack] VA_GUARD: %s: %d pointer(s) guarded (window 0x%llx)\n", entry->name.c_str(), n,
+                                 (unsigned long long)window);
+            }
         }
 
         VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -6144,7 +6198,11 @@ public:
         if (const char* v = std::getenv("LEONIDA_CE_BUFFER_PAD")) {
             const VkDeviceSize pad = (VkDeviceSize(std::strtoull(v, nullptr, 0)) + 0xFFFF) & ~VkDeviceSize(0xFFFF);
             if (pad && pad < arena.size / 4) arena.free[kArenaReserved] = arena.size - kArenaReserved - pad;
+            std::fprintf(stderr, "[hack] BUFFER_PAD: %llu bytes per own-memory buffer, arena top keeps %llu\n",
+                         (unsigned long long)std::strtoull(v, nullptr, 0), (unsigned long long)pad);
         }
+        std::fprintf(stderr, "[hack] arena: device address 0x%llx size 0x%llx (console VA 0 = this address)\n",
+                     (unsigned long long)arena.address, (unsigned long long)arena.size);
         arena.peak_end = kArenaReserved;
         char log[4] = {};
         length = 0;

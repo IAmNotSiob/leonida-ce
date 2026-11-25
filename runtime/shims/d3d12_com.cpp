@@ -858,6 +858,7 @@ public:
         cmd.count_offset = count_buffer ? count_buffer_offset : 0;
         if (kind == leonida::IndirectKind::dispatch && max_command_count) {  // the pipeline and root arguments a Dispatch would record
             if (!compute_pipeline_ || !compute_.layout) return check(false);
+            if (unfit(compute_)) return;
             cmd.pipeline = compute_pipeline_;
             cmd.user_data = compute_.data;
         }
@@ -1157,7 +1158,26 @@ private:
     struct RootState {
         const RootArgumentLayout* layout = nullptr;
         std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> data{};
+        bool overflow = false;  // agA14: a root argument landed past the 32 user-data dwords (dropped)
     };
+    // HACK (agA14): LEONIDA_CE_SKIP_UNFIT=1. re35 lost the device (READ_INVALID in fspx cs_e8c1251e) right after the
+    // first "SetComputeRootSignature(signature that does not fit the compute layout)" / "root arguments beyond 32
+    // user-data dwords": the dispatch was recorded anyway with zero or truncated root data, so the shader read its
+    // descriptor tables from garbage. With the switch such dispatches and draws are left out.
+    static bool skip_unfit() {
+        static const bool on = [] { const char* e = std::getenv("LEONIDA_CE_SKIP_UNFIT"); return e && e[0] == '1'; }();
+        return on;
+    }
+    bool unfit(const RootState& state) const {
+        if (!skip_unfit() || !state.layout) return false;
+        const bool ok = is_compute(state) ? state.layout->compute_ok : state.layout->graphics_ok;
+        if (ok && !state.overflow) return false;
+        static std::atomic<int> told{0};
+        if (told++ < 24)
+            std::fprintf(stderr, "[hack] SKIP_UNFIT: %s left out (%s)\n", is_compute(state) ? "dispatch" : "draw",
+                         ok ? "root arguments past 32 user-data dwords" : "root signature does not fit this bind point");
+        return true;
+    }
 
     // D3D12 leaves root arguments undefined after a root-signature change; they start at zero here. Setting the
     // signature that is already bound changes nothing: "existing root signature bindings do not become stale"
@@ -1177,6 +1197,7 @@ private:
         hold(signature);  // state.layout points into it
         state.layout = layout;
         state.data = {};
+        state.overflow = false;
         // CreateRootSignature accepted it for the other bind point only (its log line says why).
         if (layout && !(is_compute(state) ? layout->compute_ok : layout->graphics_ok)) {
             stub(is_compute(state) ? "SetComputeRootSignature(signature that does not fit the compute layout)"
@@ -1210,8 +1231,10 @@ private:
             if (!is_compute(state) && state.layout && state.layout->graphics_console && state.layout->graphics_end <= 16 &&
                 dword + 8 < rt::rootsig::kMaxUserSgprs)
                 state.data[dword + 8] = value;
-        } else
+        } else {
+            state.overflow = true;
             stub("root arguments beyond 32 user-data dwords (spill not modelled)");
+        }
     }
 
     void constants(RootState& state, UINT index, UINT count, const void* data, UINT offset) {
@@ -1397,6 +1420,7 @@ private:
 
     void record_dispatch(UINT x, UINT y, UINT z) {
         if (!compute_pipeline_ || !compute_.layout) return check(false);
+        if (unfit(compute_)) return;
         note_direct_heap_indexing(compute_.layout);
         check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
     }
@@ -1417,6 +1441,7 @@ private:
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
         if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
+        if (unfit(graphics_)) return;
         note_direct_heap_indexing(graphics_.layout);
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
