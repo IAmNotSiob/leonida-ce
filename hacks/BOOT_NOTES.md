@@ -1823,3 +1823,31 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   bases (ce_pc_class already classifies them).
 - Recommended env (agA23): build 81 + rp5.env minus PTR_CHECK/CB_PEEK, i.e. /root/handoff/rp1.env (caps OFF + CBV_SHADOW=2;
   CBV_SHADOW=1 once the change log is not needed). LOOP_CAP is no longer needed for the blur shaders. Leave LEONIDA_CE_STACKS unset.
+
+## agA24 (sender gen 24, 2026-11-25)
+- Receiver ada4c52511e1337a1 (runs rqN). Builds 82+.
+- rp6 census (build 81, PTR_CHECK=2 on every dispatch; receiver): 19 pool lines (11 pool-cpu, 8 pool-gpu), 291 host-committed,
+  88 other, 2 page-pool. Real ones are table V#s in cs_87dac0f8 / cs_25d19264 / cs_1bc231e4 (s5 slots 16-30): GPU-window base
+  0xbc3960000 (64 KiB-aligned, a slot base), CPU-window 0x234453ed0 / 0x2f7bff390; the same values also sit as raw qwords in
+  buffers (so descriptor rewriting alone could never cover them). Qwords like 0x900000008 / 0x400000008 are false positives.
+  Older ri46-ri59 logs had 60 pool-cpu / 119 pool-gpu lines in the same three shaders. => buffer V#s AND raw pointers into both
+  windows (Very likely). rp6 lost the device at Confirm+165 s on a READ_INVALID at device 0x7ae218cf000 (~7.7 TiB: not pool,
+  garbage) in cs_edc5d4c7; rp2 had a WRITE_INVALID (type 2) in the pool CPU window. So the pool is ONE of the bad-address sources.
+- Options checked on the local RTX 6000 (Linux driver, test programs in /root/agA24): sparse buffers take ONLY device-local memory
+  (memoryTypeBits 0x2), so neither the host-visible arena nor imported host pages can be sparse-bound => "make the arena sparse"
+  and "sparse-bind the host pool pages" are impossible on NVIDIA. But bufferDeviceAddressCaptureReplay with an arbitrary opaque
+  address places a sparse buffer EXACTLY where asked (0x2ae6e0000 wanted = got): a buffer at heap_base + 0x1800e0000 makes
+  heap_base + VA valid for every pool VA with no rewriting.
+- Build 82 (gta6rt-82.exe md5 05936516, commit 0fd9c7c41): LEONIDA_CE_POOL_GPU=1|2 (default off; LO/END/CHUNK overridable):
+  - sparse window buffer [0x1800e0000, 0xd800e0000) at heap_base + LO (capture replay enabled on the device only with the switch;
+    refuses with "POOL_GPU: OFF: <why>" if the driver places it elsewhere);
+  - =1: unbound (reads 0, writes dropped): fault-proof only;
+  - =2: xmem page hook (page_alias.h page_map_hook / for_each_mapped_hook, called from map_backing / unmap_page) queues every
+    window page map; at ExecuteCommandLists (ce::pool_sync_fn) each is sparse-bound to a device-local copy of its physical page
+    (64 MiB device chunks keyed by the xmem section scratch view, so CPU and GPU slots of one page alias), and the page host bytes
+    are copied in (imported host chunk -> window buffer) at each map event; CPU waits for bind+copy. GPU writes are not copied back.
+  - Wine sq2 (local GPU, rp1 env + POOL_GPU=2): placement OK, 6720 pages bound in the first flush, 0 failures, boot state 3,
+    768 MiB device-local after ~12k binds / 11k unbinds.
+- Env note: VA_GUARD_WINDOW=0x100000000 (rp1) redirects pool VAs in the 81 guarded shaders; with POOL_GPU use 0xd800e0000.
+- Handed rq1 = build 82 + rq1.env (rp1 + POOL_GPU=2 + VA_GUARD_WINDOW=0xd800e0000 + CB_PEEK on cs_edc5d4c7 CB+0/8/0x30/0x40,
+  main-session request: that shader takes a V# embedded in its CB and a bindless index CB[0x40]) and rq2 = rq1 with POOL_GPU=1.
