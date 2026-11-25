@@ -896,27 +896,120 @@ std::uint64_t xs_gpu_address(std::uint64_t address, std::uint64_t size) {
 // views of them (slots 70/71: (resource desc, view desc, handle), the PC view description followed by the title
 // address at +40). The resources are stand-ins not backed by the title's memory yet.
 // magic code, don't wanna deal with hours of plumbing with what these conjured devils of the souls of gpt 6 astra did.. jeez
-struct XsPlaced { std::uint64_t va, size; ID3D12Resource* resource; D3D12_RESOURCE_DESC desc; };
+struct XsPlaced { std::uint64_t va, size; ID3D12Resource* resource; D3D12_RESOURCE_DESC desc; int refs = 0; };
 std::mutex g_placed_mu;
 std::deque<XsPlaced> g_placed;  // agA5: deque, so xs_find_placed pointers survive push_back
+// HACK (agA13): LEONIDA_CE_PLACED_EVICT=1. The arena never released a buffer (re28/re29: 57344 allocations, 0
+// releases): every stand-in stays referenced by g_placed forever (agA5's AddRef, plus the creation reference of the
+// slot-70/71 stand-ins nobody else holds). With eviction, a new record drops the older entries whose console range it
+// overlaps (the title reused that memory, so their contents are gone on the console too) and releases our references.
+// g_placed_live indexes the live, disjoint ranges: start -> index in g_placed.
+std::map<std::uint64_t, std::size_t> g_placed_live;
+std::uint64_t g_placed_records = 0, g_placed_evicted = 0;
+bool xs_placed_evict() {
+    static const bool on = [] { const char* e = std::getenv("LEONIDA_CE_PLACED_EVICT"); return e && (e[0] == '1' || e[0] == '2'); }();
+    return on;
+}
 void xs_record_placed(std::uint64_t va, std::uint64_t size, ID3D12Resource* resource,
-                      const D3D12_RESOURCE_DESC* console_desc = nullptr) {
+                      const D3D12_RESOURCE_DESC* console_desc = nullptr, bool owned = false) {
     if (!va || !resource) return;
     // HACK (agA5): hold a reference, so a stand-in the title releases is never freed under a later view of its VA
     // (re1: CreateShaderResourceView -> Object::from -> Release -> free of a dead resource, heap corruption).
     static const bool keep = [] { const char* e = std::getenv("LEONIDA_CE_PLACED_REF"); return !(e && e[0] == 0); }();
     if (keep) resource->AddRef();
-    std::lock_guard lock(g_placed_mu);
-    g_placed.push_back({va, size ? size : 1, resource, console_desc ? *console_desc : resource->GetDesc()});
-    {   // DIAGNOSTIC (agA5): small-format 2D textures (glyph-cache hunt)
-        const auto& d = g_placed.back().desc;
-        static std::atomic<int> told{0};
-        const int f = static_cast<int>(d.Format);
-        if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && (f == 60 || f == 61 || f == 62 || f == 65 || f == 49 || f == 28) &&
-            d.Width >= 256 && d.Height >= 256 && told++ < 40)
-            std::fprintf(stderr, "[glyph?] placed 2D va %llx %llux%u fmt %d mips %u layout 0x%x size %llx\n", (unsigned long long)va,
-                         (unsigned long long)d.Width, d.Height, f, d.MipLevels, static_cast<unsigned>(d.Layout), (unsigned long long)size);
+    const bool evict = xs_placed_evict();
+    std::vector<std::pair<ID3D12Resource*, int>> drop;
+    {
+        std::lock_guard lock(g_placed_mu);
+        if (evict) {
+            const std::uint64_t end = va + (size ? size : 1);
+            auto it = g_placed_live.upper_bound(va);
+            if (it != g_placed_live.begin()) {
+                auto pv = std::prev(it);
+                const auto& e = g_placed[pv->second];
+                if (e.va + e.size > va) it = pv;
+            }
+            while (it != g_placed_live.end() && it->first < end) {
+                auto& e = g_placed[it->second];
+                if (e.resource && e.refs) drop.emplace_back(e.resource, e.refs);
+                e.resource = nullptr;
+                e.size = 0;
+                e.refs = 0;
+                e.desc.Dimension = D3D12_RESOURCE_DIMENSION_UNKNOWN;
+                it = g_placed_live.erase(it);
+                ++g_placed_evicted;
+            }
+        }
+        g_placed.push_back({va, size ? size : 1, resource, console_desc ? *console_desc : resource->GetDesc(),
+                            (keep ? 1 : 0) + ((owned && evict) ? 1 : 0)});
+        if (evict) g_placed_live[va] = g_placed.size() - 1;
+        // agA13: LEONIDA_CE_PLACED_CAP=N keeps at most N of the runtime's own slot-70/71 stand-ins (re31 census: they
+        // are the arena growth, +0x83b94 = proxy_slot<70>, ~8k per minute at fresh VAs); the oldest live one goes first.
+        static const std::size_t cap = [] { const char* e = std::getenv("LEONIDA_CE_PLACED_CAP"); return e ? std::size_t(std::strtoull(e, nullptr, 0)) : std::size_t(0); }();
+        static std::deque<std::size_t> owned_order;
+        if (evict && owned && cap) {
+            owned_order.push_back(g_placed.size() - 1);
+            while (owned_order.size() > cap) {
+                const std::size_t idx = owned_order.front();
+                owned_order.pop_front();
+                auto& e = g_placed[idx];
+                if (!e.resource) continue;  // evicted by overlap already
+                const auto live = g_placed_live.find(e.va);
+                if (live != g_placed_live.end() && live->second == idx) g_placed_live.erase(live);
+                if (e.refs) drop.emplace_back(e.resource, e.refs);
+                e.resource = nullptr;
+                e.size = 0;
+                e.refs = 0;
+                e.desc.Dimension = D3D12_RESOURCE_DIMENSION_UNKNOWN;
+                ++g_placed_evicted;
+            }
+        }
+        ++g_placed_records;
+        if ((g_placed_records & 2047) == 0) {
+            // agA13: orphans = live entries only we hold (the title released its object). LEONIDA_CE_PLACED_EVICT=2
+            // also drops the orphans the title made itself (slot 133 / console texture memory, refs == 1); the
+            // runtime's own slot-70/71 stand-ins (refs == 2) are only ever evicted by overlap.
+            static const bool sweep = [] { const char* e = std::getenv("LEONIDA_CE_PLACED_EVICT"); return e && e[0] == '2'; }();
+            std::size_t orphans = 0, swept = 0;
+            for (auto it = g_placed_live.begin(); it != g_placed_live.end();) {
+                auto& e = g_placed[it->second];
+                if (e.resource && e.refs) {
+                    e.resource->AddRef();
+                    const ULONG n = e.resource->Release();
+                    if (n == ULONG(e.refs)) {
+                        ++orphans;
+                        if (sweep && e.refs == 1 && it->second + 1 != g_placed.size()) {
+                            drop.emplace_back(e.resource, e.refs);
+                            e.resource = nullptr;
+                            e.size = 0;
+                            e.refs = 0;
+                            e.desc.Dimension = D3D12_RESOURCE_DIMENSION_UNKNOWN;
+                            it = g_placed_live.erase(it);
+                            ++swept;
+                            continue;
+                        }
+                    }
+                }
+                ++it;
+            }
+            std::fprintf(stderr, "[hack] placed: %llu records, %llu evicted, %zu live, %zu orphans, %zu swept (evict %d)\n",
+                         (unsigned long long)g_placed_records, (unsigned long long)g_placed_evicted,
+                         g_placed_live.size(), orphans, swept, int(evict) + int(sweep));
+            std::fflush(stderr);
+        }
+        {   // DIAGNOSTIC (agA5): small-format 2D textures (glyph-cache hunt)
+            const auto& d = g_placed.back().desc;
+            static std::atomic<int> told{0};
+            const int f = static_cast<int>(d.Format);
+            if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && (f == 60 || f == 61 || f == 62 || f == 65 || f == 49 || f == 28) &&
+                d.Width >= 256 && d.Height >= 256 && told++ < 40)
+                std::fprintf(stderr, "[glyph?] placed 2D va %llx %llux%u fmt %d mips %u layout 0x%x size %llx\n", (unsigned long long)va,
+                             (unsigned long long)d.Width, d.Height, f, d.MipLevels, static_cast<unsigned>(d.Layout), (unsigned long long)size);
+        }
     }
+    // Our references go after the lock: a Release may run a destructor that calls back into the device.
+    for (auto& [r, n] : drop)
+        while (n-- > 0) r->Release();
 }
 bool xs_placed_by_resource(const void* resource, XsPlaced& out) {
     std::lock_guard lock(g_placed_mu);
@@ -926,9 +1019,36 @@ bool xs_placed_by_resource(const void* resource, XsPlaced& out) {
 }
 const XsPlaced* xs_find_placed(std::uint64_t va) {
     std::lock_guard lock(g_placed_mu);
+    if (xs_placed_evict()) {  // agA13: live ranges are disjoint
+        auto it = g_placed_live.upper_bound(va);
+        if (it == g_placed_live.begin()) return nullptr;
+        const XsPlaced& e = g_placed[std::prev(it)->second];
+        return (e.resource && va >= e.va && va < e.va + e.size) ? &e : nullptr;
+    }
     for (auto it = g_placed.rbegin(); it != g_placed.rend(); ++it)
         if (va >= it->va && va < it->va + it->size) return &*it;
     return nullptr;
+}
+// HACK (agA13, LEONIDA_CE_CBV_FIX=1): a GPU address in title memory that a placed / stand-in BUFFER covers becomes that
+// buffer's GPU VA (the GPU-side copy the runtime refreshes), instead of reaching a shader as a raw title pointer
+// (re30: cs_25d19264 READ_INVALID 0x1e1f7f013000). 0 when no buffer covers [va, va + bytes).
+bool xs_cbv_fix_on() {
+    static const bool on = [] { const char* v = std::getenv("LEONIDA_CE_CBV_FIX"); return v && v[0] == '1'; }();
+    return on;
+}
+std::uint64_t xs_placed_buffer_va(std::uint64_t va, std::uint64_t bytes) {
+    const XsPlaced* p = xs_find_placed(va);
+    if (!p || !p->resource || p->desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return 0;
+    if (bytes && va - p->va + bytes > p->size) return 0;
+    const std::uint64_t gpu = p->resource->GetGPUVirtualAddress();
+    return gpu ? gpu + (va - p->va) : 0;
+}
+void xs_cbv_fix_note(const char* what, std::uint64_t from, std::uint64_t to) {
+    static std::atomic<int> told{0};
+    if (told++ < 24) {
+        std::fprintf(stderr, "[hack] CBV_FIX: %s 0x%llx -> 0x%llx\n", what, (unsigned long long)from, (unsigned long long)to);
+        std::fflush(stderr);
+    }
 }
 std::uint64_t xs_format_bytes(DXGI_FORMAT f) {
     switch (f) {
@@ -2870,7 +2990,18 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
             auto** const real_vtable = *reinterpret_cast<void***>(self->real);
             UnwrappedArray heaps;
             if constexpr (pc == 31 || pc == 32) a2 = xs_gpu_handle_from_console(a2);  // HACK: unified handles
-            if constexpr (pc >= 37 && pc <= 42) a2 = xs_va_from_cpu(a2);  // HACK: root CBV/SRV/UAV addresses
+            if constexpr (pc >= 37 && pc <= 42) {
+                const std::uint64_t raw = a2;
+                a2 = xs_va_from_cpu(a2);  // HACK: root CBV/SRV/UAV addresses
+                if (xs_cbv_fix_on() && a2 == raw && raw >= g_arena_size) {  // agA13: past the arena: a title pointer
+                    if (const std::uint64_t to = xs_placed_buffer_va(raw, 0)) {
+                        a2 = to;
+                        xs_cbv_fix_note("root view in a placed buffer", raw, to);
+                    } else {
+                        xs_cbv_fix_note("root view at an unknown title address (left)", raw, raw);
+                    }
+                }
+            }
             if constexpr (pc == 25) {  // HACK diagnostic: which pipelines the title draws with
                 static std::mutex seen_mu;
                 static std::set<std::uint64_t> seen;
@@ -4310,6 +4441,13 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                     cbv.SizeInBytes);
                         cbv.BufferLocation = xs_va_from_cpu(copy);
                     }
+                } else if (xs_cbv_fix_on() && translated == cbv.BufferLocation && cbv.BufferLocation >= g_arena_size) {
+                    // agA13: too big to snapshot here, or not CPU-readable (GPU-written title memory): a placed buffer
+                    // that covers it; else the vulkan device's CBV_FIX (snapshot up to 8 MiB / null view) decides.
+                    if (const std::uint64_t to = xs_placed_buffer_va(cbv.BufferLocation, cbv.SizeInBytes)) {
+                        xs_cbv_fix_note("CBV in a placed buffer", cbv.BufferLocation, to);
+                        cbv.BufferLocation = to;
+                    }
                 } else {
                     cbv.BufferLocation = translated;
                 }
@@ -4729,7 +4867,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                                               nullptr, __uuidof(ID3D12Resource), &created)) && created) {
                 const std::uint64_t bytes = d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
                     ? d.Width : self->real->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
-                xs_record_placed(va, bytes, static_cast<ID3D12Resource*>(created), rdesc);
+                xs_record_placed(va, bytes, static_cast<ID3D12Resource*>(created), rdesc, true);  // agA13: owned
                 placed = xs_find_placed(va);
             }
         }

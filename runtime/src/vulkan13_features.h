@@ -38,6 +38,8 @@ public:
     bool subgroup_size_control = false;
     bool compute_full_subgroups = false;
     bool extended_dynamic_state = false;  // core on 1.3; on 1.2 both VK_EXT_extended_dynamic_state(2) extensions
+    bool robust_image_access = false;     // HACK (agA13): 1.3 core robustImageAccess, supported by the device
+    bool want_robust_image_access = false;  // HACK (agA13): LEONIDA_CE_ROBUST_IMAGE=1 asks enable() to turn it on
 
     bool usable() const { return dynamic_rendering && synchronization2; }
 
@@ -57,6 +59,7 @@ public:
             subgroup_size_control = f13.subgroupSizeControl == VK_TRUE;
             compute_full_subgroups = f13.computeFullSubgroups == VK_TRUE;
             extended_dynamic_state = true;  // core in 1.3, no feature bit
+            robust_image_access = f13.robustImageAccess == VK_TRUE;
             return;
         }
         if (api_version < VK_API_VERSION_1_2 || !enumerate_extensions) return;
@@ -103,6 +106,7 @@ public:
         subgroup_size_control = from.subgroup_size_control;
         compute_full_subgroups = from.compute_full_subgroups;
         extended_dynamic_state = from.extended_dynamic_state;
+        robust_image_access = from.robust_image_access;
     }
 
     // The structs that enable both features, ahead of `chain`; returns their head for VkPhysicalDeviceVulkan12Features'
@@ -114,6 +118,7 @@ public:
             enable13_.synchronization2 = VK_TRUE;
             enable13_.subgroupSizeControl = subgroup_size_control ? VK_TRUE : VK_FALSE;
             enable13_.computeFullSubgroups = compute_full_subgroups ? VK_TRUE : VK_FALSE;
+            enable13_.robustImageAccess = (want_robust_image_access && robust_image_access) ? VK_TRUE : VK_FALSE;
             return &enable13_;
         }
         if (subgroup_size_control) {

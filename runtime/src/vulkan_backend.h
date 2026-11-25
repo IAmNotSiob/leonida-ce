@@ -1181,6 +1181,12 @@ public:
         }
     }
 
+    // HACK (agA13): true when a buffer of a live resource holds `va` (the buffer_at index), for CBV checks.
+    bool va_known(std::uint64_t va) {
+        std::shared_lock lock(resource_mutex_);
+        BufferVaIndex<ResourceId>::Hit hit{};
+        return buffer_vas_.find(va, hit);
+    }
     void remove_resource(ResourceId id) {
         VkImage img = VK_NULL_HANDLE;
         std::shared_ptr<SparseResource> sparse_resource;

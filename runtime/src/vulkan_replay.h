@@ -1056,6 +1056,7 @@ struct PreparedQuery {
 };
 
 struct Prepared {
+    bool ce_bad = false;  // HACK (agA13): left out by LEONIDA_CE_SKIP_BAD (invalid subresource)
     // Helper commands split the active statistics query just like query resolves, and so does a draw whose kind (mesh
     // or vertex) differs from the draws before it in the current segment (plan_statistics_segments, D3D-291).
     std::uint32_t statistics_end = PreparedQuery::no_segment;
@@ -3117,6 +3118,33 @@ inline bool zero_clear_unavailable(const PreparedList& prepared, const ReplayFun
 // Resolve maps a ResourceId to a const ResourceBinding* (nullptr: unknown).
 // statistics_helpers promises a statistics segment pool at QueryReplay::plan(). Keep the default for replay()
 // and callers without a summation helper: reject before allocating any helper scratch.
+// HACK (agA13): LEONIDA_CE_SKIP_BAD=1 leaves out a command whose subresource is invalid (re27-re29: 4-5 lists a run
+// were dropped whole for one such command) instead of failing the list. Logs the first few.
+namespace ce_skip {
+inline bool on() {
+    static const bool v = [] { const char* e = std::getenv("LEONIDA_CE_SKIP_BAD"); return e && e[0] == '1'; }();
+    return v;
+}
+inline void note(std::size_t index, std::size_t count, std::size_t kind, int line) {
+    static std::atomic<int> told{0};
+    if (told++ < 24) {
+        std::fprintf(stderr, "[hack] SKIP_BAD: invalid subresource at vulkan_replay.h:%d, command %zu of %zu (kind %zu) left out\n",
+                     line, index, count, kind);
+        std::fflush(stderr);
+    }
+}
+} // namespace ce_skip
+#define CE_BAD_SUBRESOURCE()                                                                     \
+    {                                                                                            \
+        if (::leonida::ce_skip::on()) {                                                          \
+            p.skip = true;                                                                       \
+            p.ce_bad = true;                                                                     \
+            ::leonida::ce_skip::note(i, commands.size(), command.index(), __LINE__);             \
+            goto ce_next_command;                                                                \
+        }                                                                                        \
+        return ReplayResult::invalid_subresource;                                                \
+    }
+
 template<typename Resolve>
 ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFunctions& vk, PreparedList& out,
                      bool statistics_helpers = false) {
@@ -3188,9 +3216,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!bind(transition->resource)) { static bool told_ = false; if (!told_) { told_ = true; std::fprintf(stderr, "[hack] replay: unresolved resource at vulkan_replay.h:%d (command %zu of %zu)\n", __LINE__, i, commands.size()); } return ReplayResult::unresolved_resource; }
             if (p.binding.image == VK_NULL_HANDLE) {
                 if (transition->subresource != 0 && transition->subresource != all_subresources)
-                    return ReplayResult::invalid_subresource;
+                    CE_BAD_SUBRESOURCE()
             } else if (!image_range(p.binding, transition->subresource, p.range)) {
-                return ReplayResult::invalid_subresource;
+                CE_BAD_SUBRESOURCE()
             }
         } else if (std::holds_alternative<GlobalBarrier>(command) || std::holds_alternative<BufferBarrier>(command)) {
             if (!vk.pipeline_barrier2) return ReplayResult::unsupported;
@@ -3200,12 +3228,12 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!vk.pipeline_barrier2) return ReplayResult::unsupported;
             if (!bind(texture->resource)) { static bool told_ = false; if (!told_) { told_ = true; std::fprintf(stderr, "[hack] replay: unresolved resource at vulkan_replay.h:%d (command %zu of %zu)\n", __LINE__, i, commands.size()); } return ReplayResult::unresolved_resource; }
             if (!p.binding.image || !barrier_range(p.binding, texture->range, p.range))
-                return ReplayResult::invalid_subresource;
+                CE_BAD_SUBRESOURCE()
         } else if (const auto* color_clear = std::get_if<ClearRenderTarget>(&command)) {
             if (!bind(color_clear->target.resource)) { static bool told_ = false; if (!told_) { told_ = true; std::fprintf(stderr, "[hack] replay: unresolved resource at vulkan_replay.h:%d (command %zu of %zu)\n", __LINE__, i, commands.size()); } return ReplayResult::unresolved_resource; }
             if (!p.binding.image || p.binding.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return ReplayResult::invalid_clear;
             if (!detail::view_range(p.binding, color_clear->target, VK_IMAGE_ASPECT_COLOR_BIT, p.range))
-                return ReplayResult::invalid_subresource;
+                CE_BAD_SUBRESOURCE()
             p.clear_format = detail::color_view_format(p.binding, color_clear->target);
             // Older ownerless replay callers omit the resource format for float-only clears. Preserve
             // that path; an explicit format or a typeless resource must still resolve a concrete RTV.
@@ -3236,7 +3264,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             // 2026-11-23 it returned invalid_clear here and the whole list was dropped (D3D-437).
             aspects &= available;
             if (!detail::view_range(p.binding, depth_clear->target, aspects, p.range))
-                return ReplayResult::invalid_subresource;
+                CE_BAD_SUBRESOURCE()
             if (!aspects) p.skip = true;
             if (const auto r = rect_view(clear_rects(depth_clear->rects), depth_clear->target, p.binding.aspects);
                 r != ReplayResult::success)
@@ -3265,7 +3293,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!p.binding.image || p.binding.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return ReplayResult::invalid_clear;
             const TargetView target{view.resource, view.mip, view.first_layer, view.layer_count};
             if (!detail::view_range(p.binding, target, VK_IMAGE_ASPECT_COLOR_BIT, p.range))
-                return ReplayResult::invalid_subresource;
+                CE_BAD_SUBRESOURCE()
             // The view's format turns the values into bytes. When the view format differs from the image's backing
             // format (a typeless or castable texture) and can be cleared as a color attachment, clear through a view of
             // view_format instead of decoding into the backing format (which turns non-float bit patterns like
@@ -3425,6 +3453,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 }
                 p.image_copies.clear();
             }
+            if (result == ReplayResult::invalid_subresource) CE_BAD_SUBRESOURCE()
             if (result != ReplayResult::success) return result;
             if (p.binding.host_readable) {
                 out.wrote_readback = true;
@@ -3439,8 +3468,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             const ResourceBinding* source = resolve(resolve_command->src);
             if (!bind(resolve_command->dst) || !source) { static bool told_ = false; if (!told_) { told_ = true; std::fprintf(stderr, "[hack] replay: unresolved resource at vulkan_replay.h:%d (command %zu of %zu)\n", __LINE__, i, commands.size()); } return ReplayResult::unresolved_resource; }
             p.source = *source;
-            if (const auto result = detail::prepare_resolve(*resolve_command, p); result != ReplayResult::success)
+            if (const auto result = detail::prepare_resolve(*resolve_command, p); result != ReplayResult::success) {
+                if (result == ReplayResult::invalid_subresource) CE_BAD_SUBRESOURCE()
                 return result;
+            }
             if (p.resolve_mode != VK_RESOLVE_MODE_NONE) {
                 if (!vk.begin_rendering || !vk.end_rendering || !vk.image_view) return ReplayResult::unsupported;
                 p.view = vk.image_view(p.source, p.source_range);
@@ -3471,16 +3502,16 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!bind(discard->resource)) { static bool told_ = false; if (!told_) { told_ = true; std::fprintf(stderr, "[hack] replay: unresolved resource at vulkan_replay.h:%d (command %zu of %zu)\n", __LINE__, i, commands.size()); } return ReplayResult::unresolved_resource; }
             const std::uint64_t end = std::uint64_t(discard->first_subresource) + discard->count;
             if (!p.binding.image) {
-                if (!discard->whole && end > 1) return ReplayResult::invalid_subresource;
+                if (!discard->whole && end > 1) CE_BAD_SUBRESOURCE()
             } else if (discard->whole) {
                 VkImageSubresourceRange range{};
-                if (!image_range(p.binding, all_subresources, range)) return ReplayResult::invalid_subresource;
+                if (!image_range(p.binding, all_subresources, range)) CE_BAD_SUBRESOURCE()
                 if (!discard->partial) p.discards.push_back(range);
             } else {
                 for (std::uint64_t sub = discard->first_subresource; sub < end; ++sub) {
                     const auto s = static_cast<std::uint32_t>(sub);
                     VkImageSubresourceRange range{};
-                    if (!image_range(p.binding, s, range)) return ReplayResult::invalid_subresource;
+                    if (!image_range(p.binding, s, range)) CE_BAD_SUBRESOURCE()
                     if (!discard->partial) p.discards.push_back(range);
                 }
             }
@@ -3669,6 +3700,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             prepared_draw.reset();
             p.draw = std::uint32_t(out.draw_count++);
             if (const auto r = detail::prepare_draw(*draw, resolve, vk, prepared_draw); r != ReplayResult::success) {
+                if (r == ReplayResult::invalid_subresource && ce_skip::on()) {  // agA13: the draw is left out
+                    prepared_draw.skip = true;
+                    ce_skip::note(i, commands.size(), command.index(), __LINE__);
+                    goto ce_next_command;
+                }
                 rtdiag::count_list(int(r), true);
                 return r;
             }
@@ -3696,6 +3732,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     }
             }
         }
+    ce_next_command:;
     }
     if (ordinary_active || binary_active) return ReplayResult::invalid_query;
     out.statistics_overlaps = statistics_overlaps;
@@ -3980,6 +4017,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             emit_query(prepared, prepared.queries[next_query++], command_buffer, vk, predicate);
             continue;
         }
+        if (p.ce_bad) continue;  // HACK (agA13): LEONIDA_CE_SKIP_BAD
         // Helpers run outside the per-command rendering scopes; both segment endpoints stay outside too.
         const auto end_statistics = [&] {
             detail::end_statistics_segment(prepared, p.statistics_end, command_buffer, vk);

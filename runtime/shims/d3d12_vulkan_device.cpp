@@ -63,6 +63,34 @@
 #include <cwchar>
 #include <vector>
 
+// HACK (agA13): arena-leak census (see CreateCommittedResource and ~Resource).
+#include <intrin.h>
+static std::mutex g_ce_tally_mu;
+static std::map<std::uintptr_t, std::pair<std::uint64_t, std::uint64_t>> g_ce_tally;  // caller RVA -> (count, bytes)
+static std::atomic<std::uint64_t> g_ce_resources_made{0}, g_ce_resources_freed{0}, g_ce_arena_buffers_freed{0};
+static void ce_arena_tally(std::uintptr_t ret, std::uint64_t bytes) {
+    const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    std::lock_guard lock(g_ce_tally_mu);
+    auto& e = g_ce_tally[ret - base];
+    ++e.first;
+    e.second += bytes;
+}
+static void ce_arena_tally_report() {
+    std::vector<std::pair<std::uintptr_t, std::pair<std::uint64_t, std::uint64_t>>> v;
+    {
+        std::lock_guard lock(g_ce_tally_mu);
+        v.assign(g_ce_tally.begin(), g_ce_tally.end());
+    }
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+    std::fprintf(stderr, "[hack] arena census: resources made %llu freed %llu, arena buffers freed %llu; DEFAULT buffers by caller:",
+                 (unsigned long long)g_ce_resources_made.load(), (unsigned long long)g_ce_resources_freed.load(),
+                 (unsigned long long)g_ce_arena_buffers_freed.load());
+    for (std::size_t i = 0; i < v.size() && i < 8; ++i)
+        std::fprintf(stderr, " +0x%llx:%llu/%.1fMiB", (unsigned long long)v[i].first, (unsigned long long)v[i].second.first,
+                     v[i].second.second / 1048576.0);
+    std::fprintf(stderr, "\n");
+}
+
 namespace rt::d3d12 {
 namespace {
 
@@ -838,6 +866,7 @@ struct DeviceState {
             growth_told = arena.allocations;
             VkDeviceSize largest = 0;
             for (const auto& [o, n] : arena.free) largest = (std::max)(largest, n);
+            ce_arena_tally_report();
             std::fprintf(stderr, "[hack] arena: %llu allocations, %llu releases, live %.1f MiB (buffers %.1f), %zu free blocks, largest %.1f MiB\n",
                          (unsigned long long)arena.allocations, (unsigned long long)arena.releases, arena.in_use / 1048576.0,
                          arena.use_in_use[arena_buffer] / 1048576.0, arena.free.size(), largest / 1048576.0);
@@ -1969,7 +1998,7 @@ public:
 
     Resource(DeviceState& device, const D3D12_RESOURCE_DESC& desc, const D3D12_HEAP_PROPERTIES& heap,
              D3D12_HEAP_FLAGS heap_flags)
-        : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags) {}
+        : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags) { ++g_ce_resources_made; }
 
     // A placed resource lives inside a heap's arena range: the heap owns the range, so only the console VA is kept
     // here and nothing goes back to the arena when this object dies.
@@ -1978,6 +2007,8 @@ public:
         : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags), placed_(true), va_(placed_va) {}
 
     ~Resource() override {
+        ++g_ce_resources_freed;
+        if (in_arena_) ++g_ce_arena_buffers_freed;
         if (accel_) {
             device_.context->unregister_acceleration_structure(gpu_va_);
             if (buffer_va_ && buffer_va_ != gpu_va_) device_.context->unregister_acceleration_structure(buffer_va_);
@@ -2094,6 +2125,14 @@ public:
         const bool need_bda = device_.info.buffer_device_address || device_.info.ray_tracing;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = desc_.Width;
+        // HACK (agA13): LEONIDA_CE_BUFFER_PAD=N (bytes) gives a buffer with its own memory (upload, readback, arena
+        // spill) N bytes of slack: translated scalar loads (s_buffer_load) go through the device address without
+        // num_records bounds, so a constant view near the end of such a buffer read the next, unmapped page
+        // (re29-re31 faults at page-aligned addresses in fspx compute). The arena itself is one big buffer.
+        {
+            static const VkDeviceSize pad = [] { const char* v = std::getenv("LEONIDA_CE_BUFFER_PAD"); return VkDeviceSize(v ? std::strtoull(v, nullptr, 0) : 0); }();
+            info.size += pad;
+        }
         info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -6100,6 +6139,12 @@ public:
         arena.address = vk.vkGetBufferDeviceAddress(state_.info.device, &address);
         arena.size = info.size;
         arena.free[kArenaReserved] = arena.size - kArenaReserved;
+        // HACK (agA13): LEONIDA_CE_BUFFER_PAD also keeps that many bytes at the arena top unallocated: small buffers
+        // are packed top-down (agA12), so an unbounded scalar overread of the topmost one left the arena.
+        if (const char* v = std::getenv("LEONIDA_CE_BUFFER_PAD")) {
+            const VkDeviceSize pad = (VkDeviceSize(std::strtoull(v, nullptr, 0)) + 0xFFFF) & ~VkDeviceSize(0xFFFF);
+            if (pad && pad < arena.size / 4) arena.free[kArenaReserved] = arena.size - kArenaReserved - pad;
+        }
         arena.peak_end = kArenaReserved;
         char log[4] = {};
         length = 0;
@@ -7116,6 +7161,25 @@ public:
         if (!desc || !desc->BufferLocation || !desc->SizeInBytes) return;
         leonida::gfx10::Buffer buffer{};
         buffer.address = desc->BufferLocation;
+        // HACK (agA13): LEONIDA_CE_CBV_FIX=1. re30: fspx cs_25d19264 faulted reading 0x1e1f7f013000 through a CBV of
+        // its descriptor table (s_buffer_load from table+0x00/+0x40): a constant-buffer view whose location no
+        // buffer holds (a title CPU pointer the console GPU reads directly) reaches the shader as heap_base + it.
+        // Such a location becomes a snapshot of the title bytes in the upload ring (refreshed on replay with
+        // SNAP_RESYNC), or a null view (zeros) when it cannot be read. Logged (first 24).
+        static const bool cbv_fix = [] { const char* v = std::getenv("LEONIDA_CE_CBV_FIX"); return v && v[0] == '1'; }();
+        if (cbv_fix && state_.context && buffer.address >= state_.arena.size && !state_.context->va_known(buffer.address)) {
+            const std::uint64_t from = buffer.address;
+            const std::uint64_t to = rt::d3d12_xs::upload_snapshot(reinterpret_cast<const void*>(from), desc->SizeInBytes);
+            static std::atomic<int> told{0};
+            if (told++ < 24) {
+                std::fprintf(stderr, "[hack] CBV_FIX: location 0x%llx (+0x%x) is no buffer -> %s 0x%llx\n",
+                             (unsigned long long)from, unsigned(desc->SizeInBytes), to ? "snapshot" : "null view",
+                             (unsigned long long)to);
+                std::fflush(stderr);
+            }
+            if (!to) return;  // the slot stays zero: a null view
+            buffer.address = to;
+        }
         buffer.stride = 0;
         buffer.num_records = desc->SizeInBytes;
         buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
@@ -7577,6 +7641,10 @@ public:
                                                       const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
                                                       const D3D12_CLEAR_VALUE* clear, REFIID riid,
                                                       void** out) override {
+        // HACK (agA13): who makes the DEFAULT-heap buffers that fill the arena (re28-re30: 0 releases)? Tally the
+        // caller (RVA in gta6rt.exe) and the bytes; ce_arena_tally_report prints the top callers with the arena line.
+        if (desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && heap && heap->Type == D3D12_HEAP_TYPE_DEFAULT)
+            ce_arena_tally(reinterpret_cast<std::uintptr_t>(_ReturnAddress()), desc->Width);
         return create_committed_validated("ID3D12Device::CreateCommittedResource", heap, heap_flags, desc, state, clear,
                                           0, nullptr, riid, out);
     }
@@ -10299,6 +10367,17 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                                       v13.compute_full_subgroups, info.subgroup);
     // Translated vertex shaders read BaseVertex / BaseInstance (SPIR-V DrawParameters) to give v0 / v3 the
     // hardware's zero-based vertex and instance ids (docs/design.md, Inputs and outputs).
+    // HACK (agA13): LEONIDA_CE_ROBUST_IMAGE=1 enables 1.3 robustImageAccess: an out-of-range texel, mip or layer
+    // reads zero and stores are dropped, instead of the NVIDIA page fault (re29: cs_bedf0201 image_load_mip with a
+    // level past the view -> READ_INVALID -> RC error / TDR).
+    {
+        char rv[8] = {};
+        std::size_t rl = 0;
+        v13.want_robust_image_access = getenv_s(&rl, rv, "LEONIDA_CE_ROBUST_IMAGE") == 0 && rl > 1 && rv[0] == '1';
+        std::fprintf(stderr, "[hack] robust image access: %s (supported %d)\n",
+                     v13.want_robust_image_access && v13.robust_image_access && v13.core ? "on" : "off",
+                     int(v13.robust_image_access));
+    }
     VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
                                               v13.enable(ext_chain)};
     enable11.shaderDrawParameters = chosen_draw_params ? VK_TRUE : VK_FALSE;

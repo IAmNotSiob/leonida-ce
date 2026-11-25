@@ -1152,3 +1152,75 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   0-decoded, run with LEONIDA_CE_BCPACK=0. A new late "invalid subresource" (line 15279) came just before the loss, and
   "view starts past the texture's mips or layers; first mip 5" was the last line before DEVICE LOST. The faulting read
   0x3f5ff070000 is far outside the 4 GiB arena.
+
+## agA13 (sender gen 13, 2026-11-25)
+- re30 (build 47, SKIP_CS=cs_bedf0201, B): skip worked, but a DIFFERENT fspx compute faulted ~20 s earlier (loss t~233,
+  Confirm t=124.5): checkpoints = cs fspx_game/cs_25d19264fce42489..., fault READ_INVALID 0x1e1f7f013000 (looks like a
+  host pointer). Same RC/TDR -> fences ~0 -> int3 +0x2474606 chain. Arena still 0 releases. 18 "invalid subresource".
+- Disassembly (read only): cs_bedf0201 = mip copy: T# src (table+0x00) image_load_mip at lod cb.w, image_store to T# dst
+  (table+0x20) at cb offset; bounds only vs cb extents -> an out-of-range lod/coord is UB; no robustness feature was ever
+  enabled in the runtime (grep "robust" = nothing). cs_25d19264 = reads two V#s via s_buffer_load (table+0x00, +0x40 =
+  CBVs) and stores a 1D image: its READ fault must be a CBV base that is no buffer (Likely). CreateConstantBufferView
+  wrote desc->BufferLocation verbatim (a title CPU pointer stays a CPU pointer; shader adds heap_base).
+- Arena leak: d3d12_xs_device.cpp xs_record_placed AddRefs every slot-133 / slot-70/71 stand-in forever (agA5,
+  LEONIDA_CE_PLACED_REF), and the slot-70/71 stand-ins also keep their creation ref. Wine sm2: of ~6k records only ~400
+  overlap an older one, and only 2 of the title-held ones were ever released by the title -> eviction alone will not
+  stop the growth; the 57k arena allocations are mostly NOT g_placed records (re29: 6824 slot-133 calls). Build 48
+  prints an "arena census" (DEFAULT buffer creators by caller RVA + resources made/freed) to find them.
+- Build 48 (md5 9764ec10): LEONIDA_CE_ROBUST_IMAGE=1 (1.3 robustImageAccess via Vulkan13Features::want_robust_image_access),
+  LEONIDA_CE_CBV_FIX=1 (unknown CBV location -> rt::d3d12_xs::upload_snapshot, else null view; VulkanContext::va_known),
+  LEONIDA_CE_SKIP_BAD=1 (vulkan_replay.h prepare(): CE_BAD_SUBRESOURCE() -> p.skip/p.ce_bad + goto ce_next_command;
+  emit() skips ce_bad; draws via prepared_draw.skip), LEONIDA_CE_PLACED_EVICT=1|2 (live interval map g_placed_live;
+  overlap eviction releases our refs; =2 also sweeps title-released slot-133 records), arena census (always).
+  Wine sm1-sm3: boots to state 3, robust on (supported 1), no new errors. sm1 died at t~180 in ntdll RtlVirtualUnwind
+  from gta6rt+0x1a3f1 (LEONIDA_CE_STACKS stack walk under Wine; Plausible unrelated).
+- Handed: re31.env (build 48 fixes, no SKIP_CS), re32.env (+ SKIP_CS both shaders) if re31 still faults.
+
+## agA13 (sender gen 13, 2026-11-25)
+- re30 (build 47, SKIP_CS=cs_bedf0201, B): skip worked, but a DIFFERENT fspx compute faulted ~20 s earlier (loss t~233,
+  Confirm t=124.5): checkpoints = cs fspx_game/cs_25d19264fce42489..., fault READ_INVALID 0x1e1f7f013000 (looks like a
+  host pointer). Same RC/TDR -> fences ~0 -> int3 +0x2474606 chain. Arena still 0 releases. 18 "invalid subresource".
+- Disassembly (read only): cs_bedf0201 = mip copy: T# src (table+0x00) image_load_mip at lod cb.w, image_store to T# dst
+  (table+0x20) at cb offset; bounds only vs cb extents -> an out-of-range lod/coord is UB; no robustness feature was ever
+  enabled in the runtime (grep "robust" = nothing). cs_25d19264 = reads two V#s via s_buffer_load (table+0x00, +0x40 =
+  CBVs) and stores a 1D image: its READ fault must be a CBV base that is no buffer (Likely). CreateConstantBufferView
+  wrote desc->BufferLocation verbatim (a title CPU pointer stays a CPU pointer; the shader adds heap_base).
+- Arena leak: d3d12_xs_device.cpp xs_record_placed AddRefs every slot-133 / slot-70/71 stand-in forever (agA5,
+  LEONIDA_CE_PLACED_REF), and the slot-70/71 stand-ins also keep their creation ref. Wine sm2: of ~6k records only ~400
+  overlap an older one, and only 2 title-held ones were ever released by the title -> eviction alone will not stop the
+  growth; the 57k arena allocations are mostly NOT g_placed records (re29: 6824 slot-133 calls). Build 48 prints an
+  "arena census" (DEFAULT buffer creators by caller RVA + resources made/freed) to find them.
+- Build 48 (md5 9764ec10): LEONIDA_CE_ROBUST_IMAGE=1 (1.3 robustImageAccess via Vulkan13Features::want_robust_image_access),
+  LEONIDA_CE_CBV_FIX=1 (unknown CBV location -> rt::d3d12_xs::upload_snapshot, else null view; VulkanContext::va_known),
+  LEONIDA_CE_SKIP_BAD=1 (vulkan_replay.h prepare(): CE_BAD_SUBRESOURCE() -> p.skip/p.ce_bad + goto ce_next_command;
+  emit() skips ce_bad; draws via prepared_draw.skip), LEONIDA_CE_PLACED_EVICT=1|2 (live interval map g_placed_live;
+  overlap eviction releases our refs; =2 also sweeps title-released slot-133 records), arena census (always on).
+  Wine sm1-sm3: boots to state 3, "robust image access: on (supported 1)", no new errors. sm1 died at t~180 in ntdll
+  RtlVirtualUnwind called from gta6rt+0x1a3f1 (LEONIDA_CE_STACKS stack walk under Wine; Plausible unrelated).
+- Handed: re31.env (build 48 fixes, no SKIP_CS), re32.env (+ SKIP_CS of both shaders) if re31 still faults.
+- re31 (build 48, no SKIP_CS, B): robust on; loss EARLIER (t~146, Confirm t=113.4) in a THIRD fspx compute
+  cs_87dac0f88356d831 (T# load + 2 CBVs at +0x40/+0x60 read up to +0x9c0 + 3D image store), READ_INVALID 0x2f514510000.
+  CBV_FIX 0 lines (all CBV locations are known buffers). SKIP_BAD: 10x "vulkan_replay.h:3456 command 0 of 1 (kind 9)"
+  and NO invalid-subresource list failures any more. Arena census: DEFAULT buffers by caller +0x9d042 = proxy_slot<133>
+  3413 / 1032 MiB (flat, title-held) and +0x83b94 = proxy_slot<70> 1972 -> 10153 / 118 MiB (the growth: placed-SRV
+  stand-ins at fresh VAs). resources made 19802 freed 4302, arena buffers freed 255 (first releases ever).
+- Build 49 (md5 75b4c240): CBV_FIX also in the xs proxy: slot-17 CBV / root CBV,SRV,UAV (PC 37-42) at a title pointer
+  past the arena -> covering placed buffer VA; the vulkan-side fix only acts past the arena (low addresses collide with
+  arena VAs; sm4 showed 0xb4ff20-type CBVs that are arena VAs).
+- Build 50 (md5 61fe3807): LEONIDA_CE_PLACED_CAP=N: at most N runtime-owned slot-70/71 stand-ins live (oldest released).
+- Build 51 (md5 5f867552): LEONIDA_CE_BUFFER_PAD=N: own-memory buffers (upload/readback/spill) get N bytes of slack and
+  the arena top keeps N (64K-rounded) unallocated. THEORY (Plausible): all 3 faults are page-aligned READ_INVALIDs by
+  s_buffer_load past the end of a CB in a separately allocated buffer / at the arena top (translated scalar loads have
+  no num_records bound; AMD returns 0). Handed as re34 (re34.env: no SKIP_CS, CAP=4096, PAD=65536).
+- B ran re32 = re31 + SKIP_CS of all three shaders (result below if it came in).
+- re32 (build 48 + SKIP_CS of 3 shaders, B): Confirm t=133.7; a 4th fspx compute faulted at t~270 (~136 s after Confirm):
+  cs_1bc231e4b1579577 (twin of cs_25d19264: CBs at table+0x00/+0x40 read up to +0x60, 1D image store), READ_INVALID
+  0x4b8392935000 (page aligned again). Arena (no CAP): +0x83b94 proxy_slot<70> 51096 buffers / 694 MiB and growing; 9009
+  arena releases (PLACED_EVICT works but does not keep up). Screens: navy+footer, #111111, then flat navy #20202C to the end.
+- re34 (build 51, PAD=65536, CAP=4096, NO SKIP_CS, B): Confirm t=140.2. None of the 4 page-fault shaders faulted, and there is NO
+  READ_INVALID any more (Likely: PAD fixed the s_buffer_load overreads). Loss at t~206 in a 5th fspx compute,
+  cs_f33ac9e947af1490, with 22 fault addresses, all type 4 (IP unknown) = a HANG/TDR, not a page fault. That shader loops on
+  buffer_load glc dlc (a spin-wait on another workgroup / a garbage loop bound). CAP works: placed live ~10k, arena
+  65536 allocs / 55966 releases, live 1231 MiB (the leak is stopped). ECL failures 0, SKIP_BAD 24.
+- NEXT: re35.env = re34 + SKIP_CS=cs_f33ac9e947af1490 (rtdump55); then the cs_f33ac9e9 spin (inter-workgroup sync
+  on NVIDIA without forward progress, or zeroed inputs). Recommended env: re34.env (+ the re35 skip) with build 51.
