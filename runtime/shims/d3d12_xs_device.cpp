@@ -1025,6 +1025,22 @@ std::uint64_t xs_cbv_shadow(ID3D12Device* dev, std::uint64_t title, std::uint32_
     return e->va;
 }
 
+// agA23 LEONIDA_CE_CBV_SHADOW_ROOT=<bytes> (needs CBV_SHADOW >= 1 and a pool made by a slot-17 CBV first): a root CBV
+// (pc 37/38) at a title address the arena does not know was passed raw (the GPU read whatever sits at that VA). Shadow
+// <bytes> of it (halved down to 256 while not readable; a root CBV has no size). Root SRV/UAV stay raw (UAV writes
+// would not reach the title).
+std::uint64_t xs_cbv_shadow_root(std::uint64_t title) {
+    static const std::uint32_t want = [] {
+        const char* v = std::getenv("LEONIDA_CE_CBV_SHADOW_ROOT");
+        return v ? static_cast<std::uint32_t>(std::strtoul(v, nullptr, 0)) : 0u;
+    }();
+    if (!want || xs_cbv_shadow_mode() <= 0) return 0;
+    std::uint32_t n = want;
+    while (n >= 256 && !xs_readable(reinterpret_cast<const void*>(title), n)) n >>= 1;
+    if (n < 256) return 0;
+    return xs_cbv_shadow(nullptr, title, n);
+}
+
 // Before every ExecuteCommandLists: bring each shadow up to date with the title bytes (only changed ones written).
 void xs_cbv_shadow_refresh() {
     if (xs_cbv_shadow_mode() <= 0) return;
@@ -3280,6 +3296,9 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                     if (const std::uint64_t to = xs_placed_buffer_va(raw, 0)) {
                         a2 = to;
                         xs_cbv_fix_note("root view in a placed buffer", raw, to);
+                    } else if (const std::uint64_t sh = (pc == 37 || pc == 38) ? xs_cbv_shadow_root(raw) : 0) {
+                        a2 = sh;  // agA23 LEONIDA_CE_CBV_SHADOW_ROOT: a refreshed arena shadow of the title constants
+                        xs_cbv_fix_note("root CBV at a title address -> CBV shadow", raw, sh);
                     } else {
                         xs_cbv_fix_note("root view at an unknown title address (left)", raw, raw);
                     }
