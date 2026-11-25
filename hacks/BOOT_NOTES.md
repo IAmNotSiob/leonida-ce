@@ -1456,3 +1456,100 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   (3) Check whether draw ring sync can write into the mirror range (log sync_title_range hits in [mirror, mirror+38 MiB)).
   (4) Present surface mismatch: 100000000 vs the drawn 100053700.
 - Recommended env now: build 61 + re58.env.
+
+## agA20 (sender gen 20, 2026-11-25)
+- Tree: /root/leonida-ce branch "experimental" (was first-light a28601df9). Commits allowed there (author IAmNotSiob, Co-Authored-By
+  trailer), never push / never touch main or first-light. agA20 commits: 6a526986e, 0a62e036a (+ later ones below).
+- Build 62 (md5 dbc13842) = a28601df9 as is (build 61 + agA19 INDIRECT_DRAW + MIRROR_GUARD + main CI merge). Sender 19's own
+  pre-merge build 62 was never run: renamed /root/handoff/gta6rt-62-a19-unsent.exe.
+- ri58 / ri59 (build 61): lost ~110/136 s after Confirm at the first indirect draw (marker 0xCE01 kind 0), presented all zero.
+- rk62 (B; build 62 + re62 = re58): Confirm 123.9 s, LOST ~124 s after Confirm, but now NOT at an indirect draw: the indexed
+  indirect draws (kind 1, stride 20, args res +0x5bef628..) were recorded but never replayed (no replay log, last present frame
+  2340 before them). Checkpoints: direct queue cs_f39d1d8b (top) / cs_4ae22e7a, compute queues cs_c5b1005e. FaultInfo works for
+  the first time: 334 records, ALL type INSTRUCTION_POINTER_UNKNOWN in one 16 KiB code range, no memory fault => a runaway shader,
+  not a bad pointer (Likely). The only indirect op replayed before it: the kind-2 indirect DISPATCH (stand-in args at 0xfee6d200).
+  cs_f39d1d8b is straight-line (no loops, 1-D, 32 threads) - a huge group count from garbage args fits (Plausible).
+  MIRROR_GUARD: 0 hits => the title-VA ring sync never writes into the mirror: mirror-overwrite theory KILLED (Very likely, rk62).
+  The new render phase is always the same: first calls of list slots 26, 148, 43, 37, 45, 80 + first ROOT_SPILL dispatches.
+- Presented surface zero with HEAP_MIRROR: ri45/48/49/50 (no mirror) presented navy from frame ~870 in state 3; ri53..rk62
+  (mirror) zero from frame 0, identical otherwise. Wine never gets there (presented zero in every Wine run, mirror or not).
+  Mechanism (Likely, static): replay hacks read the descriptor TABLE from TITLE memory at the table VA (RECTLIST vertices at
+  table+0x20 = the composite blits, CB fix (also WRITES there), SF_STRIDE, VSHARP). Without the mirror the table VA is the title
+  heap address (0x10000+x) so title memory there is right; with the mirror it is the mirror's arena VA (0xee10000+x) and title
+  memory there is unrelated (and the CB fix wrote into it).
+- Build 63 (md5 e767d096): LEONIDA_CE_MIRROR_REMAP (default on with HEAP_MIRROR): copy_title_bytes/title_readable and the
+  CB-fix/SF_STRIDE writes map a mirror VA back to the title heap. LEONIDA_CE_INDIRECT_SRC=0..4 (draws + dispatches with a
+  placed-resource stand-in arg buffer): logs stand-in / title CPU / arena[title VA] arg bytes; 4 = pick a valid source, else
+  drop the draw / zero the dispatch. Crash dialogs: SetErrorMode at startup + title SetUnhandledExceptionFilter ignored
+  (LEONIDA_CE_KEEP_UEF=0 restores) - the title installs 3 filters at boot, which is why "I have fallen" never printed on Windows;
+  the VM "Application Error game+0x43a6b7a" box was ri57's crash (t=206), not rk62.
+- Wine: st1/st2/st3 (builds 62/63) boot to state 1 and stall at frame ~610-640 with a hang dump, then crash at a Wine-module
+  address 0x6fffffca63ac reading 0x202; sr5 (build 60) did the same => pre-existing, not a regression (Likely).
+- rk64 (B; build 63 + re64 = re62 + INDIRECT_SRC=4): Confirm 129.5 s, LOST ~142 s after Confirm; checkpoints direct cs_956fdcc6,
+  compute cs_c5b1005e (as rk62/ri54). "[error] I have fallen ... game+0x55aa29b read 0x99d53e910" now printed (filter shim works,
+  no dialog). MIRROR_REMAP active (title heap at 0x7480000 this run). Presented STILL all zero (remap alone does not fix it).
+  MIRROR_GUARD: 16384+ hits (ring-sync windows 0xf9ae000.. inside the mirror) => the mirror-overwrite was REAL in this layout
+  (rk62's 0 hits depended on that run's heap/placed addresses); ri59's float-filled cs_c5b1005e table (VA 0xfe2f640) lies in the
+  mirror next to those hits => ri57/ri59's garbage tables were that clobber (Likely). Fixed by the guard (build 62+).
+  INDIRECT_SRC: ALL indirect args (49 dispatches: cs_152795e7, cs_6be10ff0 x17, cs_5c890e88, cs_e659191f, ...; 1 draw) are ZERO at
+  submit in the stand-in, title memory and arena[title VA] => GPU-generated later (or never). The title placed buffer at title VA
+  0x7980000 (0xae00000 bytes) has its stand-in at arena 0x4010000: D3D-level users (ExecuteIndirect, CBV_FIX root views) use the
+  stand-in offset, shaders with title-VA V#s use arena[title VA] => GPU-written args never meet their reader. This is the
+  "single address space" problem (docs/d3d12_vulkan.md 3.3), not fixable by a hack in one pass. Mode 4 (CPU pick) is meaningless
+  for GPU-written args. Indirect ops do not cause the loss (dispatches were zero-group) (Likely).
+- Build 64 (md5 de4eaa8b): LEONIDA_CE_MIRROR_GFX=0 = graphics tables keep the raw title-heap handle (pre-mirror behaviour), compute
+  tables use the mirror; LEONIDA_CE_INDIRECT_SRC=1 = args from arena[title VA]. Wine st4: boots, "MIRROR_GFX=0 ... kept raw".
+- rk66 (B; build 64 + re66 = re62 + MIRROR_GFX=0 + INDIRECT_SRC=1): PRESENTED SURFACE BACK. First non-zero presented frame 780
+  (state 3): navy ff2c2020 with the title's "ACCOUNT PICKER (Y)  PLAYER (A)" prompts (/root/rb/rk66_frames/p000780.png); frame 990
+  gray 17 (transition); after Confirm (123.9 s) navy loading screen through frame 2220. => job 4 fixed by MIRROR_GFX=0 (Definite
+  for the probe/pulled frames; the mirror broke graphics only). Why graphics break with the mirror is still open: the graphics
+  "tables" are the title's per-draw root blocks (V# + inline vertices, e.g. table 0xfbae200 = [V# 0x95a400/0x60 bytes][3 verts]..)
+  written into the heap memory; MIRROR_REMAP fixed the CPU-side reads but not the GPU result (rk64), so something on the GPU side
+  (V#s naming title VAs next to the table, or a sync window the raw path gets) differs.
+  Device STILL lost after the new phase: checkpoints cs_956fdcc6 (direct) + cs_c5b1005e (compute), as rk64. INDIRECT_SRC=1 used
+  arena[title VA] for 16 cs_6be10ff0 dispatches (all args 0 at submit): no effect on the loss.
+  cs_c5b1005e / cs_956fdcc6 / cs_f39d1d8b have no backward branches (no loops) => not runaway shaders; the IP-only FaultInfo
+  records are where waves sat at the loss. cs_c5b1005e (43 lines) loads 3 V#s from its heap table and STORES through two of them
+  (title-VA bases -> arena[title VA], which for the big placed buffer is inside another stand-in) - a plausible corrupter.
+- Handed rk68 = re66 + LEONIDA_CE_SKIP_CS=cs_c5b1005e,cs_956fdcc6 (env-only bisect of the loss).
+- rk66 final: lost ~150 s after Confirm (checkpoints direct cs_956fdcc6, compute cs_c5b1005e x2, cs_cee65a2d, cs_344692c2; FaultInfo
+  3 IP-only records). VM vshots /root/rb/rk66v v005-v013: the game WINDOW is gray 17 then navy - first visible screen this session.
+- rk68 (re66 + SKIP_CS=cs_c5b1005e,cs_956fdcc6): both skipped; LOST EARLIER (~frame 1680, shortly after Confirm), checkpoint a
+  graphics UI PSO (VVertexCxformEAlpha). => those two are not the sole cause; skipping them just breaks something sooner
+  (victims, Plausible). The loss is a post-Confirm memory-consistency problem, most likely the two-address-scheme arena
+  overlap (title-VA writes/ring-sync windows landing in other stand-ins).
+- Build 65 (md5 3877fd30, respun once - the first 384fe704 had arena_host published only with the ring sync on):
+  LEONIDA_CE_MIRROR_POKE (default on): CB-fix / SF_STRIDE patches of the per-draw root block also write the arena mirror. Theory
+  (Plausible) for "graphics through the mirror = zero composite": the mirror was synced at ExecuteCommandLists BEFORE the replay
+  patched the title heap, so the GPU used the unpatched CB V# (title base 0x40ade20 -> zeros) and the Cxform composite multiplied
+  everything to transparent black. Also arena_host/arena_bytes now published even with LEONIDA_CE_NO_RING_SYNC.
+  Handed rk69 (re69 = re62: graphics through the mirror) and rk70 (re69 + NO_RING_SYNC=1).
+- rk69 (build 65 + re69 = re62, graphics THROUGH the mirror + MIRROR_POKE): presented non-zero from frame 810 (navy), vshots
+  gray 17 then navy => MIRROR_POKE fixes the mirror composite (Very likely: build 63/rk64 without the poke = zero, same env).
+  So the zero composite was the CB-fix patch reaching the mirror one submit late. Loss ~124 s after Confirm (cs_f39d1d8b /
+  cs_4ae22e7a direct, cs_c5b1005e x2, cs_344692c2, cs_cee65a2d compute; FaultInfo -13).
+- rk70 (re69 + NO_RING_SYNC=1): presented ALL ZERO again (the composite still needs the title-VA ring sync for its non-table
+  data, e.g. the CB at root-0x80 / vertex V#s), loss ~144 s after Confirm (new checkpoints cs_7acaea81 direct, cs_752cc8dc +
+  cs_c5b1005e compute). => the ring-sync overwrites are NOT the loss cause (Likely).
+- Build 66 (md5 3733bb8c): LEONIDA_CE_PLACED_IDENTITY=1 (default off): slot-133 BUFFER stand-ins at arena VA == title VA when
+  that range is free (hint via rt::d3d12_xs::set_arena_want_hook -> arena_allocate exact placement); heap mirror from the arena
+  top. Wine st8: the 174 MiB buffer (title 0xb10000 under Wine) overlaps the upload ring -> not placed; all other placed buffers
+  are above 4 GiB (0xd..-0xe.. title VAs) and can never be identity-placed. Handed rk71 = re69 + PLACED_IDENTITY=1.
+- rk71 (build 66 + re71 = re69 + PLACED_IDENTITY=1): the 174 MiB buffer WAS placed at identity (title VA 0x27f80000 this run);
+  all other slot-133 buffers sit above 4 GiB (0xd99..-0xe39..) and cannot be. Presented navy from frame 750. Confirm 143.0 s,
+  STILL LOST at ~frame 2400 (checkpoints cs_edc5d4c7 / cs_a039b209 / cs_c5b1005e x3, FaultInfo -13, then an execute AV at
+  0x1402bc345b8). => unifying the one low placed buffer does not fix the loss (Likely, 1 run).
+- SUMMARY agA20: presented surface FIXED (HEAP_MIRROR + MIRROR_POKE, or MIRROR_GFX=0): title screen with UI and the
+  post-Confirm navy loading screen are presented and visible in the VM window. Indirect draw FE fault gone since build 62 (the
+  old path emitted the draw outside any render pass; no FE exception since). Mirror-overwrite theory CONFIRMED and guarded
+  (MIRROR_GUARD hits 16k in rk64). The post-Confirm loss (~120-150 s after Confirm, new render phase: first list slots 26/148/
+  43/37/45/80 + ROOT_SPILL dispatches) remains; it is not: indirect args (zero-group dispatches), ring-sync overwrites (rk70),
+  cs_c5b1005e/cs_956fdcc6 alone (rk68), runaway loops (no backward branches), the big placed buffer address split (rk71).
+- NEXT: (1) the high title VAs (0xd9..-0xe3.., all placed buffers except the big one) are outside the arena: any title V# naming
+  them is translated how? (heap_base + VA overflows the arena => robust drop or MMU fault) - log the V# bases the fspx compute
+  shaders of the new phase use (PTR_CHECK_ONLY=cs_c5b1005e,cs_edc5d4c7,cs_a039b209,cs_f39d1d8b on build 66) and check whether
+  they name those high VAs. (2) "list slot 80 (not forwarded) args 1,1,1,0xe00008020" is the last new console call before every
+  loss - find what it is (a console-only GPU op skipped = missing work/sync). (3) Event 153 with FaultInfo -13 or IP-only
+  records = TDR-style hang: try VK timeouts per queue / one submit per list to localize.
+- Recommended env: build 66 (gta6rt-66.exe) + /root/handoff/re69.env (HEAP_MIRROR=3, ROLL=32, graphics through the mirror with
+  MIRROR_POKE/REMAP/GUARD default on). Alternative: re66 (MIRROR_GFX=0). Never DISPATCH_SYNC; NO_RING_SYNC breaks the composite.
