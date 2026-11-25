@@ -1149,6 +1149,8 @@ struct PreparedDraw {
     // Title-memory vertex bytes to write into vertex_buffers[slot] before the draw (Leonida CE, see prepare).
     std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>> vertex_uploads;
     std::uint32_t rect_count = 0;  // HACK (agG, RECTLIST): non-zero = draw this many vertices as a triangle list
+    VkBuffer ind_buffer = VK_NULL_HANDLE, cnt_buffer = VK_NULL_HANDLE;  // agA19 LEONIDA_CE_INDIRECT_DRAW
+    VkDeviceSize ind_offset = 0, cnt_offset = 0;
     VkBuffer index_buffer = VK_NULL_HANDLE;
     VkDeviceSize index_offset = 0;
     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
@@ -1168,6 +1170,8 @@ struct PreparedDraw {
         vertex_strides.clear();
         vertex_uploads.clear();
         rect_count = 0;
+        ind_buffer = cnt_buffer = VK_NULL_HANDLE;
+        ind_offset = cnt_offset = 0;
         index_buffer = VK_NULL_HANDLE;
         index_offset = 0;
         index_type = VK_INDEX_TYPE_UINT16;
@@ -3826,6 +3830,42 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                         if (told_skip++ < 4) std::fprintf(stderr, "[hack] SKIP_DRAWS: dropped draw count %u first %u\n", draw->count, draw->first);
                     }
             }
+            if (draw->ind_buffer && !prepared_draw.skip) {  // agA19 LEONIDA_CE_INDIRECT_DRAW
+                const ResourceBinding* ab = resolve(draw->ind_buffer);
+                const VkDeviceSize rec = draw->indexed ? 20 : 16;
+                const VkDeviceSize bytes = VkDeviceSize(draw->ind_max - 1) * draw->ind_stride + rec;
+                const ResourceBinding* cb = draw->ind_count_buffer ? resolve(draw->ind_count_buffer) : nullptr;
+                static std::atomic<int> told_ind{0};
+                if (!ab || !ab->buffer || !detail::indirect_range(*ab, draw->ind_offset, bytes) ||
+                    (draw->ind_count_buffer && (!cb || !cb->buffer || !vk.draw_indirect_count || !vk.draw_indexed_indirect_count ||
+                                                !detail::indirect_range(*cb, draw->ind_count_offset, 4))) ||
+                    !vk.draw_indirect || !vk.draw_indexed_indirect) {
+                    prepared_draw.skip = true;
+                    if (told_ind++ < 8) std::fprintf(stderr, "[hack] INDIRECT_DRAW: unresolved/out of range (args res %p) -> skipped\n", (void*)draw->ind_buffer);
+                } else {
+                    prepared_draw.ind_buffer = ab->buffer;
+                    prepared_draw.ind_offset = ab->buffer_offset + draw->ind_offset;
+                    prepared_draw.cnt_buffer = cb ? cb->buffer : VK_NULL_HANDLE;
+                    prepared_draw.cnt_offset = cb ? cb->buffer_offset + draw->ind_count_offset : 0;
+                    // Dump the argument bytes the CPU sees in the arena now (GPU-written args may differ at execution).
+                    // LEONIDA_CE_INDIRECT_CLAMP=1: skip the draw when those bytes look like garbage (count or
+                    // instances > 2^24) - only meaningful for CPU-written args.
+                    static const bool clamp = [] { const char* e = std::getenv("LEONIDA_CE_INDIRECT_CLAMP"); return e && e[0] == '1'; }();
+                    std::uint32_t a[5] = {};
+                    const std::uint8_t* h = nullptr;
+                    const int hs = vk.host_at ? int(vk.host_at(ab->va + draw->ind_offset, rec, h)) : -1;
+                    const bool have = hs == 0 && h;
+                    if (have) std::memcpy(a, h, rec);
+                    if (told_ind++ < 24)
+                        std::fprintf(stderr, "[hack] INDIRECT_DRAW: %s max %u stride %u args arena 0x%llx (binding off 0x%llx size 0x%llx) "
+                                     "va 0x%llx count %s 0x%llx; cpu args (host_at %d) [%u %u %u %d %u]\n", draw->indexed ? "indexed" : "draw",
+                                     draw->ind_max, draw->ind_stride, (unsigned long long)prepared_draw.ind_offset,
+                                     (unsigned long long)ab->buffer_offset, (unsigned long long)ab->size, (unsigned long long)ab->va,
+                                     cb ? "yes" : "no", (unsigned long long)prepared_draw.cnt_offset, hs,
+                                     a[0], a[1], a[2], int(a[3]), a[4]);
+                    if (clamp && have && (a[0] > (1u << 24) || a[1] > (1u << 24))) prepared_draw.skip = true;
+                }
+            }
         }
     ce_next_command:;
     }
@@ -4899,7 +4939,16 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                         &d.vertex_sizes[slot], &d.vertex_strides[slot]);
             }
             ::leonida::ce::checkpoint(command_buffer, reinterpret_cast<std::uint64_t>(d.pipeline));
-            if (draw->mesh) {
+            if (d.ind_buffer) {  // agA19 LEONIDA_CE_INDIRECT_DRAW
+                if (draw->indexed) vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
+                if (d.cnt_buffer) {
+                    if (draw->indexed) vk.draw_indexed_indirect_count(command_buffer, d.ind_buffer, d.ind_offset, d.cnt_buffer, d.cnt_offset, draw->ind_max, draw->ind_stride);
+                    else vk.draw_indirect_count(command_buffer, d.ind_buffer, d.ind_offset, d.cnt_buffer, d.cnt_offset, draw->ind_max, draw->ind_stride);
+                } else {
+                    if (draw->indexed) vk.draw_indexed_indirect(command_buffer, d.ind_buffer, d.ind_offset, draw->ind_max, draw->ind_stride);
+                    else vk.draw_indirect(command_buffer, d.ind_buffer, d.ind_offset, draw->ind_max, draw->ind_stride);
+                }
+            } else if (draw->mesh) {
                 vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
             } else if (draw->indexed) {
                 vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
