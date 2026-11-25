@@ -315,7 +315,8 @@ class Emitter:
         elif kind == "sif":
             _, (cc, sr, k), on_one, then, other = n
             els, end = self.label(), self.label()
-            self.ins(f"s_cmp_{cc}_u32 s{sr}, {k}")
+            # SOPC spells "not equal" as lg (s_cmp_lg_u32); there is no s_cmp_ne_u32. CCS is shared with v_cmp_*.
+            self.ins(f"s_cmp_{'lg' if cc == 'ne' else cc}_u32 s{sr}, {k}")
             self.br("s_cbranch_scc0" if on_one else "s_cbranch_scc1", els if other else end)
             self.nodes(then)
             if other:
