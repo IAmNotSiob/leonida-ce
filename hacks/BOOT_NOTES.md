@@ -1766,3 +1766,28 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
 - Recommended env (agA22): build 77 + /root/handoff/rn10.env (tv6 + CP_FINE + LOOP_CAP on the 294 loopy/old modules, INNER 16384),
   UNTESTED. Proven-safe fallback: build 77 + tv6.env (behaves like build 74; the multi-function cap only acts where LOOP_CAP names it).
   Every run's files: /root/rb/rnN.err.log, rnN.syncN.txt, rnN_frames/.
+
+## agA23 (sender gen 23, 2026-11-25)
+- Receiver ada4c52511e1337a1 (B16). Builds 78+.
+- rn9 host crash (t=377.8, AV in ntdll reading 0xd84cbff818): gta6rt+0xf1dce = xs_dump_thread_stacks (d3d12_xs_device.cpp,
+  the LEONIDA_CE_STACKS frame-4000 dumper thread; +0xf3cb9 = its CreateThread lambda). NOT a game/runtime-path bug: the dumper
+  resumes each thread (agA3 deadlock fix) and then RtlVirtualUnwind walks the LIVE stack; rn9 printed every [stacks] line twice
+  (two dumpers walking each other) while background compiles finished (threads exiting, stacks freed) => fault (Likely).
+  Fix (commit 7b93ae6e4): unwind in a __try helper (" <fault>" appended), one dump at a time, TEB read in
+  xs_game_thread_index guarded. Advice: leave LEONIDA_CE_STACKS unset in normal runs (1500+ threads on a cold boot).
+- ro1 (build 77 + rn10 = 294 loop-capped modules, INNER 16384): STILL hangs (Confirm t=130.7, last frame 2352, Event 153 at
+  Confirm+146 s; host then crashed executing 0x0 after device loss). Checkpoints: direct + compute queues 2/3/4 ALL report
+  BOTTOM = pipeline marker cs_956fdcc6, TOP = CP_FINE before command #64 (variant 4); SYNC_DUMP: direct ticket 26503 and
+  compute tickets 4 (submitted within 50 ms of each other) stalled inside their cmdbufs, 0 waits, no deadlock.
+  cs_956fdcc6 has NO GCN backward branch; its SPIR-V has 4 OpLoopMerge, but they are the recompiler's structurizer state
+  loops (a pc variable stored before each), not data-dependent loops. So "every hang is an uncapped loopy blur" does not
+  hold for ro1 (Plausible). Candidates: a huge dispatch (DISPATCH_LOG will say), garbage data hurting a loop-free shader, or
+  the stall belongs to other work in flight at that moment (every hang is ~130-150 s after Confirm, right after the first
+  BVH build calls, slots 26/148/43/37/45).
+- Build 78 (gta6rt-78.exe md5 f617231e, commit 839ad5a1a): stack-dumper fix + analyst patch LEONIDA_CE_CBV_SHADOW (see
+  /root/handoff/analysis-fspx-cb.md): title-memory CBVs (slot 17) get a stable arena shadow refreshed before every
+  ExecuteCommandLists instead of a one-time copy in the wrapping 64 MiB upload ring. Default OFF here (the patch had it on);
+  =2 logs "changed after its view was made". Compiled clean.
+- Commit fc41fc1c1 (build 79+): LEONIDA_CE_CBV_SHADOW_ROOT=<bytes>: root CBVs (pc 37/38) at unknown title addresses
+  (passed raw before; CBV_FIX logged 0xba04e0000) get a shadow too. Off by default.
+- rp1 = build 78 + rp1.env (ro1 without any LOOP_CAP + CBV_SHADOW=2 + DISPATCH_LOG=1); rp2 = the same with the ro1 caps.
