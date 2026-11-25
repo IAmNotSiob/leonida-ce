@@ -2383,6 +2383,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
                 bool ok = true;
                 __try {
                     *reinterpret_cast<volatile std::uint32_t*>(::leonida::ce::mirror_to_title(std::uint64_t(root)) + 4) = w[1] | (16u << 16);
+                    ::leonida::ce::mirror_poke32(std::uint64_t(root) + 4, w[1] | (16u << 16));  // agA20
                 } __except (1) { ok = false; }
                 static std::atomic<int> told{0};
                 if (told++ < 4 || (slot && told < 40)) std::fprintf(stderr, "[hack] SF_STRIDE: root %x slot %u V# %08x %08x %08x %08x -> stride 16 (%d)\n", root0, slot, w[0], w[1], w[2], w[3], int(ok));
@@ -2397,6 +2398,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
                 w[0] != root - 0x80 && (w[1] & 0xFFFF) == 0) {
                 __try {
                     *reinterpret_cast<volatile std::uint32_t*>(::leonida::ce::mirror_to_title(std::uint64_t(root))) = root - 0x80;
+                    ::leonida::ce::mirror_poke32(std::uint64_t(root), root - 0x80);  // agA20
                 } __except (1) {}
                 static std::atomic<int> told{0};
                 if (told++ < 4) std::fprintf(stderr, "[hack] CB fix: root %x V# base %x -> %x\n", root, w[0], root - 0x80);

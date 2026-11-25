@@ -4,6 +4,7 @@
 #pragma once
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <mutex>
 #include <string>
@@ -64,6 +65,15 @@ inline std::uint64_t mirror_to_title(std::uint64_t va) {
     const std::uint64_t lo = mirror_lo().load(std::memory_order_relaxed);
     if (!lo || va < lo || va >= mirror_hi().load(std::memory_order_relaxed)) return va;
     return mirror_title().load(std::memory_order_relaxed) + (va - lo);
+}
+// agA20 (LEONIDA_CE_MIRROR_POKE, default on): a replay hack that patches a table in the title heap also patches the
+// arena mirror, which was synced at ExecuteCommandLists BEFORE the replay ran (else the GPU sees the patch one submit late).
+inline void mirror_poke32(std::uint64_t va, std::uint32_t v) {
+    static const bool on = [] { const char* e = std::getenv("LEONIDA_CE_MIRROR_POKE"); return !e || e[0] != '0'; }();
+    const std::uint64_t lo = mirror_lo().load(std::memory_order_relaxed);
+    std::uint8_t* const a = arena_host().load(std::memory_order_relaxed);
+    if (!on || !lo || !a || va < lo || va + 4 > mirror_hi().load(std::memory_order_relaxed)) return;
+    *reinterpret_cast<volatile std::uint32_t*>(a + va) = v;
 }
 inline void checkpoint(VkCommandBuffer cb, std::uint64_t marker) {
     if (auto f = set_checkpoint_fn().load(std::memory_order_relaxed)) f(cb, reinterpret_cast<const void*>(marker));
