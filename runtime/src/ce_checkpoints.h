@@ -38,6 +38,12 @@ inline std::atomic<PtrCheckFn>& ptr_check_fn() {
     static std::atomic<PtrCheckFn> f{nullptr};
     return f;
 }
+// HACK (agA17, LEONIDA_CE_HEAP_MIRROR): copies mirrored console descriptor heaps into the arena (ExecuteCommandLists).
+using HeapSyncFn = void (*)();
+inline std::atomic<HeapSyncFn>& heap_sync_fn() {
+    static std::atomic<HeapSyncFn> f{nullptr};
+    return f;
+}
 inline void checkpoint(VkCommandBuffer cb, std::uint64_t marker) {
     if (auto f = set_checkpoint_fn().load(std::memory_order_relaxed)) f(cb, reinterpret_cast<const void*>(marker));
 }

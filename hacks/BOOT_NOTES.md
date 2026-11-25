@@ -1359,3 +1359,51 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   If not: find who writes the ring at 0x30xxxxxx-0x31xxxxxx (log the slot-14/CopyDescriptors destinations around those VAs and the
   title SetComputeRootDescriptorTable handles for cs_87dac0f8); compare to the title handle before translation.
 - Recommended env: build 54/56 + re43.env (no PTR_CHECK; it slows boot). Press theory (b) dropped.
+
+## agA17 (sender gen 17, 2026-11-25)
+- ri48 (B; build 56, re48 = PTR_CHECK=2, EVICT/CAP OFF): device still lost, later: ~98 s after Confirm (t~222; Confirm t=123.7), checkpoint
+  cs_25d19264 (direct), READ_INVALID 0x60033eaba000. PTR_CHECK: only cs_87dac0f8/cs_25d19264/cs_1bc231e4 again, 13647 bad / 2048 dispatches;
+  0x50700010014 garbage V# again (same [00000014 07060504 00000003 ...] slot). Frames: post-Confirm flat navy (32,32,44).
+- ROOT CAUSE of the bad s5 tables (Very likely): NOT truncation. The table VAs 0x2da8f..-0x31acd.. lie inside the title placed buffer
+  CreatePlacedResourceX(va=2d5b0000, width=182452224 = 174 MiB) - title memory whose arena stand-in has the SAME VA (arena VA == title VA
+  for low title memory). Draws copy an 8 KiB window of title memory around each root word into the arena (ring sync, sync_title_range,
+  vulkan_replay.h prepare_draw); DISPATCHES never did. Compute tables therefore read what an earlier draw sync left there (floats, CBs,
+  stack copies) -> garbage V#s -> faults in whichever fspx shader hits a bad one first (different shader/address each run).
+- Console descriptor heap (now logged): type 0 (CBV_SRV_UAV), 1245184 descriptors, address 0x10000, size 0x2600000 (38 MiB). Its
+  GPU handle is the console address 0x10000, which as an arena VA is the console upload ring (RING_IN_ARENA ring at VA 0x10000, 64 MiB):
+  tables into this heap would read the ring, not the title heap (Plausible issue, unverified whether the title binds tables there).
+- Build 58 (md5 210eb601): LEONIDA_CE_DISPATCH_SYNC=1 (vulkan_replay.h, Dispatch prepare): sync each compute table (1 KiB exact +
+  8 KiB window) and 1-dword root view, then each buffer V# of the first 32 slots (<= 64 KiB) from title memory into the arena.
+  LEONIDA_CE_HEAP_MIRROR=1 (experimental, off): the console heap gets an arena mirror (GPU handle = mirror offset, registered for the
+  unified-handle translation) and ExecuteCommandLists memcpys the whole 38 MiB heap into it (d3d12_com.cpp -> ce heap_sync_fn). Wine sq1
+  ran with it to state 3 (2048 syncs / 150 s), no crash. Always-on logs: console heap creation; "table handle ... above 4 GiB" in the xs
+  list proxy (pc 31/32), none under Wine. Wine sq2 (DISPATCH_SYNC=1): boots to state 3, "64 dispatches, 128 tables, 132 V# buffers".
+- Handed ri51 (re51 = re48 + DISPATCH_SYNC, PTR_CHECK=2, 420 s) and ri52 (re52 = re48 - PTR_CHECK + DISPATCH_SYNC, 480 s).
+- CORRECTION (agA17, later): ri50 had 0 "does not fit 32 bits" lines, so truncation is ruled out (Definite for ri50). ri51 (build 58,
+  DISPATCH_SYNC=1 incl. V# buffers) was WORSE: lost at t~70 in state 3 (cs_87dac0f8, READ_INVALID 0x191c7b930000). Reason: placed-buffer
+  stand-ins are committed resources at their OWN arena VA (slot 133 "not tied to va"), so copying title memory to arena[title VA]
+  overwrites whatever arena allocation lives there. (The draw "ring sync" does the same, only in small windows.) DISPATCH_SYNC is now
+  =1 tables only / =2 +V#s; do not use either.
+- REAL ROOT CAUSE (Very likely; Wine sq4 with LEONIDA_CE_TABLE_LOG / TABLE_DIAG): the fspx compute tables are raw handles INTO THE CONSOLE
+  DESCRIPTOR HEAP (e.g. s5 0x1aaf340, 0x1acf340, ... stepping 0x20000, inside heap 0x10000 + 38 MiB; s4 0xa2e180). Title memory there
+  holds real descriptors (s5 slot 0 T# 01000003 03800000 00000000 90000fac); the arena at that VA, which the shader reads, holds zeros
+  (Wine: upload ring) or other buffers' bytes (Windows: floats, host pointers -> the device loss). The heap GPU handle == title
+  address, and arena VA X is not title memory X. Unregistered (cpu == gpu), so the unified-handle translation never touched it.
+- FIX: LEONIDA_CE_HEAP_MIRROR=1 (build 59, md5 a40ba493): arena mirror of the console heap, GPU handle = mirror offset (registered,
+  so table handles translate into it), whole-heap memcpy title -> mirror on every ExecuteCommandLists. Wine sq3/sq4: same boot timing
+  with and without it. Handed ri53 (re53 = re48 + HEAP_MIRROR + TABLE_DIAG=12, PTR_CHECK=2) and ri54 (re54 = re48 - PTR_CHECK + HEAP_MIRROR).
+  Also new: LEONIDA_CE_TABLE_LOG=N (xs list proxy: raw compute table handles), LEONIDA_CE_TABLE_DIAG=N (replay: title vs arena words).
+- ri53 (B; build 59, re53 = HEAP_MIRROR + TABLE_DIAG=12 + PTR_CHECK=2): heap at 0x148a0000 mirrored to arena VA 0xee10000; table handles
+  now land in the mirror (s5 0x1032f340.. step 0x20000, s4 0xf82de00). PTR_CHECK DOES read the mirror: s5 slot 0 = the real T#
+  [01000003 03800000 00000000 90000fac] (flagged only because its base 0x100000300 is a title texture above the arena). The remaining
+  "bad" lines are slots 6..31 (title heap bytes the title never filled for this table; the scan reads 32 slots blindly), so
+  PTR_CHECK totals are no longer a valid metric here. STILL LOST ~120 s after Confirm (t=192.2 -> ~312), but checkpoints moved: no
+  cs_87dac0f8/cs_25d19264; compute queues at cs_c5b1005e, cs_344692c2, cs_cee65a2d; direct at a list-begin marker. No fault address
+  (vkGetDeviceFaultInfoEXT -13). COST: the 38 MiB per-ExecuteCommandLists copy makes it ~3x slower (boot 2x slower, 14 fps falling to
+  4 fps). No frames (B's puller exited early). ri54 (screens, no PTR_CHECK) NOT run (B out of time).
+- NEXT: (1) cut the mirror cost: copy only dirty/used ranges (e.g. per-table windows of the mirror at replay prepare for dispatches and
+  draws, from title heap + (va - mirror)), or write-watch (GetWriteWatch / VirtualProtect) the title heap pages and copy only dirtied
+  64 KiB pages per submit. (2) run ri54-like (no PTR_CHECK) to see whether the loss persists without the PTR_CHECK slowdown, and get frames.
+  (3) the new faulters cs_c5b1005e / cs_344692c2 / cs_cee65a2d (compute queue): check whether their tables/root views also point into
+  the heap (TABLE_LOG) or into placed buffers (stand-ins at their own VA: same class of bug for V# bases that name placed-buffer title VAs).
+- Recommended env now: build 59 + re54.env (re48 - PTR_CHECK + HEAP_MIRROR=1). Never DISPATCH_SYNC.

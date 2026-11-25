@@ -7,6 +7,7 @@
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "../src/gfx10_descriptors.h"
+#include "../src/ce_checkpoints.h"  // agA17
 
 #include <algorithm>
 #include <array>
@@ -1731,6 +1732,7 @@ public:
             recorded.push_back(&list->commands());
             graphics.push_back(list);
         }
+        if (auto f = leonida::ce::heap_sync_fn().load(std::memory_order_relaxed)) f();  // agA17 HEAP_MIRROR
         last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
         if (last_result_ != leonida::ReplayResult::success)

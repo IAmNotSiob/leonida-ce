@@ -3003,7 +3003,27 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                                                      std::uint64_t, std::uint64_t);
             auto** const real_vtable = *reinterpret_cast<void***>(self->real);
             UnwrappedArray heaps;
-            if constexpr (pc == 31 || pc == 32) a2 = xs_gpu_handle_from_console(a2);  // HACK: unified handles
+            if constexpr (pc == 31 || pc == 32) {
+                const std::uint64_t raw = a2;
+                a2 = xs_gpu_handle_from_console(a2);  // HACK: unified handles
+                static const int tlog = [] { const char* v = std::getenv("LEONIDA_CE_TABLE_LOG"); return v ? std::atoi(v) : 0; }();
+                if (tlog > 0 && pc == 31) {  // agA17 diagnostic: raw compute table handles
+                    static std::atomic<int> tl{0};
+                    if (tl++ < tlog) {
+                        std::fprintf(stderr, "[hack] TABLE_LOG compute root %llu handle raw 0x%llx -> 0x%llx\n", (unsigned long long)a1,
+                                     (unsigned long long)raw, (unsigned long long)a2);
+                        std::fflush(stderr);
+                    }
+                }
+                if (a2 >> 32) {  // agA17: a table the one-dword compute layout truncates
+                    static std::atomic<int> told{0};
+                    if (told++ < 24) {
+                        std::fprintf(stderr, "[hack] table handle 0x%llx (raw 0x%llx, %s) above 4 GiB after translation\n",
+                                     (unsigned long long)a2, (unsigned long long)raw, pc == 31 ? "compute" : "graphics");
+                        std::fflush(stderr);
+                    }
+                }
+            }
             if constexpr (pc >= 37 && pc <= 42) {
                 const std::uint64_t raw = a2;
                 a2 = xs_va_from_cpu(a2);  // HACK: root CBV/SRV/UAV addresses

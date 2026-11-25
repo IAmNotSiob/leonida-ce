@@ -3694,6 +3694,84 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!pipeline || !pipeline->pipeline) { static bool told_ = false; if (!told_) { told_ = true; std::fprintf(stderr, "[hack] replay: unresolved resource at vulkan_replay.h:%d (command %zu of %zu)\n", __LINE__, i, commands.size()); } return ReplayResult::unresolved_resource; }
             if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
             p.pipeline = *pipeline;
+            // HACK (agA17, LEONIDA_CE_DISPATCH_SYNC=1): draws copy a window of title memory around each root word
+            // into the arena (ring sync, sync_title_range), dispatches did not. The fspx compute tables live in the
+            // title's descriptor ring (placed buffers, arena VA == title VA), so the GPU read whatever an earlier
+            // draw's sync left there (ri46/ri48/ri49: floats, host pointers -> the post-Confirm device loss). Sync
+            // each table (and root view) window, then the buffers its V#s name (up to 64 KiB each).
+            // agA17 build 59: =1 tables (+ root views) only; =2 also each table V#'s buffer (ri51: harmful, the placed
+            // stand-ins are NOT at their title VA, so arena[VA] belongs to other buffers).
+            static const int dsync_level = [] { const char* v = std::getenv("LEONIDA_CE_DISPATCH_SYNC"); return v ? std::atoi(v) : 0; }();
+            static const bool dsync = dsync_level > 0;
+            // HACK diagnostic (agA17, LEONIDA_CE_TABLE_DIAG=N): the first N compute tables (per distinct 64 KiB of VA):
+            // the first 16 dwords in title memory and in the arena at the table VA, before any sync.
+            static const int tdiag = [] { const char* v = std::getenv("LEONIDA_CE_TABLE_DIAG"); return v ? std::atoi(v) : 0; }();
+            if (tdiag > 0) {
+                static std::atomic<int> told{0};
+                static std::mutex seen_mu;
+                static std::set<std::uint64_t> seen;
+                const std::uint32_t* ud = dispatch->user_data.data();
+                for (unsigned b = 0; b < 32 && told.load() < tdiag; ++b) {
+                    if (!((dispatch->ce_table_mask >> b) & 1)) continue;
+                    const std::uint64_t va = ud[b];
+                    if (va < 0x10000) continue;
+                    {
+                        std::lock_guard l(seen_mu);
+                        if (!seen.insert((reinterpret_cast<std::uint64_t>(pipeline->pipeline) << 8) ^ (va >> 16) ^ (std::uint64_t(b) << 56)).second) continue;
+                    }
+                    std::uint32_t t[16] = {}, a[16] = {};
+                    const bool tok = detail::copy_title_bytes(va, t, sizeof t);
+                    const std::uint8_t* h = nullptr;
+                    const bool aok = vk.host_at && vk.host_at(va, sizeof a, h) == HostReadStatus::ok && h;
+                    if (aok) std::memcpy(a, h, sizeof a);
+                    ++told;
+                    char line[700];
+                    int o = std::snprintf(line, sizeof line, "[hack] TABLE_DIAG %s s%u VA 0x%llx title%s:",
+                                          ::leonida::ce::pipeline_name(reinterpret_cast<std::uint64_t>(pipeline->pipeline)).c_str(),
+                                          b, (unsigned long long)va, tok ? "" : "(unreadable)");
+                    for (int i = 0; i < 16; ++i) o += std::snprintf(line + o, sizeof line - o, " %08x", t[i]);
+                    o += std::snprintf(line + o, sizeof line - o, " | arena%s:", aok ? "" : "(none)");
+                    for (int i = 0; i < 16; ++i) o += std::snprintf(line + o, sizeof line - o, " %08x", a[i]);
+                    std::fprintf(stderr, "%s\n", line);
+                    std::fflush(stderr);
+                }
+            }
+            if (dsync && vk.sync_title_range) {
+                const std::uint32_t* ud = dispatch->user_data.data();
+                const std::uint32_t tm = dispatch->ce_table_mask, vm = dispatch->ce_view_mask;
+                static std::atomic<std::uint64_t> n_tables{0}, n_bufs{0};
+                for (unsigned b = 0; b < 32; ++b) {
+                    const bool table = (tm >> b) & 1;
+                    const bool view = b < 31 && ((vm >> b) & 1) && ud[b + 1] == 0;
+                    if (!table && !view) continue;
+                    const std::uint64_t va = ud[b];
+                    if (va < 0x10000) continue;
+                    vk.sync_title_range(va & ~0x1Full, 1024);  // exact first (a window may cross the buffer end)
+                    vk.sync_title_range(va & ~0xFFFull, 0x2000);
+                    if (!table) continue;
+                    ++n_tables;
+                    if (dsync_level < 2) continue;
+                    const std::uint8_t* h = nullptr;
+                    if (!vk.host_at || vk.host_at(va, 32 * 32, h) != HostReadStatus::ok || !h) continue;
+                    for (unsigned k = 0; k < 32; ++k) {
+                        std::uint32_t d[4];
+                        std::memcpy(d, h + k * 32, sizeof d);
+                        if (!(d[0] | d[1] | d[2] | d[3]) || (d[3] >> 30) != 0) continue;  // buffer V#s only
+                        const std::uint64_t base = d[0] | (std::uint64_t(d[1] & 0xffff) << 32);
+                        const std::uint32_t stride = (d[1] >> 16) & 0x3fff;
+                        std::uint64_t bytes = stride ? std::uint64_t(d[2]) * stride : d[2];
+                        if (!base || !bytes || base >= (1ull << 32)) continue;
+                        bytes = std::min<std::uint64_t>(bytes + (base & 0xFFF), 65536);
+                        vk.sync_title_range(base & ~0xFFFull, (bytes + 0xFFF) & ~0xFFFull);
+                        ++n_bufs;
+                    }
+                }
+                static std::atomic<std::uint64_t> n_disp{0};
+                const std::uint64_t k = ++n_disp;
+                if ((k & (k - 1)) == 0 && k >= 64)
+                    std::fprintf(stderr, "[hack] DISPATCH_SYNC: %llu dispatches, %llu tables, %llu V# buffers synced\n",
+                                 (unsigned long long)k, (unsigned long long)n_tables.load(), (unsigned long long)n_bufs.load());
+            }
             if (auto f = ::leonida::ce::ptr_check_fn().load(std::memory_order_relaxed))  // agA16
                 f(dispatch->user_data.data(), dispatch->ce_view_mask, dispatch->ce_table_mask,
                   reinterpret_cast<std::uint64_t>(pipeline->pipeline));

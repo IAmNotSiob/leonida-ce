@@ -102,6 +102,33 @@ static void ce_arena_tally_report() {
 // pool-cpu / pool-gpu (the title texture pool windows [0x149e1dac0] / [0x149e1dad0]), page-pool ([0x1471bfaa8]), else
 // other. Counters at the end of each burst: "[hack] PTR_CHECK: N dispatches scanned, M bad".
 #include <set>
+// HACK (agA17, LEONIDA_CE_HEAP_MIRROR): console-addressed shader-visible descriptor heaps mirrored into the arena;
+// ExecuteCommandLists copies title bytes -> mirror before the lists replay (leonida::ce::heap_sync_fn).
+struct CeHeapMirror { const std::uint8_t* title; std::uint8_t* arena; std::size_t bytes; };
+static std::mutex g_hm_mu;
+static std::vector<CeHeapMirror> g_hm;
+static void ce_heap_mirror_sync() {
+    std::lock_guard lock(g_hm_mu);
+    for (const auto& m : g_hm) std::memcpy(m.arena, m.title, m.bytes);
+    static std::atomic<std::uint64_t> n{0};
+    const std::uint64_t k = ++n;
+    if ((k & (k - 1)) == 0 && k >= 256) {
+        std::size_t total = 0;
+        for (const auto& m : g_hm) total += m.bytes;
+        std::fprintf(stderr, "[hack] HEAP_MIRROR: %llu syncs, %zu heaps, %zu KiB each sync\n", (unsigned long long)k,
+                     g_hm.size(), total / 1024);
+    }
+}
+static void ce_heap_mirror_add(const std::uint8_t* title, std::uint8_t* arena, std::size_t bytes) {
+    std::lock_guard lock(g_hm_mu);
+    g_hm.push_back({title, arena, bytes});
+    leonida::ce::heap_sync_fn().store(&ce_heap_mirror_sync);
+}
+static void ce_heap_mirror_remove(const std::uint8_t* title) {
+    std::lock_guard lock(g_hm_mu);
+    for (auto it = g_hm.begin(); it != g_hm.end(); ++it)
+        if (it->title == title) { g_hm.erase(it); break; }
+}
 static std::uint8_t* g_pc_mapped = nullptr;
 static std::uint64_t g_pc_size = 0;
 static std::uint64_t g_pc_dev = 0;
@@ -2062,6 +2089,26 @@ public:
             log_once("descriptor heap uses console address/size (not backed by title memory)", int(desc_.Type));
             cpu_ = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(console_address_));
             in_arena_ = false;
+            // HACK (agA17, LEONIDA_CE_HEAP_MIRROR=1): the title writes this heap's descriptors into its own memory
+            // (console_address, above 4 GiB), but a compute descriptor table is ONE dword (the shader reads
+            // arena + low 32 bits), so tables into this heap read unrelated arena bytes (ri49: floats, stack data;
+            // the post-Confirm device loss). Give the heap an arena mirror: its GPU handle is the mirror's offset,
+            // and every ExecuteCommandLists copies the title bytes into the mirror (ce_heap_mirror_sync).
+            static const bool mirror = [] { const char* e = std::getenv("LEONIDA_CE_HEAP_MIRROR"); return e && e[0] == '1'; }();
+            std::fprintf(stderr, "[hack] console descriptor heap: type %d count %u flags 0x%x address 0x%llx size 0x%llx%s\n",
+                         int(desc_.Type), desc_.NumDescriptors, unsigned(desc_.Flags),
+                         (unsigned long long)console_address_, (unsigned long long)console_size_,
+                         mirror ? " (HEAP_MIRROR on)" : "");
+            if (mirror && (desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device.arena.mapped &&
+                device.arena_allocate(bytes, 256, arena_offset_, DeviceState::arena_descriptor_heap)) {
+                mirrored_ = true;
+                std::memcpy(device.arena.mapped + arena_offset_, cpu_, std::size_t(bytes));
+                ce_heap_mirror_add(cpu_, device.arena.mapped + arena_offset_, std::size_t(bytes));
+                std::fprintf(stderr, "[hack] HEAP_MIRROR: console heap 0x%llx (%llu KiB) -> arena VA 0x%llx\n",
+                             (unsigned long long)console_address_, (unsigned long long)(bytes / 1024),
+                             (unsigned long long)arena_offset_);
+            }
+            std::fflush(stderr);
             return;
         }
         if ((desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device.arena.mapped) {
@@ -2080,6 +2127,11 @@ public:
     }
 
     ~DescriptorHeap() override {
+        if (mirrored_) {
+            ce_heap_mirror_remove(cpu_);
+            device_.arena_release(arena_offset_, VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize,
+                                  DeviceState::arena_descriptor_heap);
+        }
         if (in_arena_) device_.arena_release(arena_offset_, VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize,
                                             DeviceState::arena_descriptor_heap);
     }
@@ -2097,6 +2149,7 @@ public:
     }
     D3D12_GPU_DESCRIPTOR_HANDLE STDMETHODCALLTYPE GetGPUDescriptorHandleForHeapStart() override {
         if (!(desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)) return {0};
+        if (mirrored_) return {UINT64(arena_offset_)};  // agA17
         if (console_addressed_) return {static_cast<UINT64>(console_address_)};
         if (!in_arena_) log_once("shader-visible heap without a GPU address arena; flags", int(desc_.Flags));
         return {in_arena_ ? UINT64(arena_offset_) : 0};
@@ -2104,6 +2157,7 @@ public:
 
     const D3D12_DESCRIPTOR_HEAP_DESC& raw_desc() const { return desc_; }
     D3D12_GPU_VIRTUAL_ADDRESS gpu_base() const {
+        if (mirrored_) return UINT64(arena_offset_);  // agA17
         if (console_addressed_) return static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(console_address_);
         return in_arena_ ? UINT64(arena_offset_) : 0;
     }
@@ -2118,6 +2172,7 @@ private:
     std::uint64_t console_address_ = 0;
     std::uint64_t console_size_ = 0;
     bool console_addressed_ = false;
+    bool mirrored_ = false;  // agA17 HEAP_MIRROR
 };
 
 class Resource final
