@@ -1791,3 +1791,23 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
 - Commit fc41fc1c1 (build 79+): LEONIDA_CE_CBV_SHADOW_ROOT=<bytes>: root CBVs (pc 37/38) at unknown title addresses
   (passed raw before; CBV_FIX logged 0xba04e0000) get a shadow too. Off by default.
 - rp1 = build 78 + rp1.env (ro1 without any LOOP_CAP + CBV_SHADOW=2 + DISPATCH_LOG=1); rp2 = the same with the ro1 caps.
+- rp1 (build 78, caps OFF, CBV_SHADOW=2): Confirm t=164.2, device lost about Confirm+150 s (nvlddmkm 153 before the 15 s present
+  watch, so no SYNC_DUMP), last frame 1620; then a game AV at game+0x55aa29b (after the loss: fences read UINT64_MAX). Shadow pool
+  64 MiB at arena VA 0x11470000, 4216 views by Confirm, 24 "changed after its view was made" (defect 1 is real). Checkpoints only
+  CP_FINE (direct before cmd #1 CopyTexture; compute queues at Buffer/TextureBarriers). Pace slower (10-25 s / 60 frames).
+- rp2 (build 78, ro1 caps + CBV_SHADOW=2): the same picture (Confirm t=183, loss Confirm+130 s, frame 1650, same game AV after).
+  FaultInfo: address 0x57d7c0000 = console VA 0x27d7b0000 (arena device base 0x300010000, size 4 GiB) => a garbage pointer
+  OUTSIDE the arena, a page fault, not the endless blur.
+- rp3 (build 79, ro1 caps, no shadow, CB_PEEK): THE BLUR CB IS OUR OWN UPLOAD-RING SNAPSHOT (Very likely):
+  cs_d5613de2 / cs_d94af257 table(s4)+0xca0 V# = [00649400 00000000 00000d60 30014fac]: base 0x649400 (3424 bytes) lies INSIDE
+  the 64 MiB console upload ring (VA 0x10000..0x4010000); heap mirror entry = title heap (the descriptor itself is what we wrote
+  for the slot-17 CBV). Radius at +0x43c = ea84302a (-8e25) = garbage. cs_f33ac9e9 CB (s5+0x40) base 0x6a9300 = ring too.
+  cs_956fdcc6 (s4+0x380, its loops are bounded by CB[0x704]/[0x72c]) V# base 0xacd3830 / 0x9ad5868, stride 0x7fc, 1 record.
+  => analyst defect 2 (the ring wraps under long-lived CBVs) confirmed; LEONIDA_CE_CBV_SHADOW is the fix for this path.
+  rp3 hung (frame 2246) and then CRASHED host-side in the hang watch: its stack walk (startup_trace stack_from) unwinds a
+  resumed live thread (same class as rn9). Fixed in build 81 (commit 30a47ce31): walk under SEH ("<walk faulted>").
+- cs_956fdcc6 does have 3 backward SCALAR branches (lines 1693/1751/1802, offsets 65495/65485/65512); the loopy list missed
+  them. Full list from the main session: /root/handoff/loopy_fspx_cs_all.txt (1826). LOOP_CAP=fspx_game (rn9/rp4) covers all.
+- Builds: 79 (f6a950a8b, CB_PEEK), 80 (184817dc9, CB_PEEK prints title bytes at the base too), 81 (30a47ce31, hang-watch SEH).
+- CB_PEEK targets that matter: d5613de2:4:0xca0:0x43c, d94af257:4:0xca0:0x43c, f33ac9e9:5:0x40:0x24, 956fdcc6:4:0x380:0x704
+  (needs LEONIDA_CE_PTR_CHECK=1 + PTR_CHECK_ONLY on the same shaders to keep the scan cheap).
