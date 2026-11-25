@@ -2992,6 +2992,24 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
             self->real->CopyResource(reinterpret_cast<ID3D12Resource*>(unwrap_object(a1)),
                                      reinterpret_cast<ID3D12Resource*>(unwrap_object(a2)));
             return 0;
+        } else if constexpr (Slot == 80) {
+            // agA21 LEONIDA_CE_SLOT80_DISPATCH (default on, =0 drops it as before): console slot 80 is the vtable
+            // fallback of the five-dword dispatch packet 0x4003cc00,x,1,1,W (docs/d3d12_command_objects.md 3.3a/3.5a).
+            // XboxBvhBuilder.dll calls it as (x, 1, 1, W) after Confirm; dropping it left the BVH build half done.
+            static const bool on = [] { const char* e = std::getenv("LEONIDA_CE_SLOT80_DISPATCH"); return !e || e[0] != 0; }();
+            if (on) {
+                static std::atomic<std::uint64_t> calls{0};
+                const std::uint64_t k = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (k <= 4 || (k & (k - 1)) == 0) {
+                    std::fprintf(stderr, "[hack] SLOT80_DISPATCH #%llu from %p: Dispatch(%llu, %llu, %llu) W=0x%llx\n",
+                                 (unsigned long long)k, _ReturnAddress(), (unsigned long long)a1, (unsigned long long)a2,
+                                 (unsigned long long)a3, (unsigned long long)(a4 & 0xffffffffull));
+                    std::fflush(stderr);
+                }
+                if (a1 && a2 && a3 && a1 <= 65535 && a2 <= 65535 && a3 <= 65535)
+                    self->real->Dispatch(static_cast<UINT>(a1), static_cast<UINT>(a2), static_cast<UINT>(a3));
+                return 0;
+            }
         }
         constexpr unsigned pc = console_to_pc_list_slot(Slot);
         if constexpr (pc == kListNotForwarded) {
