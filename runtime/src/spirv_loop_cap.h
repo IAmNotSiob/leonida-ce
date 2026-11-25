@@ -50,7 +50,9 @@ inline int spirv_cap_loops(std::vector<std::uint32_t>& words, std::uint32_t inne
         default: break;
         }
     }
-    if (!t_uint || first_function == SIZE_MAX || functions != 1) return 0;
+    // agA22: modules with helper functions too (cs_d5613de2 has 3 and its loop was never capped): each counter
+    // variable goes into the function that holds its loop.
+    if (!t_uint || first_function == SIZE_MAX || functions == 0) return 0;
     for (std::size_t i = 0; i < first_function; ++i) {
         const std::uint32_t* w = &words[insts[i].at];
         if (insts[i].op == op_type_pointer && w[2] == class_function && w[3] == t_uint) { t_ptr = w[1]; break; }
@@ -58,7 +60,17 @@ inline int spirv_cap_loops(std::vector<std::uint32_t>& words, std::uint32_t inne
 
     // Loops to cap: header (has OpLoopMerge merge continue), continue block ends in OpBranchConditional c, a, b with
     // {a, b} == {header, merge}.
-    struct Loop { std::size_t term; std::uint32_t header, merge; bool true_is_header; };
+    struct Loop { std::size_t term; std::uint32_t header, merge; bool true_is_header; std::size_t first_label; };
+    // The first OpLabel of the function that holds instruction i.
+    auto function_first_label = [&](std::size_t i) -> std::size_t {
+        std::size_t f = SIZE_MAX;
+        for (std::size_t j = i + 1; j-- > 0;)
+            if (insts[j].op == op_function) { f = j; break; }
+        if (f == SIZE_MAX) return SIZE_MAX;
+        for (std::size_t j = f; j < insts.size(); ++j)
+            if (insts[j].op == op_label) return j;
+        return SIZE_MAX;
+    };
     std::vector<Loop> loops;
     for (std::size_t i = 0; i < insts.size(); ++i) {
         if (insts[i].op != op_loop_merge) continue;
@@ -74,8 +86,10 @@ inline int spirv_cap_loops(std::vector<std::uint32_t>& words, std::uint32_t inne
             ++k;
         if (k >= insts.size() || insts[k].op != op_branch_conditional) continue;
         const std::uint32_t a = words[insts[k].at + 2], b = words[insts[k].at + 3];
-        if (a == header && b == merge) loops.push_back({k, header, merge, true});
-        else if (a == merge && b == header) loops.push_back({k, header, merge, false});
+        const std::size_t fl = function_first_label(i);
+        if (fl == SIZE_MAX) continue;
+        if (a == header && b == merge) loops.push_back({k, header, merge, true, fl});
+        else if (a == merge && b == header) loops.push_back({k, header, merge, false, fl});
     }
     if (loops.empty()) return 0;
 
@@ -91,12 +105,13 @@ inline int spirv_cap_loops(std::vector<std::uint32_t>& words, std::uint32_t inne
     decls.insert(decls.end(), {(4u << 16) | op_constant, t_uint, c_outer, outer_cap});
 
     // Outer loops: their continue block branches to the merge block on true (the translator's barrier rounds).
-    std::vector<std::uint32_t> vars;                                       // after the function's first OpLabel
+    std::unordered_map<std::size_t, std::vector<std::uint32_t>> vars;      // after each function's first OpLabel
     std::unordered_map<std::size_t, std::vector<std::uint32_t>> before;     // instruction index -> words before it
     std::unordered_map<std::size_t, std::uint32_t> new_cond;                // terminator index -> new condition id
     for (const Loop& l : loops) {
         const std::uint32_t var = fresh();
-        vars.insert(vars.end(), {(5u << 16) | op_variable, t_ptr, var, class_function, c_zero});
+        auto& fv = vars[l.first_label];
+        fv.insert(fv.end(), {(5u << 16) | op_variable, t_ptr, var, class_function, c_zero});
         const std::uint32_t old_cond = words[insts[l.term].at + 1];
         const std::uint32_t ld = fresh(), inc = fresh(), lt = fresh(), cond = fresh();
         std::vector<std::uint32_t> code = {
@@ -119,14 +134,9 @@ inline int spirv_cap_loops(std::vector<std::uint32_t>& words, std::uint32_t inne
         slot.insert(slot.end(), code.begin(), code.end());
         new_cond[l.term] = cond;
     }
-    // The function's first OpLabel.
-    std::size_t first_label = SIZE_MAX;
-    for (std::size_t i = first_function; i < insts.size(); ++i)
-        if (insts[i].op == op_label) { first_label = i; break; }
-    if (first_label == SIZE_MAX) return 0;
 
     std::vector<std::uint32_t> out;
-    out.reserve(words.size() + decls.size() + vars.size() + loops.size() * 32);
+    out.reserve(words.size() + decls.size() + loops.size() * 40);
     out.insert(out.end(), words.begin(), words.begin() + 5);
     for (std::size_t i = 0; i < insts.size(); ++i) {
         if (i == first_function) out.insert(out.end(), decls.begin(), decls.end());
@@ -134,7 +144,7 @@ inline int spirv_cap_loops(std::vector<std::uint32_t>& words, std::uint32_t inne
         const std::size_t from = out.size();
         out.insert(out.end(), words.begin() + insts[i].at, words.begin() + insts[i].at + insts[i].count);
         if (auto n = new_cond.find(i); n != new_cond.end()) out[from + 1] = n->second;
-        if (i == first_label) out.insert(out.end(), vars.begin(), vars.end());
+        if (auto v = vars.find(i); v != vars.end()) out.insert(out.end(), v->second.begin(), v->second.end());
     }
     out[3] = bound;
     words.swap(out);

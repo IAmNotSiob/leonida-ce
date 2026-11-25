@@ -1879,7 +1879,7 @@ inline void note_submit(VkSemaphore progress, std::uint64_t ticket, std::span<co
     if (q) {
         ++q->subs;
         q->recent.push_back(std::move(sub));
-        while (q->recent.size() > 64) q->recent.pop_front();
+        while (q->recent.size() > 512) q->recent.pop_front();
     }
 }
 inline void note_cpu_signal(VkSemaphore s, std::uint64_t value) {
