@@ -376,6 +376,15 @@ bool special(Probe* self, int slot, uintptr_t a, uintptr_t b, uintptr_t c, uintp
     if (std::strcmp(self->name, "queue") == 0 && slot == 3) {  // EnqueueRequest(request*)
         if (!a || IsBadReadPtr(reinterpret_cast<void*>(a), 0x38)) { *result = S_OK; return true; }
         const Req r = parse_request(reinterpret_cast<void*>(a));
+        if (r.comp > 1) {  // DIAGNOSTIC (agA6): raw request bytes of compressed formats we do not decode (BCPack = 14)
+            static std::atomic<int> told{0};
+            if (told++ < 8 && !IsBadReadPtr(reinterpret_cast<void*>(a), 0x48)) {
+                const auto* q = reinterpret_cast<const uint32_t*>(a);
+                std::fprintf(stderr, "[dstorage] comp=%u raw req:", r.comp);
+                for (int i = 0; i < 18; ++i) std::fprintf(stderr, " %08x", q[i]);
+                std::fprintf(stderr, "\n");
+            }
+        }
         if (sync_mode() || !self->queue) {
             run_request(r);  // synchronous read (old behaviour)
         } else {

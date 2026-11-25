@@ -743,3 +743,46 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   Next script: after the 16 A/DOWN cycles, press A alone (no UP) every 30 s, e.g.
   LEONIDA_CE_PRESS=A@s3+20/15x16,DOWN@s3+27/15x16,A@s3+272/30  (build 26 exe, env only). The earlier guess that the
   policy text must be scrolled first is withdrawn.
+
+## agA6 (sender gen 6, 2026-11-25)
+- Missing x-height glyphs, cause #1 (Very likely, re8 tdiag): those glyphs are NOT vector shapes but glyph-cache quads
+  drawn with VText_a4ab6e63 + FText_a4ab6e63 (pipeline 21797b360b0, 12-22 quads per draw). Their vertices are stride 20
+  {rgba8 colour ffe6e6e6, float2 uv (1/2048 units), float2 pos} but the layout (sc5 psodiag) says COLOR0 R32G32B32A32,
+  TEXCOORD0 R32G32, POSITION0 R32G32 APPEND_ALIGNED (0/16/24): uv and position came from the wrong bytes. The glyphs
+  with ascenders/descenders and capitals are big enough that Scaleform draws them as vector shapes (_VBatchVertexCxform),
+  which is why only they showed. Build 27: SF_VCOLOR default also matches "VText" (LEONIDA_CE_SF_VCOLOR=0 off).
+- Cause #2 (Definite by reading): FText samples dmask 0x8 (.w only) from T# 0x100001b00 (2048x2048, FMT 8_UNORM,
+  DST_SEL (X,0,0,1)): the xs layer turns A8 (65) views into R8 with the title's identity mapping, so .w read 1 (would
+  give solid boxes once positions are right). Build 27: slot 18 gives A8 SRVs mapping (0,0,0,R) composed with the
+  title's ("[hack] A8 SRV: .. mapping 1688 -> 1124"; null descs of placed A8 textures get a Texture2D desc).
+  LEONIDA_CE_A8_SWZ=0 off.
+- TERMS: A on a box ticks it and moves focus down; A on a greyed Confirm does nothing. re9 (build 26) ended with both
+  boxes unticked and focus on Confirm. Script now cycles UP,UP,A,A,A every 30 s plus UP,A every 60 s (parity breaker).
+- dstorage comp=14: destinations of consecutive failing requests are 0x30 apart with dst_size 65536 (re8), so the +8
+  field is probably not a flat memory destination for BCPack requests: LEONIDA_CE_DS_ZEROFILL=1 would write overlapping
+  64 KiB ranges (UNSAFE, Plausible). Build 28 logs the raw 0x48-byte request for comp>1 ("[dstorage] comp=14 raw req").
+  The decoder (tools/bcpack.py, 1488 lines + tables, some entries provisional) was not ported.
+- Bink: Bink2Scarlett.dll is the title's own; VS_Bink/PS_BinkNoAlpha pipelines already draw in state 13 (re8).
+- re9 (build 26, B5): TERMS reached, ended with both boxes unticked, focus on greyed Confirm; body glyphs still missing.
+- re10 (build 27, B5): GLYPHS FIXED (Definite): /root/rb/re10d/p002400.png "< Minimap (Dynamic) >", "Minimap displays
+  dynamically or on demand.", TERMS labels/Confirm/prompts complete. ~13.8 fps median. No crash.
+  CORRECTION to agA5: on TERMS, A toggles the focused box and focus does NOT move (re10 frames: UP,UP,A,A,A only flipped
+  Privacy). Filled white square = focused+unticked? / tick icon alternate on each A.
+  REGRESSION: TERMS right-pane policy body and the Privacy row label vanished (both scroll/masked text fields).
+  Suspect (Plausible): the 3840x2160 A8 render target (va dd7c40000, flags 0x300001) is a mask; on PC it is R8 and stores
+  the shader's .r, so the A8 swizzle reads 0 there. Build 29: A8 SRVs of resources with ALLOW_RENDER_TARGET keep the R8
+  mapping ("[hack] A8 SRV: res .. is a render target"); LEONIDA_CE_A8_SWZ=2 = build 27 behaviour, =0 off.
+- Build 28 = 27 + comp=14 raw request log. Build 29 = 28 + A8 RT exemption. Wine sf1/sf3 smoke OK (state 1),
+  sf2 psodiag confirms VText attrs at 0/4/12 with R8G8B8A8 colour.
+- TERMS script (re11/re12): cycle 40 s UP,UP,A,DOWN,A,DOWN,A (+ UP,UP,A every 120 s as a parity breaker).
+- re11 (build 28, B5): PAST TERMS (Definite). The A/DOWN phase itself ticked both boxes and A #16 (t=308.6) pressed Confirm
+  (p003900 both ticked + Confirm focused; p004050 right pane "CONFIRM / Confirm setup and start the game."). Boot state
+  13 -> 0 at t=309.3 with a settings save (save_create_container/write/submit/close). p004200 = solid navy, no UI. Last
+  present frame 4345, then AV at t=325.6: game+0x501eb50 `mov qword [rdi],0` with rdi = [0x14ab1a6c8]+0xa0 = 0xa0.
+  Function 0x14501ea20 (called from 0x140164474) zeroes 0x14ab1a688/0x14ab1a6c8, then calls 0x144db7900(obj
+  [0x14ab1a5c0], &0x14ab1a688) and later (obj [0x14ab1a5b8], &0x14ab1a6c8) to fill them (looks like a Map/acquire of a
+  buffer); the second returned false -> null base -> crash. Next: find what 0x144db7900 wraps (probably a resource
+  Map or an XMem allocation) and why it fails on PC. The re10 "vanished Privacy label" was focus-dependent (re11 shows it
+  with the swizzle on); the long policy body is not seen in either build. dstorage comp=14 raw req (re11): dw0 0x0020000e
+  (comp 14, byte 2 = 0x20 = dest type?), dw2/3 = dest 0xd849aa358 (0x30 apart = array of destination descriptors, NOT
+  memory: zero-fill unsafe), dw6 0x10000 = dest size, dw8/9 file ptr, dw10 offset, dw12 compressed size.

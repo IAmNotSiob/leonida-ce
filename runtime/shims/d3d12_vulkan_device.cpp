@@ -3833,6 +3833,9 @@ public:
             auto vcolor_match = [&](const std::string& name) {
                 static const bool sf = [] { const char* v = std::getenv("LEONIDA_CE_SF_VCOLOR"); return !v || *v != '0'; }();
                 if (sf && name.find("Cxform") != std::string::npos) return true;
+                // agA6: VText (Scaleform glyph-cache text) vertices are stride 20 {rgba8 colour, float2 uv, float2 pos}
+                // (re8 tdiag), its layout says COLOR0 float4: same fix, else x-height glyphs land off screen.
+                if (sf && name.find("VText") != std::string::npos) return true;
                 const char* want = std::getenv("LEONIDA_CE_VCOLOR_FIX");
                 if (!want) return false;
                 std::string list(want);

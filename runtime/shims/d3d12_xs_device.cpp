@@ -4207,6 +4207,58 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                 *reinterpret_cast<DXGI_FORMAT*>(view_copy) = xs_pc_format(*view);
                 a2 = reinterpret_cast<std::uint64_t>(view_copy);
             }
+            // HACK (agA6, LEONIDA_CE_A8_SWZ, default on, =0 off): an A8_UNORM texture is stored as R8 on the PC side,
+            // so its SRV read (r,0,0,1) and Scaleform's glyph shader (FText samples .w only) saw alpha 1. Give A8 SRVs
+            // the A8 component mapping (0,0,0,R), composed with the title's own mapping. A null view description of an
+            // A8 placed texture gets a full Texture2D description.
+            if constexpr (Slot == 18) {
+                // build 29: A8 render targets (the scroll-pane mask, 3840x2160 A8) keep the old R8 mapping (alpha 1):
+                // their PC R8 target stores the shader's .r, not its alpha, so (0,0,0,R) masked the TERMS policy text
+                // away in re10. LEONIDA_CE_A8_SWZ=2 applies the swizzle to A8 render targets too.
+                static const int a8mode = [] { const char* e = std::getenv("LEONIDA_CE_A8_SWZ"); return e && e[0] == '0' ? 0 : e && e[0] == '2' ? 2 : 1; }();
+                const bool a8swz = a8mode != 0;
+                bool a8 = view && static_cast<unsigned>(*view) == 65u;
+                if (a8 && a8mode == 1 && a1) {
+                    XsPlaced pr{};
+                    if (xs_placed_by_resource(reinterpret_cast<const void*>(a1), pr) &&
+                        (static_cast<std::uint32_t>(pr.desc.Flags) & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
+                        a8 = false;
+                        static std::atomic<int> told_rt{0};
+                        if (told_rt++ < 8)
+                            std::fprintf(stderr, "[hack] A8 SRV: res %p is a render target (%llux%u flags %x): R8 mapping kept\n", (void*)a1,
+                                         (unsigned long long)pr.desc.Width, pr.desc.Height, static_cast<unsigned>(pr.desc.Flags));
+                    }
+                }
+                if (a8swz && !view && a1) {
+                    XsPlaced pl{};
+                    if (xs_placed_by_resource(reinterpret_cast<const void*>(a1), pl) &&
+                        static_cast<unsigned>(pl.desc.Format) == 65u && pl.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                        (a8mode == 2 || !(static_cast<std::uint32_t>(pl.desc.Flags) & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) &&
+                        pl.desc.DepthOrArraySize <= 1 && pl.desc.SampleDesc.Count <= 1) {
+                        D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+                        sd.Format = DXGI_FORMAT_R8_UNORM;
+                        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                        sd.Texture2D.MipLevels = static_cast<UINT>(-1);
+                        std::memcpy(view_copy, &sd, sizeof(sd));
+                        a2 = reinterpret_cast<std::uint64_t>(view_copy);
+                        a8 = true;
+                    }
+                }
+                if (a8swz && a8) {
+                    auto* sd = reinterpret_cast<D3D12_SHADER_RESOURCE_VIEW_DESC*>(view_copy);
+                    const UINT m = sd->Shader4ComponentMapping;
+                    UINT sel[4];
+                    for (UINT i = 0; i < 4; ++i) {
+                        const UINT from = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(i, m);
+                        sel[i] = from == 3 ? 0u : from < 3 ? UINT(D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0) : from;
+                    }
+                    sd->Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(sel[0], sel[1], sel[2], sel[3]);
+                    static std::atomic<int> told{0};
+                    if (told++ < 12)
+                        std::fprintf(stderr, "[hack] A8 SRV: res %p mapping %x -> %x\n", (void*)a1, m, sd->Shader4ComponentMapping);
+                }
+            }
         }
         const std::uint64_t r = reinterpret_cast<ForwardFn>(self->real_vtable[Slot])(self->real, a1, a2, a3, a4, a5, a6);
         if constexpr (Slot == 18) {  // SRV of a texture the title placed: copy its data in
