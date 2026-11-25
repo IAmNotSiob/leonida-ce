@@ -1897,3 +1897,32 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
 - Recommended env (agA24): build 85 + rp1.env (POOL_GPU off) behaves like build 81. POOL_GPU=2 (rq3.env) is correct but slower and
   does not fix the loss; keep it for work on the pool / ray-tracing data paths. Identity placement of imported host buffers via capture
   replay is NOT possible on the Windows driver (same refusal); the ADJACENT trick only works for the first big buffer after the arena.
+
+## agA25 (sender gen 25, 2026-11-25)
+- Receiver: the main session (runs rsN on the VM). Builds 86+. Build from Linux: PATH=/usr/lib/llvm-21/bin:$PATH cmake --build
+  runtime/build/windows --target gta6rt (llvm-lib must be on PATH), then make_game.py --stages runtime to package.
+- A24's lead was a misread (Very likely, from the disasm): cs_edc5d4c7 CB+0 is NOT a V#. The dwordx4 at CB+0 is unpacked as
+  scalars (s16 & 0xff = stride, s16 >> 8 = offset; same for s19): 00008008 = stride 8 / offset 0x80, i.e. a vertex-layout record,
+  valid data. Its V#s come from the BINDLESS heap table s6 at CB[0x40]*32 and CB[0x44]*32 (s_load_dwordx4 s[12:13], idx<<5).
+- Why VA_GUARD (which listed cs_edc5d4c7) never caught the far reads (Definite, offline count): spirv_guard_va rewrites only
+  OpConvertUToPtr(heap_base + va). The translator forms per-component accesses as (heap_base + va) + k, a second add, so in
+  edc5d4c7 only 50 of 108 pointers were guarded (the other 58 = every 2nd..4th dword of a store/load).
+- Build 86 (eb439aae, d5cbb92c7): CB_PEEK appends "| SRC shadow .. = title .. INSIDE/not in title heap ..; CBtitle-entry = N;
+  title now [..] shadow [..]" (CBV_SHADOW source of a CB, via leonida::ce::cbv_title_fn). LEONIDA_CE_CB_VSHARP_GUARD (zero a CB-
+  loaded V#) - WRONG premise for edc5d4c7 (it zeroes the layout record); keep it off. rs1 = build 86 + rs1.env.
+- Build 87 (ad21754c, 08f8d60f6): LEONIDA_CE_BINDLESS_GUARD=name:cbsgpr:cbvoff:idxoff:heapsgpr (needs PTR_CHECK>=1): leave the
+  dispatch out (ce_bad) when the CB-indexed bindless heap entry is outside the arena or its V# base is unmapped. PtrCheckFn now
+  returns bool (skip). rs2 = build 87 + rs2.env (edc5d4c7:5:0x40:0x40:6,edc5d4c7:5:0x40:0x44:6).
+- Build 88 (8db0756f, f5f6c6c43): LEONIDA_CE_VSHARP_GUARD_ALL=1 - blanket pass (src/spirv_va_guard.h spirv_guard_ptr_all) on
+  EVERY module, compute and graphics: each u64 OpConvertUToPtr operand p is checked, p >= heap_base + LIMIT -> redirected.
+  heap_base = the OpBitwiseOr operand voted from adds feeding ConvertUToPtr (module left alone if none). VA_GUARD list ignored
+  when on. (88 also tripped p < heap_base and touched bvh/: superseded by 89.)
+- Build 89 (4f54745d, 9b6c2165c): VSHARP_GUARD_ALL final form:
+  - LIMIT = LEONIDA_CE_VSHARP_GUARD_LIMIT (default 1 TiB above heap_base); pointers below heap_base pass; bvh/* excluded.
+  - Tripped pointers go to a sink at arena VA 0x10000 (512 KiB); with the switch the arena allocator starts at 0x100000.
+  - Compute modules record trips (selection branch, not in loop-header blocks): 16 B per module at arena 0x90000 + slot*16
+    = atomic count, bad pointer lo, hi. Thread (5 s): "[warning] <shader>: overly big address 0x.. ignored (count N)", first
+    time and each doubling.
+  - Offline: 123 modules (62 cs, 60 gfx, edc5d4c7), 6650/6650 pointers, spirv-val vulkan1.3 clean. Wine 300 s (local GPU):
+    ~16k modules / 86k pointers guarded, no pipeline failures, state 3 + presses, 0 warnings.
+  - Cost: every module changes -> driver pipeline cache misses on the first run with the switch.
