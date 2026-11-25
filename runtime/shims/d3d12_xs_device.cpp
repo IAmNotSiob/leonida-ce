@@ -924,6 +924,142 @@ std::uint64_t xs_gpu_address(std::uint64_t address, std::uint64_t size) {
     return xs_va_from_cpu(copy);
 }
 
+// HACK (fspx CB analysis, LEONIDA_CE_CBV_SHADOW=1 on / =2 on + change log; default OFF = old ring snapshot, agA23): constant-buffer views on title
+// memory (device slot 17) used to be a ONE-TIME copy into the 64 MiB console upload ring (xs_upload_alloc). That
+// copy is (a) never refreshed (the title fills or updates its constants after CreateConstantBufferView, as
+// SNAP_RESYNC measured for vertex data: "snapshot was stale"), and (b) overwritten when the ring wraps
+// (xs_upload_alloc has no lifetime tracking; ring snapshots of vertex/index data, ROOT_SPILL arrays and RECT_VS
+// vertices wrap it every few hundred frames, and SNAP_RESYNC writes stale vertex snapshots over reused ring
+// ranges). A descriptor that lives longer than one ring wrap then hands the shader unrelated bytes: the fspx blur
+// radius (cs_d5613de2 / cs_d94af257: s_buffer_load CB+0x43c, V# at table s4+0xca0) becomes garbage and the
+// -r..+r loop never ends; cs_edc5d4c7 reads a heap index from CB+0x40 and loads a garbage V# with it.
+// Instead: one stable arena shadow per (title address, size), allocated from a DEFAULT buffer in the arena
+// (host-coherent, so the CPU writes it through g_arena_mapped), copied at creation and re-copied (only what
+// changed, compared against a host copy) before every ExecuteCommandLists. Shadows are never freed or moved, so a
+// descriptor stays valid for the life of the process; when the pool is full the old ring snapshot is used (logged).
+int xs_cbv_shadow_mode() {
+    static const int mode = [] { const char* v = std::getenv("LEONIDA_CE_CBV_SHADOW"); return v ? std::atoi(v) : 0; }();
+    return mode;
+}
+struct XsCbvShadow {
+    std::uint64_t title = 0;
+    std::uint32_t size = 0;
+    std::uint64_t va = 0;                // arena VA the V# names
+    std::vector<std::uint8_t> last;      // host copy of what the shadow holds (compare without reading the arena)
+    bool told_change = false;
+};
+std::mutex g_cbv_mu;
+std::map<std::pair<std::uint64_t, std::uint32_t>, std::size_t> g_cbv_index;  // (title, size) -> g_cbv slot
+std::deque<XsCbvShadow> g_cbv;
+ID3D12Resource* g_cbv_pool = nullptr;
+std::uint64_t g_cbv_pool_va = 0, g_cbv_pool_size = 0, g_cbv_pool_used = 0;
+bool g_cbv_pool_failed = false;
+std::atomic<std::uint64_t> g_cbv_syncs{0}, g_cbv_changed_bytes{0}, g_cbv_changed_views{0};
+
+// Under g_cbv_mu. A DEFAULT buffer lands in the arena (VA = arena offset), so g_arena_mapped + VA is its CPU view.
+bool xs_cbv_pool_ready(ID3D12Device* dev) {
+    if (g_cbv_pool) return true;
+    if (g_cbv_pool_failed || !dev || !g_arena_mapped) return false;
+    std::uint64_t mib = 64;
+    if (const char* v = std::getenv("LEONIDA_CE_CBV_SHADOW_MB")) mib = std::strtoull(v, nullptr, 0);
+    if (mib < 1) mib = 1;
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC d{};
+    d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    d.Width = mib << 20;
+    d.Height = 1;
+    d.DepthOrArraySize = 1;
+    d.MipLevels = 1;
+    d.SampleDesc.Count = 1;
+    d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* r = nullptr;
+    const HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                    __uuidof(ID3D12Resource), reinterpret_cast<void**>(&r));
+    const std::uint64_t va = SUCCEEDED(hr) && r ? r->GetGPUVirtualAddress() : 0;
+    if (!va || va + d.Width > g_arena_size) {  // must be arena memory the CPU can reach
+        if (r) r->Release();
+        g_cbv_pool_failed = true;
+        std::fprintf(stderr, "[hack] CBV_SHADOW: no arena pool (hr 0x%08lx va 0x%llx); CBVs keep the ring snapshot\n",
+                     (unsigned long)hr, (unsigned long long)va);
+        std::fflush(stderr);
+        return false;
+    }
+    g_cbv_pool = r;  // held for the life of the process
+    g_cbv_pool_va = va;
+    g_cbv_pool_size = d.Width;
+    std::fprintf(stderr, "[hack] CBV_SHADOW: pool %llu MiB at arena VA 0x%llx\n", (unsigned long long)mib,
+                 (unsigned long long)va);
+    std::fflush(stderr);
+    return true;
+}
+
+// The arena VA a CBV on title memory [title, title + size) should name, or 0 (caller falls back to the ring).
+std::uint64_t xs_cbv_shadow(ID3D12Device* dev, std::uint64_t title, std::uint32_t size) {
+    if (xs_cbv_shadow_mode() <= 0 || !title || !size) return 0;
+    std::lock_guard lock(g_cbv_mu);
+    if (!xs_cbv_pool_ready(dev)) return 0;
+    XsCbvShadow* e = nullptr;
+    auto it = g_cbv_index.find({title, size});
+    if (it != g_cbv_index.end()) {
+        e = &g_cbv[it->second];
+    } else {
+        const std::uint64_t at = (g_cbv_pool_used + 255) & ~255ull;
+        if (at + size > g_cbv_pool_size) {
+            static std::atomic<int> told{0};
+            if (told++ < 4) {
+                std::fprintf(stderr, "[hack] CBV_SHADOW: pool full (%zu views); CBV at 0x%llx (+0x%x) falls back to the ring\n",
+                             g_cbv.size(), (unsigned long long)title, size);
+                std::fflush(stderr);
+            }
+            return 0;
+        }
+        g_cbv_pool_used = at + size;
+        g_cbv_index[{title, size}] = g_cbv.size();
+        g_cbv.push_back({title, size, g_cbv_pool_va + at, std::vector<std::uint8_t>(size), false});
+        e = &g_cbv.back();
+    }
+    // Copy now as well: the first use may come before the next ExecuteCommandLists refresh.
+    std::memcpy(e->last.data(), reinterpret_cast<const void*>(title), size);
+    std::memcpy(g_arena_mapped + e->va, e->last.data(), size);
+    return e->va;
+}
+
+// Before every ExecuteCommandLists: bring each shadow up to date with the title bytes (only changed ones written).
+void xs_cbv_shadow_refresh() {
+    if (xs_cbv_shadow_mode() <= 0) return;
+    std::lock_guard lock(g_cbv_mu);
+    if (!g_cbv_pool) return;
+    std::uint64_t bytes = 0, views = 0;
+    for (XsCbvShadow& e : g_cbv) {
+        const auto* src = reinterpret_cast<const std::uint8_t*>(e.title);
+        if (!xs_readable(src, e.size)) continue;  // released title memory: keep the last contents
+        if (std::memcmp(e.last.data(), src, e.size) == 0) continue;
+        std::memcpy(e.last.data(), src, e.size);
+        std::memcpy(g_arena_mapped + e.va, e.last.data(), e.size);
+        bytes += e.size;
+        ++views;
+        if (!e.told_change && xs_cbv_shadow_mode() >= 2) {  // =2: proof that the title updates CBs after the view
+            e.told_change = true;
+            static std::atomic<int> told{0};
+            if (told++ < 24) {
+                std::fprintf(stderr, "[hack] CBV_SHADOW: title 0x%llx (+0x%x) changed after its view was made (shadow VA 0x%llx)\n",
+                             (unsigned long long)e.title, e.size, (unsigned long long)e.va);
+                std::fflush(stderr);
+            }
+        }
+    }
+    g_cbv_changed_bytes += bytes;
+    g_cbv_changed_views += views;
+    const std::uint64_t k = ++g_cbv_syncs;
+    if ((k & (k - 1)) == 0 || (k & 4095) == 0) {
+        std::fprintf(stderr, "[hack] CBV_SHADOW: %llu syncs, %zu views, %llu KiB pool used, %llu views / %llu KiB refreshed in all\n",
+                     (unsigned long long)k, g_cbv.size(), (unsigned long long)(g_cbv_pool_used >> 10),
+                     (unsigned long long)g_cbv_changed_views.load(), (unsigned long long)(g_cbv_changed_bytes.load() >> 10));
+        std::fflush(stderr);
+    }
+}
+
 // HACK (Leonida CE boot; slots from Marvisak/VIctory, GPLv3): resources at title addresses (device slot 133) and
 // views of them (slots 70/71: (resource desc, view desc, handle), the PC view description followed by the title
 // address at +40). The resources are stand-ins not backed by the title's memory yet.
@@ -3613,6 +3749,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                 ? reinterpret_cast<ID3D12CommandList* const*>(console_lists.data()) : lists;
             if (!g_upload_queue.load() && q->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) g_upload_queue = q;
             if (n && q->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) xs_refresh_placed_buffers(q);
+            if (n) xs_cbv_shadow_refresh();  // fspx CB analysis: every queue (the fspx passes also run on compute)
             if (n && real_lists) q->ExecuteCommandLists(n, real_lists);
             if (n && lists) xs_schedule_list_writes(q, n, reinterpret_cast<const std::uint64_t*>(lists));
             return 0;
@@ -3692,6 +3829,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         if constexpr (K == ChildKind::queue && (Slot == kQueueSignal || Slot == kQueueWait)) a1 = unwrap_object(a1);
         UnwrappedArray unwrapped_lists;
         if constexpr (K == ChildKind::queue && Slot == 10) {
+            if (a1) xs_cbv_shadow_refresh();  // fspx CB analysis: PC-slot ExecuteCommandLists as well
             if (!unwrapped_lists.fill(a2, a1)) return hr_to_u64(E_OUTOFMEMORY);
             if (unwrapped_lists.data()) a2 = unwrapped_lists.data();
         }
@@ -4583,7 +4721,11 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                     xs_readable(reinterpret_cast<const void*>(cbv.BufferLocation), cbv.SizeInBytes)) {
                     // HACK (Leonida CE boot): constants in the title's own memory, which the GPU cannot read here yet:
                     // snapshot them into the arena when the view is made (VIctory copies changed title memory).
-                    if (const std::uint64_t copy = xs_upload_alloc(cbv.SizeInBytes, 256)) {
+                    // fspx CB analysis: a stable, refreshed arena shadow first (see xs_cbv_shadow); the ring copy
+                    // below is the fallback (stale after the title's next write, clobbered when the ring wraps).
+                    if (const std::uint64_t shadow = xs_cbv_shadow(self->real, cbv.BufferLocation, cbv.SizeInBytes)) {
+                        cbv.BufferLocation = shadow;
+                    } else if (const std::uint64_t copy = xs_upload_alloc(cbv.SizeInBytes, 256)) {
                         std::memcpy(reinterpret_cast<void*>(copy), reinterpret_cast<const void*>(cbv.BufferLocation),
                                     cbv.SizeInBytes);
                         cbv.BufferLocation = xs_va_from_cpu(copy);
