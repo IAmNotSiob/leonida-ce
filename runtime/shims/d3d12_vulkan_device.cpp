@@ -2509,18 +2509,82 @@ public:
             }
             return S_OK;
         }
+        HRESULT hr = S_OK;
         if (image_) {
             VkImageSubresourceRange range{};
-            return !data && cpu_visible() && subresource != leonida::all_subresources &&
-                           leonida::image_range(binding_, subresource, range)
-                       ? S_OK
-                       : E_INVALIDARG;
+            hr = !data && cpu_visible() && subresource != leonida::all_subresources &&
+                         leonida::image_range(binding_, subresource, range)
+                     ? S_OK
+                     : E_INVALIDARG;
+        } else if (!mapped_ || subresource != 0) {
+            hr = E_INVALIDARG;
+        } else if (read && read->Begin < read->End && read->End > desc_.Width) {
+            hr = E_INVALIDARG;
+        } else {
+            if (data) *data = mapped_;
+            return S_OK;
         }
-        if (!mapped_ || subresource != 0) return E_INVALIDARG;
-        if (read && read->Begin < read->End && read->End > desc_.Width) return E_INVALIDARG;
-        if (data) *data = mapped_;
+        if (SUCCEEDED(hr)) return hr;
+        // HACK (Leonida CE agA7): on the console all memory is CPU-visible, and the title maps DEFAULT-heap buffers
+        // and textures (rage grcBuffer lock 0x145121550, from 0x14501ea20: a failed lock left a null base and the
+        // title wrote base+0xa0 right after the TERMS Confirm). LEONIDA_CE_MAP_ANY (default 1; 0 = off):
+        //  - a buffer in the arena (placed or ring) maps its arena bytes, the same memory the GPU reads;
+        //  - a buffer with host-visible memory of its own is mapped through Vulkan;
+        //  - anything else (LEONIDA_CE_MAP_ANY=2 only) gets a zeroed CPU shadow the GPU never sees.
+        static const int map_any = [] {
+            const char* v = std::getenv("LEONIDA_CE_MAP_ANY");
+            return v && v[0] ? std::atoi(v) : 1;
+        }();
+        static std::atomic<int> told{0};
+        const int n = told++;
+        void* got = nullptr;
+        const char* how = "fail";
+        if (map_any && data) {
+            if (!image_ && (in_arena_ || placed_) && !host_import_ && device_.arena.mapped) {
+                got = device_.arena.mapped + va_;
+                how = "arena";
+            } else if (!image_ && memory_ && (memory_flags_ & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+                auto& vk = device_.context->vk;
+                void* p = nullptr;
+                if (vk.vkMapMemory(device_.info.device, memory_, 0, VK_WHOLE_SIZE, 0, &p) == VK_SUCCESS && p) {
+                    mapped_ = p;
+                    got = p;
+                    how = "vkmap";
+                }
+            }
+            if (!got && map_any >= 2) {
+                if (!shadow_) {
+                    std::uint64_t bytes = desc_.Width;
+                    if (image_) {
+                        bytes = std::uint64_t(desc_.Width) * std::max<UINT>(1, desc_.Height) * 16ull *
+                                std::max<UINT>(1, desc_.DepthOrArraySize) * 2ull;
+                    }
+                    bytes = std::max<std::uint64_t>(bytes, 0x10000) + 0x10000;
+                    shadow_ = std::calloc(1, std::size_t(bytes));
+                }
+                got = shadow_;
+                how = "shadow";
+            }
+        }
+        if (n < 48) {
+            std::fprintf(stderr,
+                         "[hack] Map(%u) %s %s heap=%d dim=%d %llux%u fmt=%d flags=0x%x placed=%d arena=%d va=%llx "
+                         "mem=0x%x read=%llu-%llu ret=%p -> %s %p\n",
+                         subresource, image_ ? "texture" : "buffer", placed_ ? "placed" : "own",
+                         static_cast<int>(heap_.Type), static_cast<int>(desc_.Dimension),
+                         static_cast<unsigned long long>(desc_.Width), desc_.Height, static_cast<int>(desc_.Format),
+                         static_cast<unsigned>(desc_.Flags), placed_ ? 1 : 0, in_arena_ ? 1 : 0,
+                         static_cast<unsigned long long>(va_), static_cast<unsigned>(memory_flags_),
+                         read ? static_cast<unsigned long long>(read->Begin) : 0ull,
+                         read ? static_cast<unsigned long long>(read->End) : 0ull, __builtin_return_address(0), how,
+                         got);
+            std::fflush(stderr);
+        }
+        if (!got) return hr;
+        *data = got;
         return S_OK;
     }
+    void* shadow_ = nullptr;
     void STDMETHODCALLTYPE Unmap(UINT, const D3D12_RANGE*) override {}
 
     // CPU copies into and out of a texture subresource. D3D12 completes them before returning and leaves it to

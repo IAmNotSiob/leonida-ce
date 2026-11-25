@@ -786,3 +786,113 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   with the swizzle on); the long policy body is not seen in either build. dstorage comp=14 raw req (re11): dw0 0x0020000e
   (comp 14, byte 2 = 0x20 = dest type?), dw2/3 = dest 0xd849aa358 (0x30 apart = array of destination descriptors, NOT
   memory: zero-fill unsafe), dw6 0x10000 = dest size, dw8/9 file ptr, dw10 offset, dw12 compressed size.
+
+## agA7 (sender gen 7, 2026-11-25)
+- Post-TERMS crash (re11/re12, game+0x501eb50 write to 0xa0), Very likely: 0x14501ea20 (called via 0x140164474)
+  calls 0x144db7900 = thunk to 0x145121550 = rage grcBuffer lock. It picks the resource record at [obj+(frame%n)*8];
+  record+0x20 = ID3D12Resource*, and it calls vtable+0x40 = Map(sub, range, &p). A texture (flags&0x1f80 == 0x980) uses
+  Map(0, layout range); otherwise Map(record sub, {0,size}). If HRESULT < 0 it returns false, the base stays null, and
+  0x14501ea20 writes 0x80 x 0x5c0 bytes at base+0xa0 anyway. Our Resource::Map refused DEFAULT-heap buffers
+  (mapped_ is only set for UPLOAD/READBACK) and textures without console_va_. On the console every heap is CPU-visible.
+- Build 30: LEONIDA_CE_MAP_ANY (default 1). A refused buffer Map returns arena.mapped+va_ (placed/arena buffers:
+  the same bytes the GPU reads), or vkMapMemory for host-visible own memory. =2 also hands anything else a zeroed CPU
+  shadow (calloc; the GPU never sees it). Logs the first 48 refused Maps ("[hack] Map(..) .. -> arena|vkmap|shadow|fail").
+  Wine sg1 (state 1): no refused Maps.
+- re12 (B, build 29): the saved profile skips first-boot; Confirm at t~118, crash at t=136.4. Same stack.
+- re13 (build 30, B, MAP_ANY=2): +0x501eb50 AV GONE (Very likely fixed). All 48 refused Maps were the same kind:
+  DEFAULT-heap (heap=1) UAV buffers in the arena (RING_IN_ARENA), placed=0, 9 buffers (3 x 27440, 3 x 188416,
+  3 x 1144064, triple-buffered), caller 0x14512176E, -> "arena". No vkmap/shadow/fail, so MAP_ANY=1 would be enough.
+  Confirm at t=155.6 -> flat navy (#2c2020 BGRA). At t=180.8: int3 skipped at game+0xf7c5c (assert: range outside
+  pool cpu [0x149e1dac0]=0x1800e0000 size [..c8]=0x600000000; gpu base [..d0]=0x7800e0000, from the Wine sg2 log),
+  then dstorage worker memcpy (dstorage_x.cpp:228, comp=1) first-chance AVs at 0x1cd7d40000/0x1cd7f40000, int3 at
+  game+0xf2cc4b (XMemMapPhysicalPagesScatter at 0x145f3fd20 returned FALSE; caller 0x140f2cc43), and
+  "CopyPageMappingsBatchX: a page mapping failed (pool E52E00000, error 487)". Then no presents for 76 s; the process
+  died at 261 s. 0x1cd7d40000 = 0xE52E00000 + 0xE84F40000: it looks like the tiled pool base was added to an address
+  that was already absolute (Trust me bro).
+- Build 31: diagnostics only. Scatter calls and failure reasons are logged, along with the pool globals. Dstorage
+  logs "odd dst" for destinations that are free, reserved but not mapped, or in 0x1000000000..0x1fffffffff.
+- re14 (build 31, B): EARLY crash in state 3 at t=80.9, before any press, never reached TERMS. It began with an
+  int3 at game+0x2474606, a deliberate fatal path: call [0x1467939c8] = SetUnhandledExceptionFilter(rsi), then int3,
+  i.e. a rage Quitf/crash-dump trigger; the vtable 0x420 call and 0x145f3fda0 come just before it. A cascade of AVs
+  followed (0xd0002b0ff at +0x43a6b7a, exec 0, ...). Build 31 adds only logging; Scatter had no failures (only 7 calls,
+  all at init), and there was no "odd dst" and no error 487. Probably a nondeterministic title fatal (Plausible); RTDIAG_EVERY=30
+  makes frames slower, which may trip a watchdog (Trust me bro). Needs a rerun (re14b) of build 31, then build 30 if it
+  repeats.
+- Status: build 30 = the fix (MAP_ANY). The post-Confirm screen is still flat navy; what follows is a texture-streaming
+  burst ~25 s later and the Scatter/CopyPageMappings failure, with diagnostics in build 31 still unread.
+- re14b (build 31 rerun, B): passed Confirm again (13 -> 0 at t=158.1), so re14 was a flake (Likely). It had NO Scatter
+  failures and NO odd dst. "CopyPageMappingsBatchX: a page mapping failed (pool E52E00000, error 0)": error 0 means
+  no API failed, so a range check failed in copy_page_mappings_x (inside(): range.start+count > pool_pages, or a
+  kind > 3), or map_alias returned false without SetLastError (Likely). Then at t=188.2 an int3 at game+0x4da6315 and
+  an AV write 0xbf521b75 at +0x4da63f8, then no presents ([hang] 56 s; main game thread tid 3976 blocked in a wait at
+  game+0x23cf729 <- +0x8126a7 <- +0x53ec040).
+  NEXT: log each failing CopyPageMappingsBatchX range (batch dest, kind, start, count, pool_pages, which check
+  failed), and decompile +0x4da6315/+0x4da63f8 and the wait at +0x23cf729.
+
+## agA8 (sender gen 8, 2026-11-25)
+- Texture pool mechanics (Definite, disassembly of game+0xf2c4xx..0xf2cd17 and 0x141e6c110):
+  - 0x141e6c110(size) XMemVirtualAlloc-s three windows: the CPU title pool [0x149e1dac0] = 0x1800e0000 (24 GiB VA), its GPU
+    mirror [0x149e1dad0] = 0x7800e0000, and the page pool [0x1471bfaa8] = 0xe52e00000.
+  - It allocates 99776 physical pages and XMemMapPhysicalPages-es them all at the page pool; device slot 74 registers the
+    pool (va, pages).
+  - The title keeps the pool's free list itself: head dword 0x1471bfcd8, tail +4, free count 0x1471bfce0, links in a
+    packed 21-bit array at [0x1471bfcd0], 0x1fffff = end. Pool page j's physical page number /16 sits in the packed array
+    [0x1471bfcc0].
+  - GPU slot table [0x1471bfb08][idx]: pool page index in bits 20..40; the low 15 bits must be non-zero.
+  - The only CopyPageMappingsBatchX caller is game+0xf2cc7f, with args (count, batches, pool = [0x1471bfaa8], pages =
+    dword at 0x1471bfaca = size>>16, 0).
+    - Map: batch.dest = gpu base + idx*64K, range {kind 1, start = free-list head, count 1}.
+    - Unmap: {kind 2, start 0, count n}. The freed pool page comes from 0x14221ba60(idx), which returns -1 for an empty
+      slot, and the -1 is pushed onto the free list unchecked.
+  - The same pool page indices drive XMemMapPhysicalPagesScatter for the CPU view (0x140f2cc3e): entry {lo = pool page or
+    -1, hi = cpu idx}, where -1 unmaps.
+- re14b "CopyPageMappingsBatchX ... error 0" must come from a range check (Likely): kind 1 with start >= 99776, i.e. a
+  free-list head of 0x1fffff or 0xffffffff (exhausted, or a -1 pushed by an unmap of an empty slot). re13's Scatter FALSE +
+  487 fits the same bad index.
+- game+0x4da6315 (Definite by reading): the int3 at the end of 0x144da62d0, which looks up the region (a {start,size} table,
+  0x18 each) that contains a pointer. No region -> int3 -> returns 0 -> 0x144da6330 writes through the unrelocated
+  pointer (AV at +0x4da63f8). Probably a streamed resource whose bytes are wrong (a consequence, Plausible).
+- game+0x23cf729 (main thread wait): a 1 ms sleep loop until 0x1423cb280() is true, i.e. a render/stream sync. It is a
+  consequence of the other thread dying.
+- game+0xf7c5c: a range assert in 0x1400f7c20 for an address outside the CPU pool [0x149e1dac0, +[0x149e1dac8]).
+- Build 32:
+  - a log line per failing range, and periodic stats with the title's free-list head/tail/free;
+  - map_alias failure reasons with the host VirtualQuery state;
+  - int3_skipped events carry registers and a stack;
+  - LEONIDA_CE_PAGECOPY_LENIENT (default 1): a failing range, or a source pool page that is not mapped, unmaps the
+    destination (the console copies an invalid PTE) instead of failing.
+  - Wine sh1: stats lines OK, 0 failed ranges, state 1.
+- re15 (build 32, B6, 300 s):
+  - Confirm at t=153.4. NO crash and NO hang to the 300 s stop (re14b died at 188 s), so the lenient page copies helped (Likely).
+  - Boot stays "state 0 task 5 inner 5". About 12-14 fps, dipping to about 8 fps at t~165-190.
+  - Free count never low (88-98k of 99776), so the pool is not exhausted (CORRECTS the guess above).
+  - The only failures were 6 kind-1 maps at call 123 (t~180-188). Their destinations, 0x11800e0000 and 0x12300c0000..0x1230040000,
+    are gpu base + slots 0xA0000..0xAAFFE. Those lie past the title's 0x60000-slot window, in host MEM_FREE memory.
+  - Same slot on the CPU side: the int3 at game+0xf7c5c has r14 = 0xb800e0000 = cpu base + 0xA0000<<16, caller 0x145238556
+    (stack +0x523857e <- +0x14c740 <- +0x50143bc .. worker +0x2215eca).
+  - The slot comes from the title's slot buddy allocator 0x145238780:
+    - order lists: dwords at 0x1471bfb24 + 4*order; max order [0x1471bfb1c];
+    - table [0x1471bfb08], 8 bytes per slot: bits 15-19 order, 18-19 state, 20-40 pool page, 41-61 next;
+    - count [0x1471bfb18] = 0x60000, seeded as order 18 @0 + order 17 @0x40000 by 0x14555b0f0.
+    - The free path 0x14221b7d0 bounds-checks the buddy against count, so a slot >= 0x60000 means the lists were corrupted
+      (a race on lock 0x1471bfad8, or a bad entry: unknown, Plausible).
+  - Screen (/root/rb/re15d, montage /root/rb/re15-montage.png):
+    - f840-1200: navy with footer "ACCOUNT PICKER (Y)  PLAYER (A)";
+    - f1230-1710: near-black (17,17,17);
+    - f1740-1950: plain navy;
+    - from ~f1980: the presented image is ALL ZERO (black). Dumps are only written for non-zero images, which is why they stop.
+      target0 stays navy (ff2c2020).
+- Next:
+  - Find who corrupts the slot buddy lists. Watch [0x1471bfb24..] for values >= 0x60000, e.g. from the CopyPageMappings hook
+    (it runs after every streaming step), and log the first bad head with the table entries.
+  - Or clamp: a slot past count -> treat as allocation failure. That needs a code patch of 0x145238780 (return 0x1fffff).
+  - Then find why the presented image goes black after the page failure.
+- re16 (build 32, env-only, 600 s planned):
+  - Confirm at t=175.3, then an AV at t=223.3 at game+0x28c8f86 reading 0xffffffffffffffff.
+    Stack: +0x56eba8 <- +0x2a896aa <- +0xfc247 <- +0x4f99784 <- ... <- worker +0x2215eca.
+  - There were no CopyPageMappings failures, no f7c5c, and fewer than 128 calls.
+  - Presents stopped at f2820 and the process died at 281 s.
+  - So the post-Confirm stretch is still unstable, with a different site each run (nondeterministic, like re14). Screens as in re15.
+  - target0/1 dumps are in /root/rb/re16t.
+- Build 33 = build 32 + "[hack] slot buddy" watch (see /root/handoff/build-33.txt). Wine sh2 OK. re17 (build 33, 300 s) was handed to
+  B at the end of agA8.

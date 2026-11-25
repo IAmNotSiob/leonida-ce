@@ -206,7 +206,18 @@ inline bool skip_int3(EXCEPTION_POINTERS* info) {
         const std::lock_guard lock(m);
         first = seen.insert(at).second;
     }
-    if (first) event("int3_skipped", "\"at\":" + quote(where(reinterpret_cast<uint64_t>(at))));
+    if (first) {
+        // agA8: registers and stack too, so a soft assert's caller and operands can be read from the trace.
+        const CONTEXT& c = *info->ContextRecord;
+        std::string f = "\"at\":" + quote(where(reinterpret_cast<uint64_t>(at)));
+        try {
+            f += ",\"rax\":" + quote(hex(c.Rax)) + ",\"rbx\":" + quote(hex(c.Rbx)) + ",\"rcx\":" + quote(hex(c.Rcx)) +
+                 ",\"rdx\":" + quote(hex(c.Rdx)) + ",\"rsi\":" + quote(hex(c.Rsi)) + ",\"rdi\":" + quote(hex(c.Rdi)) +
+                 ",\"r8\":" + quote(hex(c.R8)) + ",\"r14\":" + quote(hex(c.R14)) + ",\"stack\":" + stack_from(c);
+        } catch (...) {
+        }
+        event("int3_skipped", f);
+    }
     info->ContextRecord->Rip += 1;
     return true;
 }

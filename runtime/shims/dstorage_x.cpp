@@ -376,6 +376,23 @@ bool special(Probe* self, int slot, uintptr_t a, uintptr_t b, uintptr_t c, uintp
     if (std::strcmp(self->name, "queue") == 0 && slot == 3) {  // EnqueueRequest(request*)
         if (!a || IsBadReadPtr(reinterpret_cast<void*>(a), 0x38)) { *result = S_OK; return true; }
         const Req r = parse_request(reinterpret_cast<void*>(a));
+        {   // DIAGNOSTIC (agA7): a destination outside every title range (re13: memcpy faults at 0x1cd7d40000)
+            const auto d = reinterpret_cast<uintptr_t>(r.dst);
+            MEMORY_BASIC_INFORMATION mi{};
+            const bool q = VirtualQuery(r.dst, &mi, sizeof mi) != 0;
+            if (!q || mi.State == MEM_FREE || (mi.State == MEM_RESERVE && mi.Type != MEM_MAPPED) || (d >> 36) == 1) {
+                static std::atomic<int> told{0};
+                if (told++ < 12 && !IsBadReadPtr(reinterpret_cast<void*>(a), 0x48)) {
+                    const auto* w = reinterpret_cast<const uint32_t*>(a);
+                    std::fprintf(stderr, "[dstorage] odd dst %p (state 0x%lx type 0x%lx base %p) comp=%u size %u file %ls off 0x%llx raw:",
+                                 r.dst, q ? mi.State : 0ul, q ? mi.Type : 0ul, q ? mi.AllocationBase : nullptr, r.comp,
+                                 r.dst_size, r.f ? r.f->path : L"?", (unsigned long long)r.off);
+                    for (int i = 0; i < 18; ++i) std::fprintf(stderr, " %08x", w[i]);
+                    std::fprintf(stderr, "\n");
+                    std::fflush(stderr);
+                }
+            }
+        }
         if (r.comp > 1) {  // DIAGNOSTIC (agA6): raw request bytes of compressed formats we do not decode (BCPack = 14)
             static std::atomic<int> told{0};
             if (told++ < 8 && !IsBadReadPtr(reinterpret_cast<void*>(a), 0x48)) {

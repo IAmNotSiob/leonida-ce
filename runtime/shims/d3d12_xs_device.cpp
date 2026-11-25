@@ -2995,6 +2995,14 @@ struct XsPageBatch {
 static_assert(sizeof(XsPageRange) == 12 && sizeof(XsPageBatch) == 24 && offsetof(XsPageBatch, ranges) == 16,
               "CopyPageMappingsBatchX structures follow VIctory's repr(C) layout");
 
+// HACK (agA8) diagnostics: the title keeps its pool free list in globals (game+0x71bfcd8 head, +0x71bfcdc tail,
+// +0x71bfce0 free count; 21-bit pool page indices, 0x1fffff = end). Read them safely for the log.
+static void a8_pool_freelist(std::uint32_t (&g)[3]) {
+    const void* gp = reinterpret_cast<const void*>(std::uintptr_t{0x1471bfcd8});
+    g[0] = g[1] = g[2] = 0xdeadbeef;
+    if (!IsBadReadPtr(gp, sizeof g)) std::memcpy(g, gp, sizeof g);
+}
+
 HRESULT copy_page_mappings_x(std::uint32_t count, const XsPageBatch* batches, std::uint64_t pool,
                              std::uint32_t pool_pages) {
     constexpr std::uint64_t kPage = 0x10000;
@@ -3003,8 +3011,57 @@ HRESULT copy_page_mappings_x(std::uint32_t count, const XsPageBatch* batches, st
         std::fprintf(stderr, "[rt] d3d12_xs: CopyPageMappingsBatchX first call: %u batch(es), pool %p, %u pool pages\n",
                      count, reinterpret_cast<void*>(pool), pool_pages);
     }
+    // agA8: LEONIDA_CE_PAGECOPY_LENIENT (default 1): a range the console would turn into invalid PTEs (pool page index
+    // past the pool, unknown kind, unmapped source) unmaps its destination pages instead of failing, so no stale alias
+    // stays visible.
+    static const bool lenient = [] { const char* v = std::getenv("LEONIDA_CE_PAGECOPY_LENIENT"); return !v || *v != '0'; }();
+    static std::atomic<std::uint64_t> calls{0}, n_ranges[5]{}, n_pages[5]{}, n_fail{0};
+    static std::atomic<int> fail_told{0};
+    const std::uint64_t call_no = calls.fetch_add(1, std::memory_order_relaxed);
+    {
+        // agA8 (build 33): watch the title's slot buddy allocator (0x145238780) for a free-list head past its slot count
+        // (re15: slot 0xA0000 of 0x60000 was handed out). Heads: dwords at 0x1471bfb24 + 4*order (0..21); count dword
+        // 0x1471bfb18; table qword* 0x1471bfb08. Logs the first 8 bad observations with the order, head and entry.
+        static std::atomic<int> bad_told{0};
+        std::uint32_t heads[22] = {}, slot_count = 0;
+        std::uint64_t table = 0;
+        const void* hp = reinterpret_cast<const void*>(std::uintptr_t{0x1471bfb24});
+        if (bad_told.load(std::memory_order_relaxed) < 8 && !IsBadReadPtr(hp, sizeof heads)) {
+            std::memcpy(heads, hp, sizeof heads);
+            std::memcpy(&slot_count, reinterpret_cast<const void*>(std::uintptr_t{0x1471bfb18}), 4);
+            std::memcpy(&table, reinterpret_cast<const void*>(std::uintptr_t{0x1471bfb08}), 8);
+            for (int o = 0; o < 22 && slot_count; ++o) {
+                const std::uint32_t h = heads[o];
+                if (h == 0x1fffff || h < slot_count) continue;
+                if (bad_told.fetch_add(1, std::memory_order_relaxed) >= 8) break;
+                std::uint64_t entry = 0;
+                const void* ep = reinterpret_cast<const void*>(table + std::uint64_t{h} * 8);
+                if (table && !IsBadReadPtr(ep, 8)) std::memcpy(&entry, ep, 8);
+                std::fprintf(stderr, "[hack] slot buddy: order %d head 0x%x >= count 0x%x at CopyPageMappings call %llu; "
+                             "table %llx entry %016llx (table+count*8 = %llx)\n", o, h, slot_count,
+                             (unsigned long long)call_no, (unsigned long long)table, (unsigned long long)entry,
+                             (unsigned long long)(table + std::uint64_t{slot_count} * 8));
+                std::fflush(stderr);
+            }
+        }
+    }
     const auto map = rt::xmem::map_alias_hook().load(std::memory_order_acquire);
     bool ok = map != nullptr;
+    const auto tell = [&](std::uint32_t b, const XsPageBatch& batch, std::uint32_t r, const XsPageRange& range,
+                          std::uint64_t at, const char* why) {
+        n_fail.fetch_add(1, std::memory_order_relaxed);
+        if (fail_told.fetch_add(1, std::memory_order_relaxed) >= 64) return;
+        std::uint32_t g[3];
+        a8_pool_freelist(g);
+        std::fprintf(stderr,
+                     "[hack] CopyPageMappingsBatchX call %llu batch %u/%u dest %llx range %u/%u at %llx: kind %u start "
+                     "%u (0x%x) count %u; pool %llx pages %u: %s (error %lu); freelist head 0x%x tail 0x%x free %d%s\n",
+                     (unsigned long long)call_no, b, count, (unsigned long long)batch.destination, r, batch.count,
+                     (unsigned long long)at, range.kind, range.start, range.start, range.count,
+                     (unsigned long long)pool, pool_pages, why, static_cast<unsigned long>(GetLastError()), g[0], g[1],
+                     static_cast<int>(g[2]), lenient ? " -> unmapped (lenient)" : "");
+        std::fflush(stderr);
+    };
     if (map && count && batches) {
         for (std::uint32_t b = 0; b < count; ++b) {
             const XsPageBatch& batch = batches[b];
@@ -3015,29 +3072,56 @@ HRESULT copy_page_mappings_x(std::uint32_t count, const XsPageBatch* batches, st
                 const std::uint64_t len = std::uint64_t{range.count} * kPage;
                 const auto inside = [&](std::uint64_t pages) { return std::uint64_t{range.start} + pages <= pool_pages; };
                 const std::uint64_t source = pool + std::uint64_t{range.start} * kPage;
+                const unsigned k = range.kind < 4 ? range.kind : 4;
+                n_ranges[k].fetch_add(1, std::memory_order_relaxed);
+                n_pages[k].fetch_add(range.count, std::memory_order_relaxed);
+                bool good = true;
+                const char* why = "map_alias failed";
+                SetLastError(0);
                 switch (range.kind) {
                 case 0:
-                    ok &= inside(range.count) && map(at, source, len);
+                    if (!inside(range.count)) { good = false; why = "kind 0 range past the pool"; break; }
+                    good = map(at, source, len);
                     break;
                 case 1:
-                    if (!inside(1)) {
-                        ok = false;
-                        break;
-                    }
-                    for (std::uint32_t k = 0; k < range.count; ++k) ok &= map(at + k * kPage, source, kPage);
+                    if (!inside(1)) { good = false; why = "kind 1 start past the pool"; break; }
+                    for (std::uint32_t q = 0; q < range.count; ++q) good &= map(at + q * kPage, source, kPage);
                     break;
                 case 2:
-                    ok &= map(at, 0, len);
+                    good = map(at, 0, len);
+                    if (!good) why = "unmap failed";
                     break;
                 case 3:
                     break;
                 default:
-                    ok = false;
+                    good = false;
+                    why = "unknown kind";
                     break;
                 }
+                if (!good) {
+                    tell(b, batch, r, range, at, why);
+                    if (lenient && map(at, 0, len)) good = true;
+                }
+                ok &= good;
                 at += len;
             }
         }
+    }
+    if ((call_no & 1023) == 1023 || (call_no < 4096 && (call_no & (call_no + 1)) == 0)) {
+        std::uint32_t g[3];
+        a8_pool_freelist(g);
+        std::fprintf(stderr,
+                     "[hack] CopyPageMappingsBatchX stats after %llu calls: ranges/pages kind0 %llu/%llu kind1 %llu/%llu "
+                     "kind2 %llu/%llu kind3 %llu/%llu other %llu/%llu; failed ranges %llu; freelist head 0x%x tail 0x%x "
+                     "free %d\n",
+                     (unsigned long long)(call_no + 1), (unsigned long long)n_ranges[0].load(),
+                     (unsigned long long)n_pages[0].load(), (unsigned long long)n_ranges[1].load(),
+                     (unsigned long long)n_pages[1].load(), (unsigned long long)n_ranges[2].load(),
+                     (unsigned long long)n_pages[2].load(), (unsigned long long)n_ranges[3].load(),
+                     (unsigned long long)n_pages[3].load(), (unsigned long long)n_ranges[4].load(),
+                     (unsigned long long)n_pages[4].load(), (unsigned long long)n_fail.load(), g[0], g[1],
+                     static_cast<int>(g[2]));
+        std::fflush(stderr);
     }
     if (!ok) {
         static std::atomic<bool> failure_logged{false};

@@ -21,6 +21,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <limits>
@@ -811,7 +812,44 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
 // RCX is an array of addresses, EDX a 32-bit count, R8 the page for each address (an entry of 0, or a null array,
 // unmaps). The result is tested as a 32-bit BOOL. Like MapUserPhysicalPagesScatter: entry i maps pageArray[i] at
 // addresses[i].
+// HACK (agA7) diagnostics: why a scatter map fails (re13: game+0xf2cc4b asserts on a FALSE right before the title's
+// dstorage writes land outside its pool). Prints the title's pool globals (CPU base 0x149e1dac0, size +8, GPU base +0x10).
+void read_pool_globals(uint64_t (&g)[3]) {
+    const void* gp = reinterpret_cast<const void*>(uintptr_t{0x149e1dac0});
+    if (!IsBadReadPtr(gp, sizeof g)) std::memcpy(g, gp, sizeof g);
+}
+
+void scatter_fail(uint32_t i, uint32_t n, uintptr_t address, uint64_t page, const char* why) {
+    static std::atomic<int> told{0};
+    if (told++ >= 24) return;
+    const DWORD e = GetLastError();
+    uint64_t g[3] = {};
+    read_pool_globals(g);
+    std::fprintf(stderr,
+                 "[hack] XMemMapPhysicalPagesScatter: entry %u/%u address %p page 0x%llx: %s (error %lu); pool cpu %llx "
+                 "size %llx gpu %llx\n",
+                 i, n, reinterpret_cast<void*>(address), static_cast<unsigned long long>(page), why,
+                 static_cast<unsigned long>(e), static_cast<unsigned long long>(g[0]),
+                 static_cast<unsigned long long>(g[1]), static_cast<unsigned long long>(g[2]));
+    std::fflush(stderr);
+    SetLastError(e);
+}
+
 BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_count, const uint64_t* page_array) {
+    {
+        static std::atomic<int> calls{0};
+        if (calls++ < 6 && page_count && addresses) {
+            uint64_t g[3] = {};
+            read_pool_globals(g);
+            std::fprintf(stderr,
+                         "[hack] XMemMapPhysicalPagesScatter(%u): first %p page 0x%llx; pool cpu %llx size %llx gpu "
+                         "%llx; caller %p\n",
+                         page_count, addresses[0], static_cast<unsigned long long>(page_array ? page_array[0] : 0),
+                         static_cast<unsigned long long>(g[0]), static_cast<unsigned long long>(g[1]),
+                         static_cast<unsigned long long>(g[2]), _ReturnAddress());
+            std::fflush(stderr);
+        }
+    }
     if (page_count && !addresses) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
@@ -823,21 +861,29 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_co
     const std::lock_guard lock(g_phys_mutex);
     for (uint32_t i = 0; i < page_count; ++i) {
         const uintptr_t address = reinterpret_cast<uintptr_t>(addresses[i]);
+        const uint64_t page = page_array ? page_array[i] : 0;
         if (!aligned_page_address(address)) {
             SetLastError(ERROR_INVALID_PARAMETER);
+            scatter_fail(i, page_count, address, page, "unaligned");
             return FALSE;
         }
-        const uint64_t page = page_array ? page_array[i] : 0;
         if (page == 0) {
-            if (!unmap_page(address)) return FALSE;
+            if (!unmap_page(address)) {
+                scatter_fail(i, page_count, address, page, "unmap failed");
+                return FALSE;
+            }
             continue;
         }
         const Window* const window = find_window(address, kPhysicalPageSize);
         if (!window) {
             SetLastError(ERROR_INVALID_ADDRESS);
+            scatter_fail(i, page_count, address, page, "no window");
             return FALSE;
         }
-        if (!map_page(address, page, view_protect(*window))) return FALSE;
+        if (!map_page(address, page, view_protect(*window))) {
+            scatter_fail(i, page_count, address, page, g_pages.count(page) ? "map_backing failed" : "unknown page");
+            return FALSE;
+        }
     }
     return TRUE;
 }
@@ -870,6 +916,19 @@ bool xmem_map_alias(uint64_t to, uint64_t from, uint64_t len) {
         }
         const auto source = g_mapped.find(static_cast<uintptr_t>(from + k));
         if (source == g_mapped.end()) {
+            // HACK (agA8): the console copies the source PTE as it is; an unmapped pool page gives an invalid PTE.
+            // LEONIDA_CE_PAGECOPY_LENIENT (default 1) unmaps the destination instead of failing.
+            static const bool lenient = [] { const char* v = std::getenv("LEONIDA_CE_PAGECOPY_LENIENT"); return !v || *v != '0'; }();
+            static std::atomic<int> told{0};
+            if (told++ < 16) {
+                std::fprintf(stderr, "[hack] map_alias: source %llx (for %llx) is not mapped physical memory%s\n",
+                             (unsigned long long)(from + k), (unsigned long long)at, lenient ? "; unmapping the destination" : "");
+                std::fflush(stderr);
+            }
+            if (lenient) {
+                if (!unmap_page(at)) return false;
+                continue;
+            }
             SetLastError(ERROR_INVALID_ADDRESS);
             return false;
         }
@@ -877,8 +936,24 @@ bool xmem_map_alias(uint64_t to, uint64_t from, uint64_t len) {
         const MappedPage backing = source->second;  // a copy: unmap_page below may erase the source's entry
         const Window* const window = find_window(at, kPhysicalPageSize);
         const DWORD protect = window ? view_protect(*window) : PAGE_READWRITE;
-        if (!unmap_page(at)) return false;
-        if (!map_backing(at, backing.page, backing.section, backing.offset, protect)) return false;
+        const auto fail = [&](const char* why) {
+            static std::atomic<int> told{0};
+            if (told++ < 16) {
+                const DWORD e = GetLastError();
+                MEMORY_BASIC_INFORMATION mi{};
+                VirtualQuery(reinterpret_cast<void*>(at), &mi, sizeof mi);
+                std::fprintf(stderr, "[hack] map_alias: %s at %llx (from %llx, window %d, protect 0x%lx, error %lu); "
+                             "host state 0x%lx type 0x%lx alloc base %p region %llx\n", why, (unsigned long long)at,
+                             (unsigned long long)(from + k), window ? 1 : 0, (unsigned long)protect, (unsigned long)e,
+                             (unsigned long)mi.State, (unsigned long)mi.Type, mi.AllocationBase,
+                             (unsigned long long)mi.RegionSize);
+                std::fflush(stderr);
+                SetLastError(e);
+            }
+            return false;
+        };
+        if (!unmap_page(at)) return fail("unmap_page failed");
+        if (!map_backing(at, backing.page, backing.section, backing.offset, protect)) return fail("map_backing failed");
     }
     return true;
 }
