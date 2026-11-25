@@ -1070,25 +1070,71 @@ static bool ce_ptr_check(const std::uint32_t* s, std::uint32_t vm, std::uint32_t
 
 
 // HACK (agA25) LEONIDA_CE_VSHARP_GUARD_ALL=1: every translated pointer (heap_base + VA, however it was formed: table V#,
-// CB-loaded V#, bindless V#, raw pointer) farther than LEONIDA_CE_VSHARP_GUARD_LIMIT (default 1 TiB) above heap_base, or
-// below it, is redirected to heap_base (src/spirv_va_guard.h spirv_guard_ptr_all), in compute AND graphics modules.
-static void ce_guard_all(std::vector<std::uint32_t>& words, const char* name) {
+// CB-loaded V#, bindless V#, raw pointer) farther than LEONIDA_CE_VSHARP_GUARD_LIMIT (default 1 TiB) above heap_base
+// is redirected into a sink (src/spirv_va_guard.h spirv_guard_ptr_all), in compute AND graphics modules.
+// With the switch the arena keeps [0x10000, 0x100000) for it: sink at VA 0x10000 (512 KiB), hit records at 0x90000
+// (16 bytes per compute module: count, bad pointer lo, hi). A thread reads the records every 5 s and prints
+// "[warning] <shader>: overly big address 0x... ignored (count N)" when a count first moves, then each time it doubles.
+constexpr std::uint64_t kGuardSink = 0x10000, kGuardHits = 0x90000, kGuardSlots = 16384, kGuardEnd = 0x100000;
+static bool ce_guard_all_on() {
     static const bool on = [] { const char* e = std::getenv("LEONIDA_CE_VSHARP_GUARD_ALL"); return e && e[0] == 0x31; }();
-    if (!on) return;
+    return on;
+}
+static std::atomic<std::uint8_t*> g_guard_mapped{nullptr};
+static std::mutex g_guard_mu;
+static std::vector<std::string> g_guard_names;  // hit slot -> module name
+static void ce_guard_reader() {
+    std::vector<std::uint32_t> last, told;
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        std::uint8_t* const m = g_guard_mapped.load();
+        if (!m) continue;
+        std::vector<std::string> names;
+        {
+            std::lock_guard lock(g_guard_mu);
+            names = g_guard_names;
+        }
+        last.resize(names.size(), 0);
+        told.resize(names.size(), 0);
+        for (std::size_t s = 0; s < names.size() && s < kGuardSlots; ++s) {
+            const auto* r = reinterpret_cast<const volatile std::uint32_t*>(m + kGuardHits + s * 16);
+            const std::uint32_t n = r[0];
+            if (n == last[s]) continue;
+            last[s] = n;
+            if (told[s] && n < told[s] * 2u) continue;
+            told[s] = n ? n : 1;
+            std::fprintf(stderr, "[warning] %s: overly big address 0x%08x%08x ignored (count %u)\n", names[s].c_str(), r[2], r[1], n);
+            std::fflush(stderr);
+        }
+    }
+}
+static void ce_guard_all(std::vector<std::uint32_t>& words, const char* name, bool compute) {
+    if (!ce_guard_all_on() || std::strncmp(name, "bvh/", 4) == 0) return;  // the runtime BVH builder uses real addresses
     static const std::uint64_t limit = [] {
         const char* v = std::getenv("LEONIDA_CE_VSHARP_GUARD_LIMIT");
         const std::uint64_t l = v ? std::strtoull(v, nullptr, 0) : (1ull << 40);
         std::fprintf(stderr, "[hack] VSHARP_GUARD_ALL: on, limit heap_base + 0x%llx\n", (unsigned long long)l);
         return l;
     }();
-    const int n = leonida::spirv_guard_ptr_all(words, limit);
+    std::uint8_t* const mapped = g_guard_mapped.load();
+    std::uint64_t hits = 0;
+    if (compute && mapped) {
+        std::lock_guard lock(g_guard_mu);
+        if (g_guard_names.size() < kGuardSlots) {
+            hits = kGuardHits + g_guard_names.size() * 16;
+            g_guard_names.emplace_back(name);
+        }
+        static bool started = false;
+        if (!started) { started = true; std::thread(ce_guard_reader).detach(); }
+    }
+    const int n = leonida::spirv_guard_ptr_all(words, limit, mapped ? kGuardSink : 0, hits);
     static std::atomic<std::uint64_t> modules{0}, pointers{0}, untouched{0};
     if (!n) ++untouched; else { ++modules; pointers += std::uint64_t(n); }
     const std::uint64_t k = modules.load() + untouched.load();
     static std::atomic<int> told{0};
     if ((n && told++ < 8) || (k & (k - 1)) == 0)
-        std::fprintf(stderr, "[hack] VSHARP_GUARD_ALL: %s: %d pointer(s) guarded (%llu modules guarded, %llu pointers, %llu without pointers)\n",
-                     name, n, (unsigned long long)modules.load(), (unsigned long long)pointers.load(),
+        std::fprintf(stderr, "[hack] VSHARP_GUARD_ALL: %s: %d pointer(s) guarded%s (%llu modules guarded, %llu pointers, %llu without pointers)\n",
+                     name, n, hits ? ", hits recorded" : "", (unsigned long long)modules.load(), (unsigned long long)pointers.load(),
                      (unsigned long long)untouched.load());
 }
 
@@ -5019,7 +5065,7 @@ public:
                     stage.words = std::move(patched);
                 }
             }
-            ce_guard_all(stage.words, stage.entry->name.c_str());  // agA25
+            ce_guard_all(stage.words, stage.entry->name.c_str(), false);  // agA25
             VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
             module_info.codeSize = stage.words.size() * 4;
             module_info.pCode = stage.words.data();
@@ -5595,7 +5641,7 @@ public:
         // HACK (agA14): LEONIDA_CE_VA_GUARD=sub1,sub2 (or 1 = every compute program): pointers from heap_base + VA with
         // the VA farther than LEONIDA_CE_VA_GUARD_WINDOW (default 2^38) from the arena read the arena start instead of
         // page-faulting (src/spirv_va_guard.h; re29-re36 READ_INVALIDs at VAs terabytes away).
-        ce_guard_all(words, entry->name.c_str());  // agA25 (replaces VA_GUARD when on)
+        ce_guard_all(words, entry->name.c_str(), true);  // agA25 (replaces VA_GUARD when on)
         static const bool guard_all = [] { const char* e = std::getenv("LEONIDA_CE_VSHARP_GUARD_ALL"); return e && e[0] == 0x31; }();
         if (const char* g = guard_all ? nullptr : std::getenv("LEONIDA_CE_VA_GUARD")) {
             static const std::uint64_t window = [] { const char* v = std::getenv("LEONIDA_CE_VA_GUARD_WINDOW"); return v ? std::strtoull(v, nullptr, 0) : (1ull << 38); }();
@@ -7449,12 +7495,21 @@ public:
                 }
             }
         }
-        arena.free[kArenaReserved] = arena.size - kArenaReserved;
+        // agA25: VSHARP_GUARD_ALL keeps [kArenaReserved, kGuardEnd) for its sink and hit records.
+        const VkDeviceSize ce_first = ce_guard_all_on() && arena.mapped ? kGuardEnd : kArenaReserved;
+        if (ce_first != kArenaReserved) {
+            std::memset(arena.mapped + kArenaReserved, 0, kGuardEnd - kArenaReserved);
+            g_guard_mapped.store(arena.mapped);
+            std::fprintf(stderr, "[hack] VSHARP_GUARD_ALL: arena [0x%llx, 0x%llx) kept: sink 0x%llx, hit records 0x%llx\n",
+                         (unsigned long long)kArenaReserved, (unsigned long long)kGuardEnd, (unsigned long long)kGuardSink,
+                         (unsigned long long)kGuardHits);
+        }
+        arena.free[ce_first] = arena.size - ce_first;
         // HACK (agA13): LEONIDA_CE_BUFFER_PAD also keeps that many bytes at the arena top unallocated: small buffers
         // are packed top-down (agA12), so an unbounded scalar overread of the topmost one left the arena.
         if (const char* v = std::getenv("LEONIDA_CE_BUFFER_PAD")) {
             const VkDeviceSize pad = (VkDeviceSize(std::strtoull(v, nullptr, 0)) + 0xFFFF) & ~VkDeviceSize(0xFFFF);
-            if (pad && pad < arena.size / 4) arena.free[kArenaReserved] = arena.size - kArenaReserved - pad;
+            if (pad && pad < arena.size / 4) arena.free[ce_first] = arena.size - ce_first - pad;
             std::fprintf(stderr, "[hack] BUFFER_PAD: %llu bytes per own-memory buffer, arena top keeps %llu\n",
                          (unsigned long long)std::strtoull(v, nullptr, 0), (unsigned long long)pad);
         }
