@@ -41,10 +41,12 @@ class PipelinesJobsTest(unittest.TestCase):
         self.assertEqual(args.count("--jobs"), 1, args)
         return args[args.index("--jobs") + 1]
 
-    def main_with(self, *extra):
+    def main_with(self, *extra, cpus=None):
         argv = ["make_game.py", "--game", self.game, "--work", self.work, "--out", self.out,
                 "--stages", "pipelines", "--no-tui", *extra]
+        cpu_count = os.cpu_count() if cpus is None else cpus
         with mock.patch.object(sys, "argv", argv), mock.patch.object(make_game, "below_normal"), \
+                mock.patch("os.cpu_count", return_value=cpu_count), \
                 mock.patch.object(make_game, "check", return_value={"expected_exe": "g.exe"}), \
                 mock.patch.object(make_game, "preflight"):
             self.assertEqual(make_game.main(), 0)
@@ -56,7 +58,11 @@ class PipelinesJobsTest(unittest.TestCase):
                                      os.path.join(self.out, "pipeline_cache.bin")])
 
     def test_jobs_on_the_command_line_reach_the_checker(self):
-        self.assertEqual(self.jobs_of(self.checker_args(lambda: self.main_with("--jobs", "5"))), "5")
+        self.assertEqual(self.jobs_of(self.checker_args(lambda: self.main_with("--jobs", "5", cpus=8))), "5")
+
+    def test_jobs_above_the_cpu_count_are_clamped(self):
+        # main() clamps --jobs to the hardware threads before any stage sees it.
+        self.assertEqual(self.jobs_of(self.checker_args(lambda: self.main_with("--jobs", "5", cpus=4))), "4")
 
     def test_windows_reuses_the_checker_from_the_supplied_runtime_build(self):
         supplied = os.path.join(self.root, "unpacked runtime")
@@ -69,6 +75,7 @@ class PipelinesJobsTest(unittest.TestCase):
                 "--stages", "runtime,pipelines", "--runtime-build", supplied, "--jobs", "3"]
         with mock.patch.object(sys, "argv", argv), mock.patch.object(make_game, "ROOT", self.root), \
                 mock.patch("os.name", "nt"), mock.patch.object(make_game, "below_normal"), \
+                mock.patch("os.cpu_count", return_value=8), \
                 mock.patch.object(make_game, "check", return_value={"expected_exe": "g.exe"}), \
                 mock.patch.object(make_game, "log"), mock.patch.object(make_game, "run") as run:
             self.assertEqual(make_game.main(), 0)
