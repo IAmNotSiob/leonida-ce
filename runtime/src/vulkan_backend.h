@@ -111,7 +111,7 @@ struct VulkanDeviceFunctions {
     X(vkCreatePipelineCache) X(vkDestroyPipelineCache) X(vkGetPipelineCacheData)                                                        \
     X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents) X(vkCmdDrawMeshTasksEXT) \
     X(vkCreateRenderPass2) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer)               \
-    X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass)
+    X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkGetQueryPoolResults)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -1874,6 +1874,7 @@ public:
 
     ~VulkanQueue() {
         auto& vk = context_.vk;
+        if (gt_pool_ && vk.vkDestroyQueryPool) vk.vkDestroyQueryPool(context_.device(), gt_pool_, nullptr);  // agA21
         context_.holds().detach(this);  // no thread releases into this queue from here on
         report_held_at_teardown();
         context_.holds().pump_ready();  // presents queued behind what was just dropped can run
@@ -1997,6 +1998,61 @@ public:
     // passes the pipeline states and root signatures the lists named (the application may release them and Reset
     // the lists as soon as the call returns).
     using PinFn = std::function<std::shared_ptr<void>()>;
+
+    // agA21 LEONIDA_CE_GPU_TIME=1: a GPU timestamp pair around every replayed command buffer; a submission whose
+    // GPU time reaches LEONIDA_CE_GPU_TIME_MS (default 100) is logged, and every 512 per queue a summary. Results are
+    // read without waiting (vkGetQueryPoolResults, no WAIT bit) on later executes of the same queue.
+    static constexpr std::uint32_t kGtSlots = 128;
+    struct GtSlot { bool pending = false; std::uint32_t lists = 0; std::uint64_t seq = 0; };
+    bool gt_on() {
+        static const bool on = [] { const char* e = std::getenv("LEONIDA_CE_GPU_TIME"); return e && e[0] == '1'; }();
+        if (!on || gt_failed_ || kind_ == QueueKind::copy) return false;
+        if (gt_pool_) return true;
+        const auto& vk = context_.vk;
+        if (!vk.vkCreateQueryPool || !vk.vkGetQueryPoolResults || !vk.vkCmdWriteTimestamp || !vk.vkCmdResetQueryPool ||
+            context_.timestamp_period() <= 0) { gt_failed_ = true; return false; }
+        VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        info.queryCount = kGtSlots * 2;
+        if (vk.vkCreateQueryPool(context_.device(), &info, nullptr, &gt_pool_) != VK_SUCCESS) { gt_pool_ = VK_NULL_HANDLE; gt_failed_ = true; return false; }
+        return true;
+    }
+    void gt_poll() {
+        static const double limit_ms = [] { const char* e = std::getenv("LEONIDA_CE_GPU_TIME_MS"); return e ? std::atof(e) : 100.0; }();
+        const auto& vk = context_.vk;
+        const char* kind = kind_ == QueueKind::direct ? "direct" : kind_ == QueueKind::compute ? "compute" : "copy";
+        for (std::uint32_t i = 0; i < kGtSlots; ++i) {
+            GtSlot& g = gt_slots_[i];
+            if (!g.pending) continue;
+            std::uint64_t t[2] = {};
+            if (vk.vkGetQueryPoolResults(context_.device(), gt_pool_, i * 2, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+                continue;
+            g.pending = false;
+            const double ms = t[1] >= t[0] ? double(t[1] - t[0]) * context_.timestamp_period() / 1e6 : -1.0;
+            ++gt_done_;
+            gt_max_ = (std::max)(gt_max_, ms);
+            gt_sum_ += ms > 0 ? ms : 0;
+            if (ms >= limit_ms) {
+                ++gt_slow_;
+                std::fprintf(stderr, "[hack] GPU_TIME: %s queue %p submission #%llu (%u lists) took %.1f ms on the GPU\n", kind,
+                             (void*)queue_, (unsigned long long)g.seq, g.lists, ms);
+                std::fflush(stderr);
+            }
+            if ((gt_done_ & 511) == 0) {
+                std::fprintf(stderr, "[hack] GPU_TIME: %s queue %p: %llu timed, avg %.2f ms, max %.1f ms, %llu >= %.0f ms\n", kind, (void*)queue_,
+                             (unsigned long long)gt_done_, gt_sum_ / 512.0, gt_max_, (unsigned long long)gt_slow_, limit_ms);
+                std::fflush(stderr);
+                gt_sum_ = 0;
+                gt_max_ = 0;
+            }
+        }
+    }
+    VkQueryPool gt_pool_ = VK_NULL_HANDLE;
+    bool gt_failed_ = false;
+    GtSlot gt_slots_[kGtSlots];
+    std::uint32_t gt_next_ = 0;
+    std::uint64_t gt_seq_ = 0, gt_done_ = 0, gt_slow_ = 0;
+    double gt_max_ = 0, gt_sum_ = 0;
 
     ReplayResult execute(std::span<const CommandList* const> lists, const PinFn& pin = {}) {
         ReplayResult result = ReplayResult::success;
@@ -2472,6 +2528,18 @@ private:
             return ReplayResult::unsupported;
         }
         if (!tracker_lock.owns_lock()) tracker_lock.lock();
+        // agA21 LEONIDA_CE_GPU_TIME: open the timestamp pair (under tracker_lock, like the submit that closes it).
+        std::int64_t gt_slot = -1;
+        if (gt_on()) {
+            gt_poll();
+            const std::uint32_t at = gt_next_ % kGtSlots;
+            if (!gt_slots_[at].pending) {
+                gt_slot = at;
+                ++gt_next_;
+                context_.vk.vkCmdResetQueryPool(command_buffer, gt_pool_, at * 2, 2);
+                context_.vk.vkCmdWriteTimestamp(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, gt_pool_, at * 2);
+            }
+        }
         if (!transfer_only && context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {
             const bool ended = context_.vk.vkEndCommandBuffer(command_buffer) == VK_SUCCESS;
             resource_lock.unlock();
@@ -2579,6 +2647,8 @@ private:
                                                  0, 1, &host, 0, nullptr, 0, nullptr);
             }
         }
+        if (gt_slot >= 0)  // agA21
+            context_.vk.vkCmdWriteTimestamp(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gt_pool_, std::uint32_t(gt_slot) * 2 + 1);
         const bool ended = context_.vk.vkEndCommandBuffer(command_buffer) == VK_SUCCESS;
         resource_lock.unlock();  // release resource_mutex_ before vkQueueSubmit while keeping tracker_lock held
         const bool wait_previous = ordered_timestamps && submitted_;
@@ -2610,6 +2680,11 @@ private:
         if (wait_previous && !submitted && !waits_.empty()) {  // a failed submit keeps the waits for the next one
             waits_.pop_back();
             wait_values_.pop_back();
+        }
+        if (submitted && gt_slot >= 0) {  // agA21
+            gt_slots_[gt_slot].pending = true;
+            gt_slots_[gt_slot].lists = std::uint32_t(lists.size());
+            gt_slots_[gt_slot].seq = ++gt_seq_;
         }
         if (submitted) {
             context_.tracker_ = std::move(next_tracker);
