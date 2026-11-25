@@ -336,7 +336,10 @@ class ImageStoreD16Tests(unittest.TestCase):
 
     def test_unsupported_dims_and_modifiers_still_refused(self):
         for bad in (
-            "image_store v[4:5], v[2:4], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_CUBE unorm d16",
+            # Cube stores are supported since #6805 (a 6-layer 2D-array view; see test_image_cube_store_glc), so a
+            # dimension the translator still refuses stands in for it here.
+            "image_store v[4:5], v[2:3], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_1D_ARRAY unorm d16",
+            "image_store v[4:5], v[2:4], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D_MSAA_ARRAY unorm d16",
             "image_store v[4:5], v2, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm d16 tfe",
             "image_store v[4:5], v2, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm d16 lwe",
         ):

@@ -32,11 +32,17 @@ SPIRV_VAL = shutil.which("spirv-val")
 FSSM = bytes(0x138) + struct.pack("<4I", 0x88 | (12 << 1), 32, 1, 1)
 
 
+# A program that never writes EXEC has every lane active, and the translator folds the guard to `%true` there
+# (`exec_static_true`, #4473). These tests are about the runtime guard, so each program first writes EXEC (s0 holds
+# an arbitrary lane mask) to keep the `OpLoad %bool %active` condition in the output.
+EXEC_WRITE = "s_mov_b32 exec_lo, s0"
+
+
 def translate(lines, *, emulate=False):
     prev = rdna2spirv.WAVE64_EMULATE
     rdna2spirv.WAVE64_EMULATE = emulate
     try:
-        return support.translate_lines("cs_img_atomic_guard", lines + ["s_endpgm"], fssm=FSSM)
+        return support.translate_lines("cs_img_atomic_guard", [EXEC_WRITE] + lines + ["s_endpgm"], fssm=FSSM)
     finally:
         rdna2spirv.WAVE64_EMULATE = prev
 
