@@ -1553,3 +1553,20 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   records = TDR-style hang: try VK timeouts per queue / one submit per list to localize.
 - Recommended env: build 66 (gta6rt-66.exe) + /root/handoff/re69.env (HEAP_MIRROR=3, ROLL=32, graphics through the mirror with
   MIRROR_POKE/REMAP/GUARD default on). Alternative: re66 (MIRROR_GFX=0). Never DISPATCH_SYNC; NO_RING_SYNC breaks the composite.
+
+## agA21 (sender gen 21, 2026-11-25)
+- Lead 2 SOLVED statically: "console list slot 80 (not forwarded) args 1,1,1,0xe00008020" comes from 0x1800149C0 = XboxBvhBuilder.dll
+  (image base 0x180000000) RVA 0x149c0, right after the call at 0x149ba that docs/d3d12_command_objects.md 3.3a/3.5a measured as the
+  vtable fallback of the five-dword dispatch packet 0x4003cc00,x,1,1,W: slot 80 = Dispatch(x, 1, 1) + W (0x8020 here; the high half
+  of a4 is stale r9). The runtime returned 0 for it = every such BVH-build dispatch after Confirm was SILENTLY DROPPED. The other
+  new-phase calls (26, 148, 43, 37, 45) are the same builder's barrier / upload / root bindings. So "new render phase" = first
+  acceleration-structure builds; with part of the build dispatches missing, the BVH holds stale/garbage nodes and anything
+  traversing it can spin until TDR (fits Event 153 with IP-only/-13 FaultInfo and no MMU fault). (Likely, static + timing.)
+- Build 67 (gta6rt-67.exe, md5 f4cc6049, commit ce3d97df9): LEONIDA_CE_SLOT80_DISPATCH (default ON, =0 = old drop): slot 80 ->
+  real list Dispatch(a1, a2, a3) (sanity: all non-zero and <= 65535). Log "[hack] SLOT80_DISPATCH #k from <caller>: Dispatch(..) W=..".
+  Handed rk73 = build 67 + re73.env (= re69, rtdump93). Also handed rk72 = build 66 + re72 (= re69 + PTR_CHECK=2 on cs_c5b1005e,
+  cs_edc5d4c7, cs_a039b209, cs_f39d1d8b, SLOTS=24), lead 1.
+- Other console list slots still dropped (first call each, rk71): 62 from game+0x979699 (dst VA 0xdaa7ac080, src VA 0xbdd8f0000,
+  0x4000 bytes, 0) looks like a GPU memcpy by VA (fn 0x140979650: dst [rdx+0x50], src = f([rdx+0x30]), size [rdx+0x24]); 101 at
+  0x1450a6651 = (2, 1); 129 via helper 0x14555e640 (0x5c, 1, 1, ..); 70, 74, 75, 126, 131, 132, 142. All start BEFORE Confirm (the
+  screens work with them dropped), but slot 62 is the next candidate if a missing copy shows up.
