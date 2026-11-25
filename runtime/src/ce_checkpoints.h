@@ -62,6 +62,11 @@ inline std::atomic<HeapSyncFn>& heap_sync_fn() {
     static std::atomic<HeapSyncFn> f{nullptr};
     return f;
 }
+// agA24 (LEONIDA_CE_POOL_GPU): applies queued texture-pool page binds (ExecuteCommandLists, before the replay).
+inline std::atomic<HeapSyncFn>& pool_sync_fn() {
+    static std::atomic<HeapSyncFn> f{nullptr};
+    return f;
+}
 // agA20 (LEONIDA_CE_INDIRECT_SRC diagnostics): the arena host mapping, for raw reads of GPU-only (DEFAULT) buffers.
 inline std::atomic<std::uint8_t*>& arena_host() {
     static std::atomic<std::uint8_t*> p{nullptr};

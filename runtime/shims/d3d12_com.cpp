@@ -1812,6 +1812,7 @@ public:
             graphics.push_back(list);
         }
         if (auto f = leonida::ce::heap_sync_fn().load(std::memory_order_relaxed)) f();  // agA17 HEAP_MIRROR
+        if (auto f = leonida::ce::pool_sync_fn().load(std::memory_order_relaxed)) f();  // agA24 POOL_GPU
         last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
         if (last_result_ != leonida::ReplayResult::success)

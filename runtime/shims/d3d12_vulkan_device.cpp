@@ -381,6 +381,244 @@ static void ce_pc_report(std::uint64_t pipe, const char* what, unsigned sgpr, un
         std::fflush(stderr);
     }
 }
+// HACK (agA24, LEONIDA_CE_POOL_GPU=1|2, default off): a GPU mapping of the title texture-pool windows. The title
+// reserves a 24 GiB CPU window (0x1800e0000, [0x149e1dac0]) and a 24 GiB GPU mirror window (0x7800e0000, [0x149e1dad0])
+// and maps 64 KiB physical pool pages into them (XMemMapPhysicalPagesScatter: CPU side, CopyPageMappingsBatchX: GPU
+// side). Translated shaders address heap_base + VA and the arena ends at 4 GiB, so every V# / raw pointer into either
+// window hit unmapped GPU VA (rp2: WRITE_INVALID at console VA 0x27d7b0000 = CPU-window slot 0xfd6d -> device lost).
+// The fix places a SPARSE VkBuffer at device address heap_base + LO (bufferDeviceAddressCaptureReplay with that
+// opaque address; NVIDIA honours it when the range is free, checked) covering [LO, END) (defaults 0x1800e0000,
+// 0xd800e0000 = both windows), so heap_base + VA is inside a buffer for every pool-window VA, raw pointers included,
+// with no descriptor rewriting.
+//   =1: nothing is bound: reads return 0, writes are dropped (residencyNonResidentStrict). Fault-proof only.
+//   =2: every 64 KiB page xmem maps at a window VA is bound to a DEVICE-LOCAL copy of its physical page (sparse buffers
+//       take device-local memory only on NVIDIA), one copy per physical page, so a CPU slot and a GPU slot showing the
+//       same pool page alias the same bytes. The page's host bytes are copied in at each map event (the title fills a
+//       page through the CPU window, then maps it into the GPU window: that map copies the filled page). GPU writes stay
+//       on the GPU (not copied back). Host pages are read through VK_EXT_external_memory_host imports of the xmem section
+//       scratch view in LEONIDA_CE_POOL_GPU_CHUNK pieces (default 64 MiB, committed first).
+// Map events come from xmem's page hook and are applied at the next ExecuteCommandLists (vkQueueBindSparse, then the
+// copies, then a CPU wait), like the immediate host aliasing they mirror.
+static bool g_ce_capture_replay = false;  // set where the device enables bufferDeviceAddressCaptureReplay
+static bool ce_capture_replay_enabled() { return g_ce_capture_replay; }
+struct CePoolChunk { VkDeviceMemory device_memory; VkDeviceMemory host_memory; VkBuffer host_buffer; std::uintptr_t base; std::uint64_t bytes; };
+static struct CePoolGpu {
+    int mode = 0;
+    leonida::VulkanContext* ctx = nullptr;
+    VkDevice device = VK_NULL_HANDLE;
+    VkQueue queue = VK_NULL_HANDLE;
+    std::uint32_t family = 0;
+    VkBuffer buffer = VK_NULL_HANDLE;  // the sparse window buffer; buffer offset = VA - lo
+    VkSemaphore timeline = VK_NULL_HANDLE;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    std::uint64_t timeline_value = 0;
+    std::uint64_t lo = 0, hi = 0, chunk = 64ull << 20;
+    std::uint32_t device_type = 0, host_type_mask = 0;
+    VkBufferUsageFlags usage = 0;
+    PFN_vkGetMemoryHostPointerPropertiesEXT host_props = nullptr;
+    std::mutex mu;                                   // pending + chunks
+    std::map<std::uint64_t, std::uintptr_t> pending; // window address -> host page (0 = unbind)
+    std::map<std::uintptr_t, CePoolChunk> chunks;    // host chunk base -> device copy + import
+    std::atomic<std::uint64_t> binds{0}, unbinds{0}, flushes{0}, import_fail{0}, device_bytes{0}, copies{0};
+} g_pool;
+
+static void ce_pool_page_hook(std::uint64_t address, void* host) {
+    if (g_pool.mode < 2 || address < g_pool.lo || address >= g_pool.hi) return;
+    std::lock_guard lock(g_pool.mu);
+    g_pool.pending[address] = reinterpret_cast<std::uintptr_t>(host);
+}
+
+// With g_pool.mu held. The chunk holding host page `p` (device copy + host import, made on first use), or null.
+static const CePoolChunk* ce_pool_chunk(std::uintptr_t p) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(reinterpret_cast<const void*>(p), &mbi, sizeof mbi) || !mbi.AllocationBase) return nullptr;
+    const std::uintptr_t view = reinterpret_cast<std::uintptr_t>(mbi.AllocationBase);
+    const std::uintptr_t base = view + ((p - view) & ~std::uintptr_t(g_pool.chunk - 1));
+    if (auto it = g_pool.chunks.find(base); it != g_pool.chunks.end()) return &it->second;
+    std::uint64_t bytes = 0;  // the chunk ends at the view's end: walk the regions of the same allocation
+    while (bytes < g_pool.chunk) {
+        MEMORY_BASIC_INFORMATION r{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(base + bytes), &r, sizeof r) || r.AllocationBase != mbi.AllocationBase)
+            break;
+        bytes = (std::min<std::uint64_t>)(g_pool.chunk, reinterpret_cast<std::uintptr_t>(r.BaseAddress) + r.RegionSize - base);
+    }
+    auto& vk = g_pool.ctx->vk;
+    CePoolChunk c{VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, base, bytes};
+    const auto fail = [&](const char* why, long code) -> const CePoolChunk* {
+        if (c.host_buffer) vk.vkDestroyBuffer(g_pool.device, c.host_buffer, nullptr);
+        if (c.host_memory) vk.vkFreeMemory(g_pool.device, c.host_memory, nullptr);
+        if (c.device_memory) vk.vkFreeMemory(g_pool.device, c.device_memory, nullptr);
+        if (g_pool.import_fail.fetch_add(1) < 8)
+            std::fprintf(stderr, "[hack] POOL_GPU: chunk %p (+0x%llx) for page %p failed: %s (%ld)\n",
+                         (void*)base, (unsigned long long)bytes, (void*)p, why, code);
+        return nullptr;
+    };
+    if (!bytes || (bytes & 0xffff)) return fail("bad chunk size", long(bytes));
+    VkMemoryAllocateInfo dev{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    dev.allocationSize = bytes;
+    dev.memoryTypeIndex = g_pool.device_type;
+    VkResult res = vk.vkAllocateMemory(g_pool.device, &dev, nullptr, &c.device_memory);
+    if (res != VK_SUCCESS) { c.device_memory = VK_NULL_HANDLE; return fail("device-local vkAllocateMemory", long(res)); }
+    if (!VirtualAlloc(reinterpret_cast<void*>(base), bytes, MEM_COMMIT, PAGE_READWRITE)) return fail("commit", long(GetLastError()));
+    VkMemoryHostPointerPropertiesEXT props{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    res = g_pool.host_props(g_pool.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, reinterpret_cast<void*>(base), &props);
+    if (res != VK_SUCCESS) return fail("vkGetMemoryHostPointerPropertiesEXT", long(res));
+    VkExternalMemoryBufferCreateInfo ext{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+    ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &ext};
+    bi.size = bytes;
+    bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if ((res = vk.vkCreateBuffer(g_pool.device, &bi, nullptr, &c.host_buffer)) != VK_SUCCESS) { c.host_buffer = VK_NULL_HANDLE; return fail("host vkCreateBuffer", long(res)); }
+    VkMemoryRequirements req{};
+    vk.vkGetBufferMemoryRequirements(g_pool.device, c.host_buffer, &req);
+    const std::uint32_t types = props.memoryTypeBits & req.memoryTypeBits;
+    if (!types) return fail("no importable memory type", long(props.memoryTypeBits));
+    std::uint32_t type = 0;
+    while (!(types & (1u << type))) ++type;
+    VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+    import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+    import.pHostPointer = reinterpret_cast<void*>(base);
+    VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &import};
+    alloc.allocationSize = bytes;
+    alloc.memoryTypeIndex = type;
+    if ((res = vk.vkAllocateMemory(g_pool.device, &alloc, nullptr, &c.host_memory)) != VK_SUCCESS) { c.host_memory = VK_NULL_HANDLE; return fail("vkAllocateMemory(import)", long(res)); }
+    if ((res = vk.vkBindBufferMemory(g_pool.device, c.host_buffer, c.host_memory, 0)) != VK_SUCCESS) return fail("host vkBindBufferMemory", long(res));
+    const std::uint64_t total = g_pool.device_bytes.fetch_add(bytes) + bytes;
+    if (g_pool.chunks.size() < 4 || (g_pool.chunks.size() & 15) == 15)
+        std::fprintf(stderr, "[hack] POOL_GPU: chunk host %p +0x%llx (import type %u): %zu chunks / %llu MiB device-local\n",
+                     (void*)base, (unsigned long long)bytes, type, g_pool.chunks.size() + 1, (unsigned long long)(total >> 20));
+    return &(g_pool.chunks[base] = c);
+}
+
+// ExecuteCommandLists (leonida::ce::pool_sync_fn): binds the queued pages and copies their host bytes in.
+static void ce_pool_sync() {
+    if (g_pool.mode < 2) return;
+    std::vector<VkSparseMemoryBind> binds;
+    std::vector<std::pair<VkBuffer, VkBufferCopy>> copies;
+    std::size_t pages = 0;
+    {
+        std::lock_guard lock(g_pool.mu);
+        if (g_pool.pending.empty()) return;
+        std::map<std::uint64_t, std::uintptr_t> work;
+        work.swap(g_pool.pending);
+        pages = work.size();
+        std::set<std::uintptr_t> copied;
+        for (const auto& [va, host] : work) {
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            VkDeviceSize offset = 0;
+            if (host) {
+                if (const CePoolChunk* c = ce_pool_chunk(host)) {
+                    memory = c->device_memory;
+                    offset = host - c->base;
+                    if (copied.insert(host).second) {
+                        if (!copies.empty() && copies.back().first == c->host_buffer &&
+                            copies.back().second.srcOffset + copies.back().second.size == offset &&
+                            copies.back().second.dstOffset + copies.back().second.size == va - g_pool.lo)
+                            copies.back().second.size += 0x10000;
+                        else
+                            copies.push_back({c->host_buffer, VkBufferCopy{offset, va - g_pool.lo, 0x10000}});
+                    }
+                }
+                ++g_pool.binds;
+            } else {
+                ++g_pool.unbinds;
+            }
+            const VkDeviceSize at = va - g_pool.lo;
+            if (!binds.empty()) {
+                auto& b = binds.back();
+                if (b.resourceOffset + b.size == at && b.memory == memory && (!memory || b.memoryOffset + b.size == offset)) {
+                    b.size += 0x10000;
+                    continue;
+                }
+            }
+            binds.push_back({at, 0x10000, memory, offset, 0});
+        }
+    }
+    auto& vk = g_pool.ctx->vk;
+    const std::uint64_t bound = ++g_pool.timeline_value;
+    VkTimelineSemaphoreSubmitInfo tl{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    tl.signalSemaphoreValueCount = 1;
+    tl.pSignalSemaphoreValues = &bound;
+    const VkSparseBufferMemoryBindInfo bb{g_pool.buffer, std::uint32_t(binds.size()), binds.data()};
+    VkBindSparseInfo info{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO, &tl};
+    info.bufferBindCount = 1;
+    info.pBufferBinds = &bb;
+    info.signalSemaphoreCount = 1;
+    info.pSignalSemaphores = &g_pool.timeline;
+    std::uint64_t done = bound;
+    VkResult res;
+    const char* stage = "bind";
+    bool bind_ok = false;
+    {
+        std::lock_guard lock(g_pool.ctx->submit_mutex());
+        res = vk.vkQueueBindSparse(g_pool.queue, 1, &info, VK_NULL_HANDLE);
+        bind_ok = res == VK_SUCCESS;
+        if (res == VK_SUCCESS && !copies.empty()) {
+            stage = "copy";
+            VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vk.vkResetCommandBuffer(g_pool.cmd, 0);  // the previous flush waited for it
+            res = vk.vkBeginCommandBuffer(g_pool.cmd, &begin);
+            if (res == VK_SUCCESS) {
+                std::size_t i = 0;
+                while (i < copies.size()) {
+                    std::size_t j = i;
+                    std::vector<VkBufferCopy> regions;
+                    while (j < copies.size() && copies[j].first == copies[i].first) regions.push_back(copies[j++].second);
+                    vk.vkCmdCopyBuffer(g_pool.cmd, copies[i].first, g_pool.buffer, std::uint32_t(regions.size()), regions.data());
+                    i = j;
+                }
+                VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+                vk.vkCmdPipelineBarrier(g_pool.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb,
+                                        0, nullptr, 0, nullptr);
+                res = vk.vkEndCommandBuffer(g_pool.cmd);
+            }
+            if (res == VK_SUCCESS) {
+                done = ++g_pool.timeline_value;
+                const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+                VkTimelineSemaphoreSubmitInfo st{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+                st.waitSemaphoreValueCount = 1;
+                st.pWaitSemaphoreValues = &bound;
+                st.signalSemaphoreValueCount = 1;
+                st.pSignalSemaphoreValues = &done;
+                VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO, &st};
+                si.waitSemaphoreCount = 1;
+                si.pWaitSemaphores = &g_pool.timeline;
+                si.pWaitDstStageMask = &wait_stage;
+                si.commandBufferCount = 1;
+                si.pCommandBuffers = &g_pool.cmd;
+                si.signalSemaphoreCount = 1;
+                si.pSignalSemaphores = &g_pool.timeline;
+                res = vk.vkQueueSubmit(g_pool.queue, 1, &si, VK_NULL_HANDLE);
+                if (res == VK_SUCCESS) g_pool.copies.fetch_add(copies.size());
+                else done = bound;
+            }
+        }
+    }
+    if (bind_ok) {
+        VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+        wait.semaphoreCount = 1;
+        wait.pSemaphores = &g_pool.timeline;
+        wait.pValues = &done;
+        const VkResult w = vk.vkWaitSemaphores(g_pool.device, &wait, 5ull * 1000 * 1000 * 1000);
+        if (res == VK_SUCCESS && w != VK_SUCCESS) { res = w; stage = "wait"; }
+    }
+    const std::uint64_t k = ++g_pool.flushes;
+    if (res != VK_SUCCESS || k <= 4 || (k & (k - 1)) == 0) {
+        std::fprintf(stderr, "[hack] POOL_GPU: flush %llu: %zu pages, %zu binds, %zu copy regions (%s%s); %llu binds / %llu unbinds "
+                     "in all, %llu MiB device-local, %llu page copies, %llu chunk failures\n", (unsigned long long)k, pages,
+                     binds.size(), copies.size(), res == VK_SUCCESS ? "ok" : "FAILED at ", res == VK_SUCCESS ? "" : stage,
+                     (unsigned long long)g_pool.binds.load(), (unsigned long long)g_pool.unbinds.load(),
+                     (unsigned long long)(g_pool.device_bytes.load() >> 20), (unsigned long long)g_pool.copies.load(),
+                     (unsigned long long)g_pool.import_fail.load());
+        std::fflush(stderr);
+    }
+}
+
 // Pointer-looking qwords in the first bytes of an in-arena buffer.
 static void ce_pc_scan_buffer(std::uint64_t pipe, unsigned sgpr, unsigned slot, std::uint64_t va, std::uint64_t bytes) {
     if (!va || va >= g_pc_size) return;
@@ -6736,6 +6974,106 @@ public:
         address.buffer = arena.buffer;
         arena.address = vk.vkGetBufferDeviceAddress(state_.info.device, &address);
         arena.size = info.size;
+        // HACK (agA24, LEONIDA_CE_POOL_GPU=1|2): the texture-pool window buffer at heap_base + LO (see CePoolGpu).
+        if (const char* pg = std::getenv("LEONIDA_CE_POOL_GPU"); pg && (pg[0] == '1' || pg[0] == '2')) {
+            const auto envu = [](const char* n, std::uint64_t d) { const char* v = std::getenv(n); return v ? std::uint64_t(std::strtoull(v, nullptr, 0)) : d; };
+            const std::uint64_t lo = envu("LEONIDA_CE_POOL_GPU_LO", 0x1800e0000ull), hi = envu("LEONIDA_CE_POOL_GPU_END", 0xd800e0000ull);
+            const std::uint64_t chunk = envu("LEONIDA_CE_POOL_GPU_CHUNK", 64ull << 20);
+            const int mode = pg[0] - '0';
+            const char* why = nullptr;
+            VkBuffer sparse = VK_NULL_HANDLE;
+            VkSemaphore timeline = VK_NULL_HANDLE;
+            VkCommandPool cpool = VK_NULL_HANDLE;
+            VkCommandBuffer cmd = VK_NULL_HANDLE;
+            VkMemoryRequirements sreq{};
+            VkDeviceAddress got = 0;
+            const auto gdpa = state_.info.get_instance_proc
+                ? reinterpret_cast<PFN_vkGetDeviceProcAddr>(state_.info.get_instance_proc(state_.info.instance, "vkGetDeviceProcAddr"))
+                : nullptr;
+            const auto host_props = state_.info.host_pointer_alignment && gdpa
+                ? reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(gdpa(state_.info.device, "vkGetMemoryHostPointerPropertiesEXT"))
+                : nullptr;
+            if (!vk.vkQueueBindSparse || !state_.info.features.sparseBinding || !state_.info.features.sparseResidencyBuffer ||
+                !state_.info.features.sparseResidencyAliased) why = "no sparse buffer support";
+            else if (!ce_capture_replay_enabled()) why = "bufferDeviceAddressCaptureReplay not enabled";
+            else if (mode == 2 && !host_props) why = "no VK_EXT_external_memory_host";
+            else if (lo < arena.size || hi <= lo || (lo & 0xffff) || (hi & 0xffff) || (chunk & 0xffff) || !chunk ||
+                     (state_.info.host_pointer_alignment && chunk % state_.info.host_pointer_alignment)) why = "bad LO/END/CHUNK";
+            if (!why) {
+                VkBufferOpaqueCaptureAddressCreateInfo want{VK_STRUCTURE_TYPE_BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO};
+                want.opaqueCaptureAddress = arena.address + lo;
+                VkBufferCreateInfo sinfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &want};
+                sinfo.size = hi - lo;
+                sinfo.flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT |
+                              VK_BUFFER_CREATE_SPARSE_ALIASED_BIT | VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
+                sinfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                              VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                              VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                              VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+                state_.share(sinfo);
+                const VkResult r = vk.vkCreateBuffer(state_.info.device, &sinfo, nullptr, &sparse);
+                if (r != VK_SUCCESS) { sparse = VK_NULL_HANDLE; why = "vkCreateBuffer(sparse at heap_base + LO) failed"; }
+            }
+            if (!why) {
+                VkBufferDeviceAddressInfo a{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+                a.buffer = sparse;
+                got = vk.vkGetBufferDeviceAddress(state_.info.device, &a);
+                vk.vkGetBufferMemoryRequirements(state_.info.device, sparse, &sreq);
+                if (got != arena.address + lo) why = "the driver placed the window buffer elsewhere";
+                else if (!sreq.memoryTypeBits || !sreq.alignment || 0x10000 % sreq.alignment) why = "sparse requirements";
+            }
+            if (!why && mode == 2) {
+                VkSemaphoreTypeCreateInfo st{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+                st.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+                VkSemaphoreCreateInfo sc{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &st};
+                VkCommandPoolCreateInfo pc{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+                pc.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+                pc.queueFamilyIndex = state_.info.queue_family;
+                if (vk.vkCreateSemaphore(state_.info.device, &sc, nullptr, &timeline) != VK_SUCCESS) { timeline = VK_NULL_HANDLE; why = "timeline semaphore"; }
+                else if (vk.vkCreateCommandPool(state_.info.device, &pc, nullptr, &cpool) != VK_SUCCESS) { cpool = VK_NULL_HANDLE; why = "command pool"; }
+                else {
+                    VkCommandBufferAllocateInfo ca{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+                    ca.commandPool = cpool;
+                    ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+                    ca.commandBufferCount = 1;
+                    if (vk.vkAllocateCommandBuffers(state_.info.device, &ca, &cmd) != VK_SUCCESS) why = "command buffer";
+                }
+            }
+            if (why) {
+                if (sparse) vk.vkDestroyBuffer(state_.info.device, sparse, nullptr);
+                if (timeline) vk.vkDestroySemaphore(state_.info.device, timeline, nullptr);
+                if (cpool) vk.vkDestroyCommandPool(state_.info.device, cpool, nullptr);
+                std::fprintf(stderr, "[hack] POOL_GPU: OFF: %s (wanted 0x%llx, got 0x%llx)\n", why,
+                             (unsigned long long)(arena.address + lo), (unsigned long long)got);
+            } else {
+                std::uint32_t dtype = 0;
+                while (!(sreq.memoryTypeBits & (1u << dtype))) ++dtype;
+                g_pool.ctx = state_.context.get();
+                g_pool.device = state_.info.device;
+                g_pool.queue = state_.info.queue;
+                g_pool.family = state_.info.queue_family;
+                g_pool.buffer = sparse;
+                g_pool.timeline = timeline;
+                g_pool.pool = cpool;
+                g_pool.cmd = cmd;
+                g_pool.lo = lo;
+                g_pool.hi = hi;
+                g_pool.chunk = chunk;
+                g_pool.device_type = dtype;
+                g_pool.host_props = host_props;
+                g_pool.mode = mode;
+                std::fprintf(stderr, "[hack] POOL_GPU=%d: window buffer [0x%llx, 0x%llx) at device 0x%llx = heap_base + 0x%llx "
+                             "(sparse alignment 0x%llx, memory types 0x%x -> %u)%s\n", mode, (unsigned long long)lo,
+                             (unsigned long long)hi, (unsigned long long)got, (unsigned long long)lo,
+                             (unsigned long long)sreq.alignment, sreq.memoryTypeBits, dtype,
+                             mode == 2 ? "; mapped pool pages get device-local copies" : "; nothing bound (reads 0, writes dropped)");
+                if (mode == 2) {
+                    leonida::ce::pool_sync_fn().store(&ce_pool_sync);
+                    rt::xmem::page_map_hook().store(&ce_pool_page_hook, std::memory_order_release);
+                    if (auto each = rt::xmem::for_each_mapped_hook().load(std::memory_order_acquire)) each(lo, hi, &ce_pool_page_hook);
+                }
+            }
+        }
         arena.free[kArenaReserved] = arena.size - kArenaReserved;
         // HACK (agA13): LEONIDA_CE_BUFFER_PAD also keeps that many bytes at the arena top unallocated: small buffers
         // are packed top-down (agA12), so an unbounded scalar overread of the topmost one left the arena.
@@ -11102,6 +11440,12 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         std::fprintf(stderr, "[rt] d3d12: the GPU lacks a descriptor-indexing feature the bindless set needs\n");
     enable12.bufferDeviceAddress = VK_TRUE;
     info.buffer_device_address = true;
+    // HACK (agA24, LEONIDA_CE_POOL_GPU): the texture-pool window buffer is placed at heap_base + LO by capture replay.
+    if (const char* pg = std::getenv("LEONIDA_CE_POOL_GPU"); pg && (pg[0] == '1' || pg[0] == '2')) {
+        enable12.bufferDeviceAddressCaptureReplay = chosen12.bufferDeviceAddressCaptureReplay;
+        g_ce_capture_replay = chosen12.bufferDeviceAddressCaptureReplay == VK_TRUE;
+        std::fprintf(stderr, "[hack] POOL_GPU: bufferDeviceAddressCaptureReplay %s\n", g_ce_capture_replay ? "enabled" : "NOT supported");
+    }
     std::uint32_t family_count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(info.physical, &family_count, nullptr);
     std::vector<VkQueueFamilyProperties> families(family_count);

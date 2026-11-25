@@ -548,6 +548,7 @@ bool unmap_page(uintptr_t address) {
         return false;
     }
     g_mapped.erase(it);
+    if (const auto hook = rt::xmem::page_map_hook().load(std::memory_order_acquire)) hook(address, nullptr);  // agA24
     return true;
 }
 
@@ -572,6 +573,8 @@ bool map_backing(uintptr_t address, uint64_t page, const std::shared_ptr<Section
     }
     if (!view) return false;
     g_mapped[address] = MappedPage{page, section, offset};
+    if (const auto hook = rt::xmem::page_map_hook().load(std::memory_order_acquire))  // agA24 POOL_GPU
+        hook(address, section->scratch ? static_cast<uint8_t*>(section->scratch) + offset : nullptr);
     return true;
 }
 
@@ -991,7 +994,14 @@ bool xmem_write_page(uint64_t page, uint64_t off, const void* src, uint64_t n) {
     return true;
 }
 
+void xmem_for_each_mapped(uint64_t lo, uint64_t hi, rt::xmem::PageMapFn fn) {  // agA24
+    const std::lock_guard lock(g_phys_mutex);
+    for (const auto& [address, m] : g_mapped)
+        if (address >= lo && address < hi && m.section->scratch) fn(address, static_cast<uint8_t*>(m.section->scratch) + m.offset);
+}
+
 void register_map_alias() {
+    rt::xmem::for_each_mapped_hook().store(&xmem_for_each_mapped, std::memory_order_release);
     rt::xmem::write_page_hook().store(&xmem_write_page, std::memory_order_release);
     rt::xmem::map_alias_hook().store(&xmem_map_alias, std::memory_order_release);
     rt::xmem::write_phys_hook().store(&xmem_write_phys, std::memory_order_release);

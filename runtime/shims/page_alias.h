@@ -47,4 +47,18 @@ inline std::atomic<WriteTrackFn>& write_track_hook() {
     return hook;
 }
 
+// agA24 hack (LEONIDA_CE_POOL_GPU): told about every 64 KiB physical page xmem maps (host = the page's bytes in its
+// section's scratch view) or unmaps (host = null) at a guest address. Called with xmem's lock held: keep it cheap.
+using PageMapFn = void (*)(std::uint64_t address, void* host);
+inline std::atomic<PageMapFn>& page_map_hook() {
+    static std::atomic<PageMapFn> hook{nullptr};
+    return hook;
+}
+// Calls fn for every page mapped now in [lo, hi) (to catch up a hook installed late).
+using ForEachMappedFn = void (*)(std::uint64_t lo, std::uint64_t hi, PageMapFn fn);
+inline std::atomic<ForEachMappedFn>& for_each_mapped_hook() {
+    static std::atomic<ForEachMappedFn> hook{nullptr};
+    return hook;
+}
+
 }  // namespace rt::xmem
