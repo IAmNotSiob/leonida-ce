@@ -6608,11 +6608,13 @@ public:
         length = 0;
         arena.log = getenv_s(&length, log, "LEONIDA_ARENA_LOG") == 0 && length > 1 && log[0] != '0';
         state_.context->set_heap_base(arena.address);
+        if (arena.mapped) {  // agA20: also without the ring sync (mirror poke, INDIRECT_SRC)
+            leonida::ce::arena_bytes().store(arena.size);
+            leonida::ce::arena_host().store(arena.mapped);
+        }
         if (arena.mapped && !std::getenv("LEONIDA_CE_NO_RING_SYNC")) {
             std::uint8_t* const host = arena.mapped;
             const std::uint64_t arena_bytes = arena.size;
-            leonida::ce::arena_bytes().store(arena_bytes);  // agA20
-            leonida::ce::arena_host().store(host);
             state_.context->set_title_sync([host, arena_bytes](std::uint64_t va, std::uint64_t bytes) {
                 if (!bytes || va >= arena_bytes || bytes > arena_bytes - va) return;
                 if (!rt::d3d12_xs::placed_buffer_holds(va, bytes)) return;
