@@ -18,6 +18,9 @@ class FirstLookPathTests(unittest.TestCase):
     def test_literal_image_loader_and_report_paths(self):
         source = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as tmp:
+            # PowerShell's Set-Location reports the long path, and %TEMP% on a runner is an 8.3 short name
+            # (C:\Users\RUNNER~1); resolve it so the expected paths are the ones the script sees.
+            tmp = str(Path(tmp).resolve())
             repo = Path(tmp, "checkout [1]")
             for folder in ("scripts", "tools", "runtime/build/Release"):
                 (repo / folder).mkdir(parents=True)
