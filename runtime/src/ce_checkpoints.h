@@ -33,7 +33,8 @@ inline std::string pipeline_name(std::uint64_t p) {
     return it == names().end() ? std::string("?") : it->second;
 }
 // HACK (agA16, LEONIDA_CE_PTR_CHECK): the device installs a scan of the root views / descriptor tables of a dispatch.
-using PtrCheckFn = void (*)(const std::uint32_t* user_data, std::uint32_t view_mask, std::uint32_t table_mask,
+// agA25: returns true when the dispatch must be left out (LEONIDA_CE_BINDLESS_GUARD).
+using PtrCheckFn = bool (*)(const std::uint32_t* user_data, std::uint32_t view_mask, std::uint32_t table_mask,
                             std::uint64_t pipeline);
 inline std::atomic<PtrCheckFn>& ptr_check_fn() {
     static std::atomic<PtrCheckFn> f{nullptr};

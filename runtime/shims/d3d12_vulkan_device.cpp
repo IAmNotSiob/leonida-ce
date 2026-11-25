@@ -904,10 +904,99 @@ static void ce_cb_vsharp_guard(const std::uint32_t* s, std::uint64_t pipe) {
         std::fflush(stderr);
     }
 }
-static void ce_ptr_check(const std::uint32_t* s, std::uint32_t vm, std::uint32_t tm, std::uint64_t pipe) {
-    if (!g_pc_ctx || !g_pc_mapped) return;
+// agA25 LEONIDA_CE_BINDLESS_GUARD=name:cbsgpr:cbvoff:idxoff:heapsgpr[,..] (needs PTR_CHECK>=1). cs_edc5d4c7 reads two
+// bindless indices from its CB (CB V# at s5+0x40; s_buffer_load_dwordx2 CB+0x40) and loads V#s from the heap table s6 at
+// index*32 (s_load_dwordx4 s[6:7], idx<<5). CB+0 is NOT a V# (packed stride/offset bytes: s16&0xff, s16>>8). Leave the
+// dispatch out when the heap entry lies outside the arena or its V# base is outside every known mapping (the far
+// READ_INVALID of rq3/rp6). Targets edc5d4c7:5:0x40:0x40:6,edc5d4c7:5:0x40:0x44:6.
+static bool ce_bindless_guard(const std::uint32_t* s, std::uint64_t pipe) {
+    struct G { std::string name; unsigned cbs; std::uint32_t cbv, idx; unsigned heap; };
+    static const std::vector<G> targets = [] {
+        std::vector<G> r;
+        const char* e = std::getenv("LEONIDA_CE_BINDLESS_GUARD");
+        if (!e) return r;
+        const std::string t = e;
+        std::size_t p = 0;
+        while (p < t.size()) {
+            std::size_t q = t.find(',', p);
+            if (q == std::string::npos) q = t.size();
+            const std::string one = t.substr(p, q - p);
+            std::size_t c[4];
+            std::size_t k = 0, f = 0;
+            while (k < 4 && (f = one.find(':', k ? c[k - 1] + 1 : 0)) != std::string::npos) c[k++] = f;
+            if (k == 4)
+                r.push_back({one.substr(0, c[0]), unsigned(std::strtoul(one.c_str() + c[0] + 1, nullptr, 0)),
+                             std::uint32_t(std::strtoul(one.c_str() + c[1] + 1, nullptr, 0)),
+                             std::uint32_t(std::strtoul(one.c_str() + c[2] + 1, nullptr, 0)),
+                             unsigned(std::strtoul(one.c_str() + c[3] + 1, nullptr, 0))});
+            p = q + 1;
+        }
+        std::fprintf(stderr, "[hack] BINDLESS_GUARD: %zu target(s)\n", r.size());
+        return r;
+    }();
+    if (targets.empty()) return false;
+    static std::mutex mu;
+    static std::unordered_map<std::uint64_t, std::vector<int>> which;
+    static std::uint64_t checked = 0, skipped = 0;
+    std::lock_guard lock(mu);
+    auto it = which.find(pipe);
+    if (it == which.end()) {
+        const std::string nm = leonida::ce::pipeline_name(pipe);
+        std::vector<int> w;
+        for (std::size_t i = 0; i < targets.size(); ++i)
+            if (nm.find(targets[i].name) != std::string::npos) w.push_back(int(i));
+        it = which.emplace(pipe, std::move(w)).first;
+    }
+    bool skip = false;
+    for (int i : it->second) {
+        const G& g = targets[std::size_t(i)];
+        if (g.cbs >= 32 || g.heap >= 32) continue;
+        const std::uint64_t at = std::uint64_t(s[g.cbs]) + g.cbv;
+        if (at + 16 > g_pc_size) continue;
+        std::uint32_t d[4];
+        std::memcpy(d, g_pc_mapped + at, sizeof d);
+        const std::uint64_t cb = d[0] | (std::uint64_t(d[1] & 0xffff) << 32);
+        if (!cb || cb + g.idx + 4 > g_pc_size) continue;
+        std::uint32_t idx;
+        std::memcpy(&idx, g_pc_mapped + cb + g.idx, 4);
+        const std::uint64_t entry = std::uint64_t(s[g.heap]) + (std::uint64_t(idx) << 5);
+        std::uint32_t v[4] = {0xdeadbeefu, 0xdeadbeefu, 0xdeadbeefu, 0xdeadbeefu};
+        const char* why = nullptr;
+        std::uint64_t vb = 0;
+        ++checked;
+        if (entry + 16 > g_pc_size) {
+            why = "heap entry outside arena";
+        } else {
+            std::memcpy(v, g_pc_mapped + entry, sizeof v);
+            vb = v[0] | (std::uint64_t(v[1] & 0xffff) << 32);
+            if (v[2] && vb && ce_pc_bad(vb)) why = "V# base unmapped";
+        }
+        if (!why) continue;
+        skip = true;
+        const std::uint64_t z = ++skipped;
+        if (z <= 32 || (z & (z - 1)) == 0) {
+            const std::uint64_t mlo = leonida::ce::mirror_lo().load(), mhi = leonida::ce::mirror_hi().load(),
+                                mt = leonida::ce::mirror_title().load();
+            std::uint32_t t[4] = {};
+            const bool inm = mt && entry >= mlo && entry + 16 <= mhi;
+            const bool tok = inm && rt::d3d12::ce_copy_title(t, mt + (entry - mlo), sizeof t);
+            std::fprintf(stderr,
+                         "[hack] BINDLESS_GUARD: %s SKIPPED: CB 0x%llx +0x%x idx %u (0x%x) heap s%u=0x%x entry 0x%llx V# [ %08x %08x %08x %08x ] "
+                         "base 0x%llx: %s; entry %s title [ %08x %08x %08x %08x ]%s (%llu skipped / %llu checked)\n",
+                         g.name.c_str(), (unsigned long long)cb, g.idx, idx, idx, g.heap, s[g.heap], (unsigned long long)entry,
+                         v[0], v[1], v[2], v[3], (unsigned long long)vb, why,
+                         inm ? "in mirror" : "not mirrored", t[0], t[1], t[2], t[3], inm && !tok ? " UNREADABLE" : "",
+                         (unsigned long long)z, (unsigned long long)checked);
+            std::fflush(stderr);
+        }
+    }
+    return skip;
+}
+static bool ce_ptr_check(const std::uint32_t* s, std::uint32_t vm, std::uint32_t tm, std::uint64_t pipe) {
+    if (!g_pc_ctx || !g_pc_mapped) return false;
     ce_cb_peek(s, pipe);  // agA23
-    ce_cb_vsharp_guard(s, pipe);  // agA25
+    ce_cb_vsharp_guard(s, pipe);  // agA25 (wrong premise for edc5d4c7: CB+0 is not a V#; kept for other shaders)
+    const bool skip = ce_bindless_guard(s, pipe);  // agA25
     // agA18: LEONIDA_CE_PTR_CHECK_ONLY=sub1,sub2,..: only pipelines whose name contains one of the substrings.
     static const std::vector<std::string> only = [] {
         std::vector<std::string> v;
@@ -932,7 +1021,7 @@ static void ce_ptr_check(const std::uint32_t* s, std::uint32_t vm, std::uint32_t
             }
             k = it->second;
         }
-        if (!k) return;
+        if (!k) return skip;
     }
     const std::uint64_t n = ++g_pc_dispatches;
     bool deep = g_pc_level >= 2;
@@ -976,6 +1065,7 @@ static void ce_ptr_check(const std::uint32_t* s, std::uint32_t vm, std::uint32_t
     if ((n & (n - 1)) == 0 && (n == 1 || n >= 64))
         std::fprintf(stderr, "[hack] PTR_CHECK: %llu dispatches scanned, %llu bad\n", (unsigned long long)n,
                      (unsigned long long)g_pc_bad.load());
+    return skip;
 }
 
 namespace rt::d3d12 {

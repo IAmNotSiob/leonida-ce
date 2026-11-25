@@ -3851,8 +3851,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                                  (unsigned long long)k, (unsigned long long)n_tables.load(), (unsigned long long)n_bufs.load());
             }
             if (auto f = ::leonida::ce::ptr_check_fn().load(std::memory_order_relaxed))  // agA16
-                f(dispatch->user_data.data(), dispatch->ce_view_mask, dispatch->ce_table_mask,
-                  reinterpret_cast<std::uint64_t>(pipeline->pipeline));
+                if (f(dispatch->user_data.data(), dispatch->ce_view_mask, dispatch->ce_table_mask,
+                      reinterpret_cast<std::uint64_t>(pipeline->pipeline)))
+                    p.ce_bad = true;  // agA25 LEONIDA_CE_BINDLESS_GUARD: left out at record
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
             if (out.draw_count == out.draws.size()) out.draws.emplace_back();
             auto& prepared_draw = out.draws[out.draw_count];
