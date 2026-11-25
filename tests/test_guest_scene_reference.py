@@ -99,7 +99,8 @@ class GuestSceneReferenceTest(unittest.TestCase):
 
     def test_launch_failure_preserves_run_record_and_logs(self):
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
+            # resolve(): the runner records the resolved loader path (/var -> /private/var on macOS).
+            root = Path(temp).resolve()
             (root / "spirv").mkdir()
             bad_loader = root / "invalid.exe"
             bad_loader.write_bytes(b"synthetic input that is not an executable")
