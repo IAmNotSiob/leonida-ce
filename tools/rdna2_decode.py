@@ -1329,7 +1329,10 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             tname = f"param{tgt - 32}"
         else:
             tname = f"tgt{tgt}"
-        args = [{"k": "target", "t": tname}]
+        # The text parser (shader_ir.operand) reads "null" as the special register, not a target; match it so a
+        # decoded export and a parsed one are the same instruction.
+        args = [{"k": "special", "t": "null", "neg": False, "abs": False} if tname == "null"
+                else {"k": "target", "t": tname}]
         if compr:
             # Compressed export: en bit 0/1 enables vsrc0 (printed twice), bit 2/3 enables vsrc1 (printed twice).
             for pair in (0, 1):
