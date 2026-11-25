@@ -12,6 +12,22 @@ mod translate;
 
 use std::path::PathBuf;
 
+/// D3D12 Agility SDK: the runtime version `D3D12Core.dll` in `D3D12SDKPath`
+/// (beside the exe) must have. Windows 10's in-box D3D12 refuses the
+/// directly-indexed heap flags of the title's root signatures (shader model
+/// 6.6); with these two exports the loader uses the redistributable runtime
+/// instead, when that folder is there. Without it the in-box runtime runs, as
+/// before. build.rs exports both from the exe.
+#[unsafe(no_mangle)]
+#[used]
+pub static D3D12SDKVersion: u32 = 620;
+
+/// Where the Agility SDK's `D3D12Core.dll` (and `d3d12SDKLayers.dll`) are,
+/// relative to the exe.
+#[unsafe(no_mangle)]
+#[used]
+pub static D3D12SDKPath: &[u8; 9] = b".\\D3D12\\\0";
+
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
