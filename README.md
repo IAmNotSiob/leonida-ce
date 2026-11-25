@@ -33,19 +33,26 @@ the history, the GPLv3 license and the credit to everyone who worked on it are k
 
 ## Status
 
-**Not playable yet. The game boots and runs, but the screen is still black.**
+**Not playable yet. The game shows its own UI, walks through first-boot setup and accepts the legal terms; then
+it loses the GPU about two minutes later, before the next screen appears.**
 
 | | |
 |---|---|
-| Boots the real game | ✅ On native Windows (and Wine): runs 10+ minutes without a crash, starts its boot state machine, loads saves and the profile, streams speech, submits tens of thousands of draws |
-| A picture on screen | ⚠️ Every frame is presented into the game window, but black: the final UI composite draw writes no pixels yet. This is the current blocker |
+| Boots the real game | ✅ On native Windows (Windows 10, NVIDIA) and under Wine |
+| The game's own UI on screen | ✅ Scaleform UI with full text: the account prompt, then the first-boot setup pages |
+| First-boot setup | ✅ With scripted controller input (`LEONIDA_CE_PRESS`): navigation experience, UI text size, subtitles, brightness, finish setup, legal notices, Rockstar legal terms accepted and settings saved |
+| After the legal terms | ⚠️ The game starts loading (navy screen), then the GPU device is lost about 2 minutes later. This is the current blocker |
+| Streamed textures | ⚠️ DirectStorage streaming works; BCPack BC1 decodes in the runtime (bit-exact), BC5/BC7 still need a history table |
 | Shaders (offline) | ✅ All 26,503 translated to SPIR-V and validated |
 | Shaders (created at run time) | ⚠️ 1,536 of 2,675 translated; the rest run as empty placeholders |
 | Models, textures, audio | ✅ Exported (382,781 models; DDS textures; Ogg Opus / WAV audio) |
 | Playable | ❌ Not yet |
 
-Many of the fixes that got it this far are deliberate stand-ins ("hacks"), each behind an environment switch and
-logged in [hacks/BOOT_NOTES.md](hacks/BOOT_NOTES.md). The full status table is in [docs/status.md](docs/status.md).
+> [!NOTE]
+> The newest work lives on the [`first-light`](https://github.com/IAmNotSiob/leonida-ce/tree/first-light) branch
+> until it is cleaned up and merged into `main`. Many of the fixes are deliberate stand-ins ("hacks"), each behind an
+> environment switch and logged in [hacks/BOOT_NOTES.md](hacks/BOOT_NOTES.md) there. The full status table is in
+> [docs/status.md](docs/status.md).
 
 ## How to build
 
@@ -78,11 +85,13 @@ Design notes: [docs/design.md](docs/design.md) (translator contract), [docs/d3d1
 
 The open problems, most important first:
 
-- **The black screen.** The UI composite draw (`sga_dr_vs_pos_color_tex` + `default_ps_tex`, topology 17) writes
-  nothing into the back buffer. GPU readback tooling is built in (`LEONIDA_CE_RTDIAG`).
+- **The GPU loss after the legal terms.** About two minutes after Confirm the device is lost, at the first indirect
+  draw (the GPU runs garbage commands). The game also draws its loading screen into a texture that never reaches the
+  presented surface. Notes on `first-light` in `hacks/BOOT_NOTES.md` (sections agA12-agA18).
+- **BCPack history tables.** BC5, BC6H and BC7 streamed textures need the unpublished history table; until then they
+  load as zeros.
 - **The `0xF800xxxx` instruction.** About 500 run-time compute shaders stop on a 4-byte word that llvm-mc decodes as
   an 8-byte export. It looks like an Xbox-only scalar memory op; nobody knows its semantics yet.
-- **Topology 17 (RECTLIST)** still has to be expanded into two triangles.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) first. **Never attach game files, extracted assets or generated shaders**
 to issues or pull requests.
