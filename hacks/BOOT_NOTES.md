@@ -1098,3 +1098,57 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   while tearing down / on a timeout path; then find why). If the arena still fills, measure live buffers (leak?).
   table2[slot]==0 requests: park and retry, or answer S_OK and drop. BCPack port still open (tools/bcpack.py).
 - Recommended env: /root/handoff/re27.env with build 43.
+
+## agA12 (sender gen 12, 2026-11-25)
+- re27 (build 43, re27.env, B gen 8): Confirm (state 13->0) t=124.9. NO "arena full" at all (SMALL_ALIGN=256 fixed the
+  fragmentation; Very likely). 4 "invalid subresource" list failures (t~144-181, after "SRV dimension not supported for
+  buffer: 4/9") + 4 boot "invalid copy or resolve". Presents stop t~244.5; then all 5 fence mirrors flip to UINT64_MAX in
+  ONE poll (incl. fences still at 0); int3 +0x2474606 at t=250.35 (rdi = the 0x1286 mirror, rsi 0x1288); exec AV 0;
+  AV +0x61af; exit 327 s. ZERO "fence Signal"/"queue Signal"/"deferred list write" lines.
+- => it IS a Vulkan DEVICE LOSS (Very likely): the mirror line logs GetCompletedValue(), which is UINT64_MAX for every
+  fence at once only via context.is_device_lost() (vulkan_backend.h Fence::completed / d3d12_com.cpp:1456). agA11's
+  "no device loss" was wrong: the device-fault hook printed nothing (hook silent/hung or vkGetDeviceFaultInfoEXT
+  unavailable). Not a Signal(~0), not the arena.
+- Title side (disassembly 0x144fb0ad0): fence values carry a tag in the top byte; "not reached" = bit 55 of
+  (completed - target); ~0 -> 0x142474870 -> 0x142474500 (Quitf). Loop body 0x144fb0e90 is only a yield.
+- Build 44 (md5 7d7922cf): report_device_lost() always prints "[hack] DEVICE LOST seen"; LEONIDA_CE_CHECKPOINTS=1 =
+  VK_NV_device_diagnostic_checkpoints (src/ce_checkpoints.h; checkpoint before every draw/dispatch, marker = VkPipeline,
+  names registered at pipeline build: "cs <name>" or "vs + gs + ps"), printed per queue on loss before the fault query;
+  small arena buffers packed top-down; "[hack] arena: N allocations, M releases, live" every 8192 allocs; fence mirror
+  FOREIGN-write log + AddRef; LEONIDA_CE_FENCE_NO_MAX=1 hides ~0 (useless once the device is really lost);
+  DStorage table2[slot]==0 parts dropped with S_OK (LEONIDA_CE_DS_DROP0=0 = old). Wine sl3: checkpoints on, boots.
+  Handed as re28 (re28.env = re27.env + CHECKPOINTS=1, rtdump48).
+- Build 45 (md5 0c9bde3e) = 44 + BCPack integration: LEONIDA_CE_BCPACK (default on; =0 = zero fill only) decodes comp=14 with shims/bcpack_decode
+  (the other agent's port, strict mode, kAuto), refused chunks fall back to zero fill; logs "comp=14 BCPack decoded/
+  refused". bcpack_decode.cpp added to runtime/CMakeLists.txt. Wine sl4 boots (no comp=14 before state 1 there).
+- re28 (build 44, B): Confirm t=126.1; mirrors -> UINT64_MAX again (t~245), int3 +0x2474606 t=247.9, but NO "DEVICE LOST
+  seen" => vkGetSemaphoreCounterValue itself returned UINT64_MAX with VK_SUCCESS. Windows System log: nvlddmkm Event 153
+  (RC error / TDR recovery, "Error occurred on GPUID: 300") at exactly the loss moment in re27 AND re28 (and earlier runs)
+  => GPU RC/TDR (Definite that the driver hit an error then; Very likely the cause). Loss ~122-125 s after Confirm both runs.
+  ARENA LEAK (Definite): "[hack] arena: 57344 allocations, 0 releases, live 1919 MiB" - no arena buffer is EVER released
+  (+~140 MiB per 8192); fine for ~5 min with SMALL_ALIGN, will fill eventually. Who keeps them (title never Releases, or a
+  proxy/ref leak)? Open. 16 DROP0 lines (t~190-200). 5 "invalid subresource" list failures (t~145-175).
+- Build 46 (md5 6f62c16a) = 45 + Fence::completed(): a timeline reading UINT64_MAX calls mark_device_lost() -> "DEVICE LOST
+  seen" + NV checkpoints + fault info. Handed as re29 (re29.env = re28.env, rtdump49). BCPack default ON.
+- NEXT (agA13): read re29's CHECKPOINTS (the pipeline each queue was in at the TDR) and kill/skip that shader (hang =
+  infinite/long loop in a translated shader is the leading theory; zero-filled/undecoded inputs or wave64-on-wave32 may
+  feed it). Find the arena leak (count Resource releases vs creates per kind). "invalid subresource": skip the bad command
+  instead of failing the whole list.
+- (superseded below)
+- re29 (build 46, read by me from /root/rb/re29.err.log): "DEVICE LOST seen" fired at the RC error. CHECKPOINTS: only one
+  direct queue had work: top+bottom marker = "cs fspx_game/cs_bedf02010668b70ebdd31e4f4a0d010a07b74d275991a560c0af9e59faf5d857".
+  Device fault: type 6 (IP) 0x21df5a2c0, type 1 READ_INVALID 0x3f5ff070000 (prec 0x1000) => THE CULPRIT (Very likely): that
+  compute shader dereferences a garbage GPU VA. BCPack (default on): EVERY comp=14 chunk refused (129+; "mode 1: lane N
+  ... fragment did not end at its home state; mode 7: BC7 ... unknown built-in endpoint history / inferred-only rank") ->
+  zero fill as before. Either the request source needs an offset/header strip, or these are BC7/BC6H (unsupported) -
+  tell the BCPack agent.
+- Build 47 (md5 adae1192): LEONIDA_CE_SKIP_CS=<substrings> -> empty placeholder compute program. re30.env =
+  re29.env + LEONIDA_CE_SKIP_CS=cs_bedf02010668b70e (rtdump50), 420 s. Handed to B. Real fix: find which VA the shader
+  reads (its disasm in /root/leonida-work/shaders/fspx_game/disasm/cs_bedf0201...s; read-only) and why it is garbage
+  (likely from a buffer the title fills via an unsupported path / zero-filled BCPack / a never-released arena buffer).
+- Recommended env: /root/handoff/re30.env with build 47.
+- re29 extra (B): 900 C++ exceptions (0xe06d7363) from t=98 on, all from host gta6rt.exe+0x14f169 <- +0x1554b0 <- +0x14f02d
+  ... = most likely the BCPack decoder throwing internally on every refused chunk (caught, but slow). If BCPack stays
+  0-decoded, run with LEONIDA_CE_BCPACK=0. A new late "invalid subresource" (line 15279) came just before the loss, and
+  "view starts past the texture's mips or layers; first mip 5" was the last line before DEVICE LOST. The faulting read
+  0x3f5ff070000 is far outside the 4 GiB arena.

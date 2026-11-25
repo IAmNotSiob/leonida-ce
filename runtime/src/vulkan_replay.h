@@ -56,6 +56,7 @@
 #include <cstring>
 #include <atomic>
 #include <vector>
+#include "ce_checkpoints.h"
 
 bool leonida_is_sf_batch_pso(std::uint64_t pso);  // d3d12_xs_device.cpp (agA4)
 namespace leonida {
@@ -3971,6 +3972,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         if (predicate.buffer) vk.begin_conditional_rendering(command_buffer, &predicate);
     };
 
+    ::leonida::ce::checkpoint(command_buffer, 0xCE00000000000000ull | commands.size());
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
         const auto& p = prepared.commands[i];
@@ -4514,6 +4516,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                    VK_PIPELINE_STAGE_TRANSFER_BIT);
             vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, 1, p.buffer_copies.data());
         } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command)) {
+            ::leonida::ce::checkpoint(command_buffer, ind->pipeline ? reinterpret_cast<std::uint64_t>(p.pipeline.pipeline)
+                                                                  : (0xCE01000000000000ull | std::uint64_t(ind->kind)));
             const VkDeviceSize arguments = p.binding.buffer_offset + ind->argument_offset;
             if (ind->count_buffer && ind->kind != IndirectKind::dispatch) {
                 const VkDeviceSize count = p.source.buffer_offset + ind->count_offset;
@@ -4633,6 +4637,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                         &set0, 0, nullptr);
             }
             vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
+            ::leonida::ce::checkpoint(command_buffer, reinterpret_cast<std::uint64_t>(p.pipeline.pipeline));
             vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
             const detail::PreparedDraw& d = prepared.draws[p.draw];
@@ -4737,6 +4742,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.bind_vertex_buffers2(command_buffer, slot, 1, &d.vertex_buffers[slot], &d.vertex_offsets[slot],
                                         &d.vertex_sizes[slot], &d.vertex_strides[slot]);
             }
+            ::leonida::ce::checkpoint(command_buffer, reinterpret_cast<std::uint64_t>(d.pipeline));
             if (draw->mesh) {
                 vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
             } else if (draw->indexed) {

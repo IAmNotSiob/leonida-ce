@@ -54,6 +54,8 @@ inline std::atomic<void (*)()>& device_lost_hook() {
 inline void report_device_lost() {
     static std::atomic<bool> once{false};
     if (once.exchange(true)) return;
+    std::fprintf(stderr, "[hack] DEVICE LOST seen (report_device_lost)\n");  // agA12: unconditional
+    std::fflush(stderr);
     if (auto h = device_lost_hook().load(std::memory_order_acquire)) h();
 }
 
@@ -1759,6 +1761,10 @@ public:
             return UINT64_MAX;
         }
         if (result != VK_SUCCESS) return 0;
+        // HACK (agA12): re28: on Windows/NVIDIA a GPU removal (TDR) shows first as every timeline semaphore reading
+        // UINT64_MAX with VK_SUCCESS (WDDM monitored fences), with no VK_ERROR_DEVICE_LOST yet. Treat it as the loss,
+        // so the device-lost hook (checkpoints, fault info) runs.
+        if (value == UINT64_MAX) context_.mark_device_lost();
         return value;
     }
 

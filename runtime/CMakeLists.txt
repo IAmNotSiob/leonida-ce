@@ -129,6 +129,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/com_shim.cpp
     shims/bcrypt_rng.cpp
     shims/dstorage_x.cpp
+    shims/bcpack_decode.cpp
     shims/audio_x.cpp
     shims/sysinfo_ce.cpp
     shims/readfile_ce.cpp

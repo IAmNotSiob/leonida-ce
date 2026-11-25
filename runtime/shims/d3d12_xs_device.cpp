@@ -436,7 +436,7 @@ void* xs_make_probe() {
 // HACK: console fence slot 12 returns a pointer to the fence's completed value, which the title then polls in
 // memory (the console GPU writes it). Each fence asked for gets a UINT64 here, kept current from GetCompletedValue
 // by one thread (about every millisecond). Entries are never freed.
-struct XsFenceMirror { ID3D12Fence* fence; volatile std::uint64_t value; };
+struct XsFenceMirror { ID3D12Fence* fence; volatile std::uint64_t value; std::uint64_t written = 0; };
 std::mutex g_fence_mirror_mu;
 std::map<const void*, XsFenceMirror*> g_fence_mirrors;
 
@@ -472,8 +472,30 @@ DWORD WINAPI xs_fence_mirror_thread(void*) {
     for (;;) {
         {
             std::lock_guard lock(g_fence_mirror_mu);
+            // HACK (agA12): LEONIDA_CE_FENCE_NO_MAX=1 never publishes UINT64_MAX in a mirror (keeps the last value);
+            // the title's 0x144fb0ad0 would Quitf on it. Foreign writes to a mirror word are logged.
+            static const bool no_max = [] { const char* v = std::getenv("LEONIDA_CE_FENCE_NO_MAX"); return v && *v == '1'; }();
             for (auto& [key, m] : g_fence_mirrors) {
-                const std::uint64_t before = m->value, now = m->fence->GetCompletedValue();
+                std::uint64_t before = m->value, now = m->fence->GetCompletedValue();
+                if (before != m->written) {
+                    static std::atomic<int> told{0};
+                    if (told++ < 16) {
+                        std::fprintf(stderr, "[hack] fence mirror %p (fence %p) FOREIGN write: 0x%llx (we wrote 0x%llx)\n",
+                                     (void*)&m->value, (void*)m->fence, (unsigned long long)before,
+                                     (unsigned long long)m->written);
+                        std::fflush(stderr);
+                    }
+                    if (no_max && before == ~std::uint64_t{0}) before = m->written;
+                }
+                if (no_max && now == ~std::uint64_t{0}) {
+                    static std::atomic<int> told2{0};
+                    if (told2++ < 4) {
+                        std::fprintf(stderr, "[hack] FENCE_NO_MAX: fence %p completed UINT64_MAX suppressed (kept 0x%llx)\n",
+                                     (void*)m->fence, (unsigned long long)m->written);
+                        std::fflush(stderr);
+                    }
+                    now = m->written;
+                }
                 // HACK (agA11): the title's 0x144fb0ad0 treats UINT64_MAX as device removed (Quitf 0x142474500).
                 if (now == ~std::uint64_t{0} && before != now) {
                     static std::atomic<int> told{0};
@@ -484,6 +506,7 @@ DWORD WINAPI xs_fence_mirror_thread(void*) {
                     }
                 }
                 m->value = now;
+                m->written = now;
             }
             for (auto it = g_pending_writes.begin(); it != g_pending_writes.end();) {
                 if (it->fence->GetCompletedValue() >= it->value) {
@@ -546,6 +569,8 @@ volatile std::uint64_t* xs_fence_value_address(const void* proxy, ID3D12Fence* r
     auto it = g_fence_mirrors.find(proxy);
     if (it != g_fence_mirrors.end()) return &it->second->value;
     auto* m = new XsFenceMirror{real, real->GetCompletedValue()};
+    m->written = m->value;
+    real->AddRef();  // HACK (agA12): the mirror thread polls this fence forever; keep it alive past the title's Release
     g_fence_mirrors.emplace(proxy, m);
     xs_start_mirror_thread();
     std::fprintf(stderr, "[hack] fence %p: completed-value address %p (value %llu)\n", proxy, (void*)&m->value,

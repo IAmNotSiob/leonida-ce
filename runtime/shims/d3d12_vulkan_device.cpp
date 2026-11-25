@@ -15,6 +15,7 @@
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "dxgi_com.h"
+#include "../src/ce_checkpoints.h"
 #include "../src/arena_size.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/depth24_fragment.h"
@@ -796,7 +797,7 @@ struct DeviceState {
         bool log = false;  // LEONIDA_ARENA_LOG=1: one line per VA handed out
         VkDeviceSize in_use = 0, peak_in_use = 0, peak_end = 0;
         VkDeviceSize use_in_use[4] = {}, use_peak[4] = {};
-        std::uint64_t allocations = 0, failures = 0;
+        std::uint64_t allocations = 0, failures = 0, releases = 0;
     } arena;
 
     std::uint32_t sparse_buffer_memory_types = 0;
@@ -827,9 +828,42 @@ struct DeviceState {
 
     // A zero-size range is refused: it would share its offset with the next range, and its release would collide
     // with that range's free entry. The fit test cannot wrap: free blocks lie inside the arena (below 4 GiB).
-    bool arena_allocate(VkDeviceSize bytes, VkDeviceSize alignment, VkDeviceSize& out, ArenaUse use) {
+    bool arena_allocate(VkDeviceSize bytes, VkDeviceSize alignment, VkDeviceSize& out, ArenaUse use,
+                        bool from_top = false) {
         if (!bytes || bytes > arena.size) return false;
         std::lock_guard lock(arena.mutex);
+        // HACK (agA12): growth report (is it a leak?): every 8192nd allocation, live bytes / allocations / releases.
+        static std::uint64_t growth_told = 0;
+        if (arena.allocations && (arena.allocations & 8191) == 0 && growth_told != arena.allocations) {
+            growth_told = arena.allocations;
+            VkDeviceSize largest = 0;
+            for (const auto& [o, n] : arena.free) largest = (std::max)(largest, n);
+            std::fprintf(stderr, "[hack] arena: %llu allocations, %llu releases, live %.1f MiB (buffers %.1f), %zu free blocks, largest %.1f MiB\n",
+                         (unsigned long long)arena.allocations, (unsigned long long)arena.releases, arena.in_use / 1048576.0,
+                         arena.use_in_use[arena_buffer] / 1048576.0, arena.free.size(), largest / 1048576.0);
+            std::fflush(stderr);
+        }
+        // HACK (agA12): small buffers (LEONIDA_CE_ARENA_SMALL_ALIGN) are packed downward from the top of the arena,
+        // so they never land in (and split) the low holes the large 64 KiB-aligned ranges come from.
+        if (from_top) {
+            for (auto it = arena.free.rbegin(); it != arena.free.rend(); ++it) {
+                const VkDeviceSize block = it->first, end = it->first + it->second;
+                if (bytes > it->second) continue;
+                const VkDeviceSize start = (end - bytes) / alignment * alignment;
+                if (start < block) continue;
+                arena.free.erase(std::next(it).base());
+                if (start > block) arena.free[block] = start - block;
+                if (start + bytes < end) arena.free[start + bytes] = end - (start + bytes);
+                out = start;
+                ++arena.allocations;
+                arena.in_use += bytes;
+                arena.peak_in_use = std::max(arena.peak_in_use, arena.in_use);
+                arena.peak_end = std::max(arena.peak_end, start + bytes);
+                arena.use_in_use[use] += bytes;
+                arena.use_peak[use] = std::max(arena.use_peak[use], arena.use_in_use[use]);
+                return true;
+            }
+        }
         for (auto it = arena.free.begin(); it != arena.free.end(); ++it) {
             const VkDeviceSize start = (it->first + alignment - 1) / alignment * alignment;
             const VkDeviceSize end = it->first + it->second;
@@ -897,6 +931,7 @@ struct DeviceState {
     void arena_release(VkDeviceSize offset, VkDeviceSize bytes, ArenaUse use) {
         if (!bytes) return;
         std::lock_guard lock(arena.mutex);
+        ++arena.releases;
         arena.in_use -= bytes;
         arena.use_in_use[use] -= bytes;
         auto it = arena.free.emplace(offset, bytes).first;
@@ -2017,7 +2052,8 @@ public:
             }();
             const VkDeviceSize align = (small_align && desc_.Width < D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
                                            ? small_align : VkDeviceSize(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
-            if (!device_.arena_allocate(desc_.Width, align, arena_offset_, DeviceState::arena_buffer)) {
+            if (!device_.arena_allocate(desc_.Width, align, arena_offset_, DeviceState::arena_buffer,
+                                        align != VkDeviceSize(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT))) {
                 log_once("GPU address arena full (raise LEONIDA_ARENA_MB); buffer size in KiB:",
                          int(desc_.Width / 1024));
                 // HACK (agA11): LEONIDA_CE_ARENA_SPILL=1 gives the buffer its own memory (VA = its device address
@@ -3828,6 +3864,8 @@ public:
         // creating the shader modules so colliding PS and high-param producers link within MoltenVK's 30 locations.
         // stages[] is {vs, gs, ps} since geometry shaders joined graphics PSOs (#2109): the PS is stages[2], and with a
         // GS the PS reads the GS's outputs, not the VS's, so the VS/PS halves link only applies without one.
+        for (const Stage& st : stages)  // HACK (agA12): for NV checkpoints
+            if (st.entry) ce_name_ += std::string(ce_name_.empty() ? "" : " + ") + st.entry->name;
         Stage& vs_stage = stages[0];
         Stage& gs_stage = stages[1];
         Stage& ps_stage = stages[2];
@@ -4450,6 +4488,29 @@ public:
         // They keep the empty placeholder.
         static const char* const kNeverCompile[] = {"RTShadowTrace", "ScreenProbes_ActivateRays", "InterpolateStrands",
                                                     "TraceShadowRays"};
+        // HACK (agA12): LEONIDA_CE_SKIP_CS=sub1,sub2 also gets the empty placeholder (re29: cs_bedf0201.. page-faults
+        // the GPU at a garbage VA ~245 s after boot -> TDR -> the title's Quitf).
+        static const std::vector<std::string> skip_cs = [] {
+            std::vector<std::string> v;
+            if (const char* e = std::getenv("LEONIDA_CE_SKIP_CS")) {
+                std::string all(e);
+                for (std::size_t at = 0; at <= all.size();) {
+                    const std::size_t comma = all.find(',', at);
+                    const std::string item = all.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+                    if (!item.empty()) v.push_back(item);
+                    if (comma == std::string::npos) break;
+                    at = comma + 1;
+                }
+            }
+            return v;
+        }();
+        for (const std::string& pattern : skip_cs)
+            if (entry->name.find(pattern) != std::string::npos) {
+                pipeline_.pipeline = empty_compute_pipeline(pipeline_.layout);
+                if (!pipeline_.pipeline) return E_FAIL;
+                std::fprintf(stderr, "[hack] compute %s skipped (LEONIDA_CE_SKIP_CS)\n", entry->name.c_str());
+                goto compiled;
+            }
         for (const char* pattern : kNeverCompile)
             if (entry->name.find(pattern) != std::string::npos) {
                 pipeline_.pipeline = empty_compute_pipeline(pipeline_.layout);
@@ -4475,6 +4536,7 @@ public:
             if (vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr,
                                             &pipeline_.pipeline) != VK_SUCCESS)
                 return E_FAIL;
+            leonida::ce::name_pipeline(pipeline_.pipeline, "cs " + entry->name);
         } else {
             CloseHandle(compile_thread);
             WaitForSingleObject(job->event, 5);
@@ -4544,6 +4606,7 @@ public:
         VkPipeline pipeline = VK_NULL_HANDLE;
         const VkResult result = vk.vkCreateComputePipelines(job->device->info.device, job->device->pipeline_cache(), 1,
                                                             &job->info, nullptr, &pipeline);
+        if (result == VK_SUCCESS) leonida::ce::name_pipeline(pipeline, "cs " + job->name);
         const DWORD took = GetTickCount() - start;
         ReleaseSemaphore(slots, 1, nullptr);
         {
@@ -4711,6 +4774,7 @@ private:
         if (const auto it = variants_.find(unbound); it != variants_.end()) return it->second;
         if (sync) {
             const VkPipeline pipeline = build(unbound);
+            leonida::ce::name_pipeline(pipeline, ce_name_);
             if (!pipeline) {
                 log_once("a pipeline variant for unbound attachment slots could not be built; slots", int(unbound));
                 return VK_NULL_HANDLE;
@@ -4723,6 +4787,7 @@ private:
         lock.unlock();
         compile_pool().post([this, unbound] {
             const VkPipeline pipeline = build(unbound);
+            leonida::ce::name_pipeline(pipeline, ce_name_);
             {
                 std::lock_guard l(variants_mutex_);
                 pending_.erase(unbound);
@@ -4780,6 +4845,7 @@ private:
     Recipe recipe_;
     std::mutex variants_mutex_;
     std::map<std::uint32_t, VkPipeline> variants_;
+    std::string ce_name_;  // HACK (agA12): shader names, for NV checkpoints
     std::set<std::uint32_t> pending_;  // variants queued for a background build
     VkShaderModule module_ = VK_NULL_HANDLE;
     std::shared_ptr<AsyncCompute> async_job_;  // HACK (Leonida CE boot): background compute compile
@@ -10640,6 +10706,18 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (info.custom_border_color) device_extensions.push_back(custom_border_name);
     if (info.host_pointer_alignment) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     if (want_fault) device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+    // HACK (agA12): LEONIDA_CE_CHECKPOINTS=1 -> VK_NV_device_diagnostic_checkpoints breadcrumbs (src/ce_checkpoints.h).
+    bool want_checkpoints = false;
+    {
+        char cv[8] = {};
+        std::size_t cl = 0;
+        want_checkpoints = getenv_s(&cl, cv, "LEONIDA_CE_CHECKPOINTS") == 0 && cl > 1 && cv[0] == '1' &&
+                           std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+                               return std::strcmp(e.extensionName, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME) == 0;
+                           });
+        std::fprintf(stderr, "[hack] NV checkpoints: %s\n", want_checkpoints ? "on" : "off");
+        if (want_checkpoints) device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+    }
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
@@ -10652,6 +10730,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         get_fault = reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(vkGetDeviceProcAddr(owned.device, "vkGetDeviceFaultInfoEXT"));
         if (get_fault) {
             leonida::device_lost_hook().store(+[] {
+                leonida::ce::print_checkpoints();
                 VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
                 VkResult r = get_fault(fault_device, &counts, nullptr);
                 std::fprintf(stderr, "[hack] DEVICE LOST: vkGetDeviceFaultInfoEXT counts -> %d: %u address infos, %u vendor infos\n",
@@ -10674,6 +10753,15 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
             }, std::memory_order_release);
         }
     }
+    if (want_checkpoints) {
+        leonida::ce::set_checkpoint_fn().store(reinterpret_cast<PFN_vkCmdSetCheckpointNV>(
+            vkGetDeviceProcAddr(owned.device, "vkCmdSetCheckpointNV")));
+        leonida::ce::queue_set().device = owned.device;
+        leonida::ce::queue_set().get = reinterpret_cast<PFN_vkGetQueueCheckpointDataNV>(
+            vkGetDeviceProcAddr(owned.device, "vkGetQueueCheckpointDataNV"));
+        if (!want_fault || !leonida::device_lost_hook().load())
+            leonida::device_lost_hook().store(+[] { leonida::ce::print_checkpoints(); });
+    }
     owned.destroy_device = reinterpret_cast<PFN_vkDestroyDevice>(vkGetDeviceProcAddr(owned.device, "vkDestroyDevice"));
     info.command_queues.resize(command_queue_count);
     const auto get_queue = reinterpret_cast<PFN_vkGetDeviceQueue>(vkGetDeviceProcAddr(owned.device, "vkGetDeviceQueue"));
@@ -10694,6 +10782,12 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         VkQueue q = VK_NULL_HANDLE;
         get_queue(owned.device, info.copy_family, i, &q);
         info.copy_queues.push_back(q);
+    }
+    if (want_checkpoints) {
+        auto& qs = leonida::ce::queue_set().queues;
+        for (VkQueue q : info.command_queues) qs.push_back({"direct", q});
+        for (VkQueue q : info.compute_queues) qs.push_back({"compute", q});
+        for (VkQueue q : info.copy_queues) qs.push_back({"copy", q});
     }
     info.queue = info.command_queues[0];
     info.max_push_constants_size = chosen.limits.maxPushConstantsSize;

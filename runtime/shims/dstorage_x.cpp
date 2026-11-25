@@ -10,6 +10,7 @@
 // (in queue order) since the previous status entry. As on the console, a queue also submits itself once half its
 // capacity is enqueued. LEONIDA_CE_DSTORAGE_SYNC=1 restores the old behaviour (read inside EnqueueRequest, every
 // status entry complete) for A/B testing; LEONIDA_CE_DSTORAGE_WORKERS sets the pool size (default 4).
+#include "bcpack_decode.h"
 #include <windows.h>
 
 #include <algorithm>
@@ -242,10 +243,18 @@ bool write_out(const Req& r, const void* data, size_t n, bool zero = false) {
             const auto* desc = reinterpret_cast<const volatile uint64_t*>(r.dst);
             const auto* from = static_cast<const uint8_t*>(data);
             uint64_t off = r.low16, left = n;
-            bool good = true;
+            bool good = true, dropped = false;
+            // HACK (agA12): table2[slot] == 0 = the slot was released before the request ran (re26: one terrain
+            // request FAILED this way). Drop that part and answer S_OK; LEONIDA_CE_DS_DROP0=0 = old failure.
+            static const bool drop0 = [] { const char* v = std::getenv("LEONIDA_CE_DS_DROP0"); return !v || *v != '0'; }();
             for (size_t k = 0; left && good; ++k) {
                 const uint64_t page = desc[k];
                 const uint64_t chunk = (std::min)(left, uint64_t{0x10000} - off);
+                if (!page && drop0) {
+                    static std::atomic<int> dt{0};
+                    if (dt++ < 16) std::fprintf(stderr, "[dstorage] page path: desc[%zu] = 0 (released slot), %llu bytes dropped (desc %p low 0x%x) [hack DROP0]\n",
+                                                k, (unsigned long long)chunk, (void*)r.dst, r.low16);
+                    dropped = true; from += chunk; left -= chunk; off = 0; continue; }
                 good = page && wpage(page, off, from, chunk);
                 if (!good) {
                     static std::atomic<int> pt{0};
@@ -256,7 +265,7 @@ bool write_out(const Req& r, const void* data, size_t n, bool zero = false) {
                 left -= chunk;
                 off = 0;
             }
-            if (good) { ok = true; how = "phys page"; }
+            if (good) { ok = true; how = dropped ? "phys page (released slot part dropped)" : "phys page"; }
         }
         const uint64_t gpu = *reinterpret_cast<const volatile uint64_t*>(uintptr_t{0x149e1dad0});
         const uint64_t cpu = *reinterpret_cast<const volatile uint64_t*>(uintptr_t{0x149e1dac0});
@@ -333,7 +342,29 @@ int32_t run_request(const Req& r) {
                 // HACK (agA5): comp 14 = BCPack (ttdb_graphics.ttpf), no runtime decoder yet. LEONIDA_CE_DS_ZEROFILL=1
                 // answers such requests with a zero-filled destination and success instead of E_NOTIMPL.
                 static const bool zero = [] { const char* e = std::getenv("LEONIDA_CE_DS_ZEROFILL"); return !e || e[0] != '0'; }();  // agA11: default on
-                if (zero) {
+                // HACK (agA12): LEONIDA_CE_BCPACK (default on, =0 off) decodes comp 14 with shims/bcpack_decode (strict mode, auto mode
+                // detection); a chunk it refuses falls back to the zero fill below.
+                static const bool use_bcpack = [] { const char* e = std::getenv("LEONIDA_CE_BCPACK"); return !e || e[0] != '0'; }();  // default on
+                static std::atomic<int> bc_ok{0}, bc_bad{0};
+                std::vector<uint8_t> bc_out;
+                std::string bc_why;
+                int bc_mode = 0;
+                if (comp == 14 && use_bcpack) {
+                    bc_out.resize(dst_size);
+                    if (bcpack::decode(src.data(), src.size(), bcpack::kAuto, bc_out.data(), bc_out.size(), &bc_why, &bc_mode)) {
+                        ok = write_out(r, bc_out.data(), bc_out.size());
+                        if (!ok) hr = E_FAIL;
+                        const int k = bc_ok++;
+                        if (k < 4 || (k & (k - 1)) == 0)
+                            std::fprintf(stderr, "[dstorage] comp=14 BCPack decoded #%d (mode %d, %u -> %u bytes) [hack]\n", k + 1, bc_mode, src_size, dst_size);
+                    } else {
+                        const int k = bc_bad++;
+                        if (k < 8 || (k & (k - 1)) == 0)
+                            std::fprintf(stderr, "[dstorage] comp=14 BCPack refused #%d (%s; %u -> %u bytes), zero fill [hack]\n", k + 1, bc_why.c_str(), src_size, dst_size);
+                    }
+                }
+                if (ok || hr == E_FAIL) {
+                } else if (zero) {
                     write_out(r, nullptr, dst_size, true);
                     static std::atomic<int> told{0};
                     if (told++ < 4) std::fprintf(stderr, "[dstorage] comp=%u zero-filled (%u bytes) [hack]\n", comp, dst_size);
