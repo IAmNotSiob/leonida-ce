@@ -1869,3 +1869,31 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   import + a plain buffer = device address exactly heap_base + title VA). Next step candidate: place every slot-133 title-placed
   buffer (create_host_buffer, VAs 0xd9..-0xe3.. and 0x1000000000+) at heap_base + its title VA, which would end the
   "two address schemes" problem (agA20) for them. Only if capture replay works on the VM driver (rq2 tells).
+- rq2 (build 84 + rq2.env, receiver B18): POOL_GPU OFF. Every placed piece (48 GiB down to 256 MiB) failed with
+  VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS: the Windows driver only accepts capture addresses it handed out (the Linux driver takes
+  any free one). The unplaced probe landed at 0x3ffe10000 = heap_base + 0xffe00000, right after the arena. Loss at Confirm+~149 s
+  (FaultInfo -13), CP_FINE checkpoints as rp1/rp5, last frame 1440. Serves as the no-pool baseline.
+- Build 85 (365f3e31e, md5 8c4597aa): ADJACENT window buffer: one UNPLACED sparse buffer of END - arena size + 1 GiB; if it starts at
+  heap_base + X <= LO and reaches END, VA v = buffer offset v - X (identity, no capture replay, no rewriting). Then placed pieces
+  (Linux), then a REBASE fallback (heap-mirror qwords in [LO, END) shifted).
+- rq3 (build 85 + rq3.env = rp1 + POOL_GPU=2 + VA_GUARD_WINDOW=0xd800e0000 + edc5d4c7 CB_PEEK): POOL_GPU ON on the VM
+  ("adjacent sparse buffer of 0xcc02e0000 bytes -> 0 at 0x3ffe10000 = heap_base + 0xffe00000: COVERS the window"). Flushes ok until
+  the hang: 115k binds / 33k unbinds, 80 chunks = 5.6 GiB device-local, 35k copy regions, 21k dstorage refreshes, 0 chunk failures.
+  Confirm t=194.4; presents stop at frame 1548 (pace 22-45 s / 60 frames after Confirm, slower than rq2: every ExecuteCommandLists
+  with pending binds waits on the CPU for bind+copy on the direct VkQueue). SYNC_DUMP: direct ticket stalled INSIDE its cmdbuf, 0
+  waits (the old picture); the pool flush waits then time out ("FAILED at wait/bind": consequence). TDR ev153 ~Confirm+200 s, DEVICE
+  LOST seen Confirm+262 s. FaultInfo: IP 0x20b1415e0 + READ_INVALID 0xfea1c325000 (~16 TiB: garbage, NOT pool). Checkpoints
+  compute cmd #57 / #19 (v4).
+  => The pool windows are now GPU-addressable on the real target (Definite for placement, Very likely for contents), but the
+  post-Confirm hang/loss is NOT caused by the missing pool mapping (Likely, 1 run each with/without). The rp2 pool-window
+  WRITE_INVALID was one more garbage-address symptom, not the root cause.
+- edc5d4c7 (rq3 CB_PEEK, first dispatch near the hang): its CB V# (s5+0x40) = [11c89200 0 60 30014fac] (a CBV_SHADOW copy), and
+  CB+0 = 00008008 0002c804 000ac404 00075804 = EXACTLY the 16 bytes in the same table's slot 3 (s5+0x60, heap mirror = title heap).
+  The shader takes CB+0 as a V# (s_buffer_load_dwordx4 ... buffer_load_format_x idxen), so its base is 0xc80400008008 -> heap_base +
+  that ~= 220 TiB: a far READ like the FaultInfo one (Plausible link). Slot 4 = all ones, slot 5 = small ints: this table area holds
+  16-bit data, not descriptors. So either the CBV that the shadow copies points at the wrong title bytes (the CB is the descriptor
+  table itself?), or the title fills those slots later on the GPU. Next: find which title address the shadowed CBV came from
+  (CBV_SHADOW source VA for shadow 0x11c89200) and whether it overlaps the descriptor heap; Ghidra who writes the s5 table slots 3-5.
+- Recommended env (agA24): build 85 + rp1.env (POOL_GPU off) behaves like build 81. POOL_GPU=2 (rq3.env) is correct but slower and
+  does not fix the loss; keep it for work on the pool / ray-tracing data paths. Identity placement of imported host buffers via capture
+  replay is NOT possible on the Windows driver (same refusal); the ADJACENT trick only works for the first big buffer after the arena.
