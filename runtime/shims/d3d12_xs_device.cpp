@@ -2947,6 +2947,18 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                                                reinterpret_cast<void**>(a2)));
     } else {
         note_list_slot(Slot, a1, a2, a3, a4);
+        if constexpr (Slot == 14 || Slot == 80 || Slot == 61) {
+            // agA21 LEONIDA_CE_SKIP_BVH=1 (a bisect, not a fix): drop the dispatches XboxBvhBuilder.dll records
+            // (its image at 0x180000000 + 0xde000): its shaders read geometry through raw title VAs it got as data.
+            static const bool skip_bvh = [] { const char* e = std::getenv("LEONIDA_CE_SKIP_BVH"); return e && e[0] == '1'; }();
+            const auto ra = reinterpret_cast<std::uint64_t>(_ReturnAddress());
+            if (skip_bvh && ra >= 0x180000000ull && ra < 0x1800de000ull) {
+                static std::atomic<std::uint64_t> skipped{0};
+                const std::uint64_t k = ++skipped;
+                if ((k & (k - 1)) == 0) { std::fprintf(stderr, "[hack] SKIP_BVH: %llu builder dispatches dropped (slot %u from %p)\n", (unsigned long long)k, Slot, (void*)ra); std::fflush(stderr); }
+                return 0;
+            }
+        }
         if constexpr (Slot == 25) {  // HACK diagnostic: which pipelines the title sets (first 12 distinct)
             { std::lock_guard pl(g_list_pso_mu); g_list_pso[self] = a1; }  // agA21 (slot 80 thread dims)
             static std::mutex m;
