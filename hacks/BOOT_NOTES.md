@@ -1688,3 +1688,4 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   (2) GPU-AV on the XboxBvhBuilder dispatches (ROOT_SPILL compute signature) and the indirect draws right after them. (3) Sync
   validation across direct/compute queues around the BVH build (global UAV barrier slot 146 -> GCL7 Barrier). (4) Internal waits:
   vkCmdWaitEvents (order_timestamp_copy), timeline waits on storage_init / bindless_upload semaphores.
+- rm3 addendum (receiver): Event 153 at ~Confirm +170 s. Only ONE slow submission in the whole run: direct #11952 took 362.0 ms on the GPU (log line 15875, ~440 lines before the first hang dump), right after an INDIRECT dispatch of cs_152795e7 (stand-in args all 0 at record time) - a GPU-written indirect arg candidate for the tools agent. Checkpoint at the loss: direct queue cs_956fdcc6. Last frame 2429.
