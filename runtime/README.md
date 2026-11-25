@@ -227,6 +227,22 @@ The two serializer functions and `D3D12XboxCreateDevice` are the only `d3d12_xs`
 shipped DLLs (measured; see `docs/design.md` and `docs/d3d12_vulkan.md`). The game executable's own
 imports are unknown until it is available.
 
+### Leonida CE boot switches
+
+The Leonida CE boot work added these variables. Most are hacks or experiments around the retail boot, not settled
+behaviour; the comments at each read in the source say more.
+
+| Variable | Read in | Effect |
+|---|---|---|
+| `LEONIDA_CE_DATA_DIR` | `shims/d3d12_xs_device.h` | Folder for the diagnostic dumps and the pipeline map (default `Z:\root`, the Wine setup). |
+| `LEONIDA_CE_PREVIEW=N` | `shims/d3d12_xs_device.cpp` | Read the presented image back every N presents and paint it into the title's window with GDI. |
+| `LEONIDA_CE_MAGENTA` | `shims/d3d12_xs_device.cpp` | Clear render targets to magenta instead of the title's colour, to see what gets drawn. |
+| `LEONIDA_CE_KEEP_NULLDEF=1` | `shims/d3d12_xs_device.cpp` | Leave the fault on an empty definition-table slot alone instead of returning 0 from that call. |
+| `LEONIDA_CE_SKIP_B198=1` | `shims/d3d12_xs_device.cpp` | Experiment: skip the init call that stalls startup task node 0xB198EC07. |
+| `LEONIDA_CE_DSTORAGE_SYNC=1` | `shims/dstorage_x.cpp` | Read DirectStorage requests inside EnqueueRequest, as before the worker pool (A/B testing). |
+| `LEONIDA_CE_DSTORAGE_WORKERS` | `shims/dstorage_x.cpp` | DirectStorage worker pool size (default 4). |
+| `LEONIDA_RNG_SEED` | `shims/bcrypt_rng.cpp` | A 64-bit seed (decimal or 0x hex) that makes the bcrypt random generator deterministic. |
+
 ## Tests
 
 For a Visual Studio build, pass CTest the same configuration you built above.
