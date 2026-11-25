@@ -49,6 +49,10 @@ class F64ConversionTest(unittest.TestCase):
             value = result(rf"OpExtInst %float %glsl FClamp {value} %f0 %f1")
         word = result(rf"OpBitcast %uint {value}")
         dest = result(r"OpAccessChain %_ptr_Function_uint %vgpr %c3")
+        # A program that never writes EXEC stores without the per-lane select (no-EXEC fast path, #4473), as
+        # test_f64_transcendentals and test_rcp_iflag_mods accept.
+        if re.search(rf"(?m)^ *OpStore {re.escape(dest)} {re.escape(word)}$", spv):
+            return
         old_word = result(rf"OpLoad %uint {dest}")
         masked_word = result(rf"OpSelect %uint %\w+ {word} {old_word}")
         self.assertRegex(spv, rf"(?m)^ *OpStore {dest} {masked_word}$")

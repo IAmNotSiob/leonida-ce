@@ -985,6 +985,9 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             bits = [(op_sel >> i) & 1 for i in range(nsrc)]
             if nbits > nsrc:
                 bits.append((op_sel >> 3) & 1)
+            if name in ("v_permlane16_b32", "v_permlanex16_b32"):
+                # op_sel is [FI, BOUND_CTRL] here (op_sel bits 0, 1), and llvm-mc prints just those two.
+                bits = [op_sel & 1, (op_sel >> 1) & 1]
             mods.append(f"op_sel:[{','.join(str(b) for b in bits)}]")
         if clamp:
             mods.append("clamp")

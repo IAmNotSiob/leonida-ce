@@ -231,13 +231,19 @@ class TestFormatDecoderBoundary(unittest.TestCase):
         self.assertEqual(len(self.gen.tbuffer_norm_fns), fns_count)
 
     def test_decode_any_format_selection(self):
+        # The run-time format picks its decode with selects in one shared function per component (SHADER-849,
+        # fb38bc5d3); Gen.decode_any_format, the binary search over the codes, is gone.
         words = ["%w0", "%w1", "%w2", "%w3"]
         initial_lines = len(self.gen.body)
-        comps = self.gen.decode_any_format("%run_fmt", words)
+        comps = self.gen.format_decode_call("%run_fmt", words)
         self.assertEqual(len(comps), 4)
         emitted = "\n".join(self.gen.body[initial_lines:])
-        self.assertIn("OpIEqual %bool %run_fmt", emitted)
-        self.assertIn("OpSelect %uint", emitted)
+        for k in range(4):
+            self.assertIn(f"OpFunctionCall %uint %fmt_dec_c{k} %run_fmt", emitted)
+        functions = "\n".join(self.gen.fmt_fn)
+        self.assertIn("OpSelect %uint", functions)
+        for branch in ("OpBranch ", "OpBranchConditional", "OpSelectionMerge"):
+            self.assertNotIn(branch, functions)
 
     def test_format_decode_call_builds_and_caches_function(self):
         words = ["%w0", "%w1", "%w2", "%w3"]
