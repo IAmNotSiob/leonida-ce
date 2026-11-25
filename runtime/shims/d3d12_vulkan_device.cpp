@@ -408,7 +408,8 @@ static struct CePoolGpu {
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
     std::uint32_t family = 0;
-    VkBuffer buffer = VK_NULL_HANDLE;  // the sparse window buffer; buffer offset = VA - lo
+    std::vector<VkBuffer> pieces;      // agA24 build 84: the window in pieces of `piece` bytes; piece i covers lo + i*piece..
+    std::uint64_t piece = 0;
     VkSemaphore timeline = VK_NULL_HANDLE;
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
@@ -571,10 +572,31 @@ static void ce_pool_sync() {
     VkTimelineSemaphoreSubmitInfo tl{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
     tl.signalSemaphoreValueCount = 1;
     tl.pSignalSemaphoreValues = &bound;
-    const VkSparseBufferMemoryBindInfo bb{g_pool.buffer, std::uint32_t(binds.size()), binds.data()};
+    // Window offsets -> (piece, offset in piece); a bind or copy crossing a piece boundary is split there.
+    const std::uint64_t P = g_pool.piece;
+    std::map<std::size_t, std::vector<VkSparseMemoryBind>> per_piece;
+    for (VkSparseMemoryBind b : binds) {
+        while (b.size) {
+            const std::size_t k = std::size_t(b.resourceOffset / P);
+            const VkDeviceSize in = b.resourceOffset % P, n = (std::min<VkDeviceSize>)(b.size, P - in);
+            per_piece[k].push_back({in, n, b.memory, b.memoryOffset, 0});
+            b.resourceOffset += n; b.size -= n; if (b.memory) b.memoryOffset += n;
+        }
+    }
+    std::vector<std::pair<std::pair<VkBuffer, VkBuffer>, VkBufferCopy>> pcopies;  // (src, dst piece), region
+    for (auto [src, c] : copies) {
+        while (c.size) {
+            const std::size_t k = std::size_t(c.dstOffset / P);
+            const VkDeviceSize in = c.dstOffset % P, n = (std::min<VkDeviceSize>)(c.size, P - in);
+            pcopies.push_back({{src, g_pool.pieces[k]}, VkBufferCopy{c.srcOffset, in, n}});
+            c.srcOffset += n; c.dstOffset += n; c.size -= n;
+        }
+    }
+    std::vector<VkSparseBufferMemoryBindInfo> bbs;
+    for (auto& [k, v] : per_piece) bbs.push_back({g_pool.pieces[k], std::uint32_t(v.size()), v.data()});
     VkBindSparseInfo info{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO, &tl};
-    info.bufferBindCount = binds.empty() ? 0 : 1;
-    info.pBufferBinds = &bb;
+    info.bufferBindCount = std::uint32_t(bbs.size());
+    info.pBufferBinds = bbs.data();
     info.signalSemaphoreCount = 1;
     info.pSignalSemaphores = &g_pool.timeline;
     std::uint64_t done = bound;
@@ -593,11 +615,11 @@ static void ce_pool_sync() {
             res = vk.vkBeginCommandBuffer(g_pool.cmd, &begin);
             if (res == VK_SUCCESS) {
                 std::size_t i = 0;
-                while (i < copies.size()) {
+                while (i < pcopies.size()) {
                     std::size_t j = i;
                     std::vector<VkBufferCopy> regions;
-                    while (j < copies.size() && copies[j].first == copies[i].first) regions.push_back(copies[j++].second);
-                    vk.vkCmdCopyBuffer(g_pool.cmd, copies[i].first, g_pool.buffer, std::uint32_t(regions.size()), regions.data());
+                    while (j < pcopies.size() && pcopies[j].first == pcopies[i].first) regions.push_back(pcopies[j++].second);
+                    vk.vkCmdCopyBuffer(g_pool.cmd, pcopies[i].first.first, pcopies[i].first.second, std::uint32_t(regions.size()), regions.data());
                     i = j;
                 }
                 VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -7029,28 +7051,79 @@ public:
             else if (mode == 2 && !host_props) why = "no VK_EXT_external_memory_host";
             else if (lo < arena.size || hi <= lo || (lo & 0xffff) || (hi & 0xffff) || (chunk & 0xffff) || !chunk ||
                      (state_.info.host_pointer_alignment && chunk % state_.info.host_pointer_alignment)) why = "bad LO/END/CHUNK";
+            // Pieces: try one buffer for the whole window, then smaller pieces (LEONIDA_CE_POOL_GPU_PIECES, a comma list of
+            // sizes; rq1 on the Windows driver refused the 48 GiB sparse buffer at heap_base + LO). Each failure is logged.
+            std::vector<VkBuffer> pieces;
+            std::uint64_t piece = 0;
             if (!why) {
-                VkBufferOpaqueCaptureAddressCreateInfo want{VK_STRUCTURE_TYPE_BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO};
-                want.opaqueCaptureAddress = arena.address + lo;
-                VkBufferCreateInfo sinfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &want};
-                sinfo.size = hi - lo;
-                sinfo.flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT |
-                              VK_BUFFER_CREATE_SPARSE_ALIASED_BIT | VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
-                sinfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                              VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                              VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                              VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-                state_.share(sinfo);
-                const VkResult r = vk.vkCreateBuffer(state_.info.device, &sinfo, nullptr, &sparse);
-                if (r != VK_SUCCESS) { sparse = VK_NULL_HANDLE; why = "vkCreateBuffer(sparse at heap_base + LO) failed"; }
-            }
-            if (!why) {
-                VkBufferDeviceAddressInfo a{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
-                a.buffer = sparse;
-                got = vk.vkGetBufferDeviceAddress(state_.info.device, &a);
-                vk.vkGetBufferMemoryRequirements(state_.info.device, sparse, &sreq);
-                if (got != arena.address + lo) why = "the driver placed the window buffer elsewhere";
-                else if (!sreq.memoryTypeBits || !sreq.alignment || 0x10000 % sreq.alignment) why = "sparse requirements";
+                std::string sizes = std::getenv("LEONIDA_CE_POOL_GPU_PIECES") ? std::getenv("LEONIDA_CE_POOL_GPU_PIECES")
+                                                                               : "0,0x200000000,0x100000000,0x40000000,0x10000000";
+                const auto make = [&](std::uint64_t at, std::uint64_t size, bool capture, VkBuffer& out) {
+                    VkBufferOpaqueCaptureAddressCreateInfo want{VK_STRUCTURE_TYPE_BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO};
+                    want.opaqueCaptureAddress = arena.address + at;
+                    VkBufferCreateInfo sinfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, capture ? &want : nullptr};
+                    sinfo.size = size;
+                    sinfo.flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT |
+                                  VK_BUFFER_CREATE_SPARSE_ALIASED_BIT | (capture ? VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT : 0);
+                    sinfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                  VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                  VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                  VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+                    state_.share(sinfo);
+                    out = VK_NULL_HANDLE;
+                    const VkResult r = vk.vkCreateBuffer(state_.info.device, &sinfo, nullptr, &out);
+                    if (r != VK_SUCCESS) out = VK_NULL_HANDLE;
+                    return r;
+                };
+                const auto address_of = [&](VkBuffer b) {
+                    VkBufferDeviceAddressInfo a{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+                    a.buffer = b;
+                    return vk.vkGetBufferDeviceAddress(state_.info.device, &a);
+                };
+                // Diagnostic: can the driver make a sparse buffer this big at all (no placement)?
+                {
+                    VkBuffer probe = VK_NULL_HANDLE;
+                    const VkResult r = make(lo, hi - lo, false, probe);
+                    std::fprintf(stderr, "[hack] POOL_GPU: probe: unplaced sparse buffer of 0x%llx bytes -> %d at 0x%llx\n",
+                                 (unsigned long long)(hi - lo), int(r), probe ? (unsigned long long)address_of(probe) : 0ull);
+                    if (probe) vk.vkDestroyBuffer(state_.info.device, probe, nullptr);
+                }
+                for (std::size_t at = 0; at <= sizes.size() && pieces.empty();) {
+                    std::size_t comma = sizes.find(',', at);
+                    if (comma == std::string::npos) comma = sizes.size();
+                    std::uint64_t p = std::strtoull(sizes.substr(at, comma - at).c_str(), nullptr, 0);
+                    at = comma + 1;
+                    if (!p) p = hi - lo;
+                    if ((p & 0xffff) || (hi - lo) % p) continue;
+                    bool ok = true;
+                    for (std::uint64_t o = lo; o < hi; o += p) {
+                        VkBuffer b = VK_NULL_HANDLE;
+                        const VkResult r = make(o, p, true, b);
+                        const VkDeviceAddress a = b ? address_of(b) : 0;
+                        if (r != VK_SUCCESS || a != arena.address + o) {
+                            std::fprintf(stderr, "[hack] POOL_GPU: piece size 0x%llx: piece at VA 0x%llx -> VkResult %d, device 0x%llx "
+                                         "(wanted 0x%llx); %zu pieces made before it\n", (unsigned long long)p, (unsigned long long)o,
+                                         int(r), (unsigned long long)a, (unsigned long long)(arena.address + o), pieces.size());
+                            if (b) vk.vkDestroyBuffer(state_.info.device, b, nullptr);
+                            ok = false;
+                            break;
+                        }
+                        pieces.push_back(b);
+                    }
+                    if (!ok) {
+                        for (VkBuffer b : pieces) vk.vkDestroyBuffer(state_.info.device, b, nullptr);
+                        pieces.clear();
+                    } else {
+                        piece = p;
+                    }
+                }
+                if (pieces.empty()) why = "no piece size gave buffers at heap_base + VA (see the piece lines)";
+                else {
+                    sparse = pieces[0];
+                    got = arena.address + lo;
+                    vk.vkGetBufferMemoryRequirements(state_.info.device, sparse, &sreq);
+                    if (!sreq.memoryTypeBits || !sreq.alignment || 0x10000 % sreq.alignment) why = "sparse requirements";
+                }
             }
             if (!why && mode == 2) {
                 VkSemaphoreTypeCreateInfo st{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
@@ -7070,7 +7143,7 @@ public:
                 }
             }
             if (why) {
-                if (sparse) vk.vkDestroyBuffer(state_.info.device, sparse, nullptr);
+                for (VkBuffer b : pieces) vk.vkDestroyBuffer(state_.info.device, b, nullptr);
                 if (timeline) vk.vkDestroySemaphore(state_.info.device, timeline, nullptr);
                 if (cpool) vk.vkDestroyCommandPool(state_.info.device, cpool, nullptr);
                 std::fprintf(stderr, "[hack] POOL_GPU: OFF: %s (wanted 0x%llx, got 0x%llx)\n", why,
@@ -7082,7 +7155,8 @@ public:
                 g_pool.device = state_.info.device;
                 g_pool.queue = state_.info.queue;
                 g_pool.family = state_.info.queue_family;
-                g_pool.buffer = sparse;
+                g_pool.pieces = pieces;
+                g_pool.piece = piece;
                 g_pool.timeline = timeline;
                 g_pool.pool = cpool;
                 g_pool.cmd = cmd;
@@ -7093,9 +7167,9 @@ public:
                 g_pool.host_props = host_props;
                 g_pool.mode = mode;
                 std::fprintf(stderr, "[hack] POOL_GPU=%d: window buffer [0x%llx, 0x%llx) at device 0x%llx = heap_base + 0x%llx "
-                             "(sparse alignment 0x%llx, memory types 0x%x -> %u)%s\n", mode, (unsigned long long)lo,
+                             "(%zu piece(s) of 0x%llx, sparse alignment 0x%llx, memory types 0x%x -> %u)%s\n", mode, (unsigned long long)lo,
                              (unsigned long long)hi, (unsigned long long)got, (unsigned long long)lo,
-                             (unsigned long long)sreq.alignment, sreq.memoryTypeBits, dtype,
+                             pieces.size(), (unsigned long long)piece, (unsigned long long)sreq.alignment, sreq.memoryTypeBits, dtype,
                              mode == 2 ? "; mapped pool pages get device-local copies" : "; nothing bound (reads 0, writes dropped)");
                 if (mode == 2) {
                     leonida::ce::pool_sync_fn().store(&ce_pool_sync);
