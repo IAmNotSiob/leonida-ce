@@ -54,7 +54,8 @@ class GuestSceneReferenceTest(unittest.TestCase):
             "runpy.run_path(script, run_name='__main__')"
         )
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
+            # resolve(): the runner prints the resolved report path (RUNNER~1 -> runneradmin on Windows).
+            root = Path(temp).resolve()
             (root / "spirv").mkdir()
             loader = root / "loader.py"
             diagnostic = "guest diagnostic: 測試"
