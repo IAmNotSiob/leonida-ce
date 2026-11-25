@@ -171,7 +171,6 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
       shims/registry.cpp
       shims/d3d12_xs.cpp
       shims/d3d12_xs_device.cpp
-      test/xmem_commit_stub.cpp
     )
     target_link_libraries(root_sig_test PRIVATE gta6rt_d3d12_xs_rootsig ${D3D12_LIBRARY})
     target_compile_definitions(root_sig_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -196,7 +195,6 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
         shims/registry.cpp
         shims/d3d12_xs.cpp
         shims/d3d12_xs_device.cpp
-        test/xmem_commit_stub.cpp
       )
       target_link_libraries(device_proxy_test PRIVATE gta6rt_d3d12_xs_rootsig ${D3D12_LIBRARY} ${DXGI_LIBRARY})
       target_compile_definitions(device_proxy_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -210,7 +208,6 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     add_executable(xs_proxy_mock_test
       test/xs_proxy_mock_test.cpp
       shims/d3d12_xs_device.cpp
-      test/xmem_commit_stub.cpp
     )
     target_compile_definitions(xs_proxy_mock_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(xs_proxy_mock_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
