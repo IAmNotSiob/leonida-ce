@@ -41,6 +41,10 @@
 #include "vulkan_indirect_dispatch_count.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <mutex>
+#include <set>
 #include <cstdio>
 #include <array>
 #include <cmath>
@@ -4638,6 +4642,29 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             ::leonida::ce::checkpoint(command_buffer, ind->pipeline ? reinterpret_cast<std::uint64_t>(p.pipeline.pipeline)
                                                                   : (0xCE01000000000000ull | std::uint64_t(ind->kind)));
             const VkDeviceSize arguments = p.binding.buffer_offset + ind->argument_offset;
+            // HACK (agA18): ri53/ri54 died with the direct queue at the top of an ExecuteIndirect draw (marker
+            // 0xCE01..00) and an NVIDIA FE exception (garbage methods). LEONIDA_CE_INDIRECT_LOG=1 logs each new
+            // (kind, stride, max_count, count buffer) shape; LEONIDA_CE_SKIP_INDIRECT=1 skips indirect draws,
+            // =2 also indirect dispatches (a test of whether they cause the loss, not a fix).
+            static const int skip_ind = [] { const char* e = std::getenv("LEONIDA_CE_SKIP_INDIRECT"); return e ? std::atoi(e) : 0; }();
+            static const bool log_ind = [] { const char* e = std::getenv("LEONIDA_CE_INDIRECT_LOG"); return e && e[0] == '1'; }();
+            if (log_ind) {
+                static std::mutex mu; static std::set<std::uint64_t> seen;
+                const std::uint64_t key = (std::uint64_t(ind->kind) << 60) ^ (std::uint64_t(ind->stride) << 40) ^
+                                          (std::uint64_t(ind->max_count) << 8) ^ (ind->count_buffer ? 1u : 0u);
+                std::lock_guard lock(mu);
+                if (seen.size() < 64 && seen.insert(key).second) {
+                    std::fprintf(stderr, "[hack] INDIRECT kind %d stride %u max_count %u count_buffer %s args offset 0x%llx (+0x%llx) buffer %p\n",
+                                 int(ind->kind), ind->stride, ind->max_count, ind->count_buffer ? "yes" : "no",
+                                 (unsigned long long)arguments, (unsigned long long)ind->argument_offset, (void*)p.binding.buffer);
+                    std::fflush(stderr);
+                }
+            }
+            if (skip_ind >= (ind->kind == IndirectKind::dispatch ? 2 : 1)) {
+                static std::atomic<std::uint64_t> skipped{0};
+                const std::uint64_t k = ++skipped;
+                if ((k & (k - 1)) == 0) { std::fprintf(stderr, "[hack] SKIP_INDIRECT: %llu skipped\n", (unsigned long long)k); std::fflush(stderr); }
+            } else
             if (ind->count_buffer && ind->kind != IndirectKind::dispatch) {
                 const VkDeviceSize count = p.source.buffer_offset + ind->count_offset;
                 if (ind->kind == IndirectKind::draw) {

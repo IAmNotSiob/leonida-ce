@@ -628,6 +628,8 @@ bool access_allowed(DWORD protect, ULONG_PTR access) {
 
 LONG CALLBACK physical_page_fault(EXCEPTION_POINTERS* info) {
     thread_local bool busy = false;
+    if (auto f = rt::xmem::write_track_hook().load(std::memory_order_acquire))  // agA18 HEAP_MIRROR=2
+        if (f(info) == EXCEPTION_CONTINUE_EXECUTION) return EXCEPTION_CONTINUE_EXECUTION;
     const EXCEPTION_RECORD* record = info ? info->ExceptionRecord : nullptr;
     if (busy || !record || record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2) {
         return EXCEPTION_CONTINUE_SEARCH;

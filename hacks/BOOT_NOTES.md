@@ -1407,3 +1407,52 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   (3) the new faulters cs_c5b1005e / cs_344692c2 / cs_cee65a2d (compute queue): check whether their tables/root views also point into
   the heap (TABLE_LOG) or into placed buffers (stand-ins at their own VA: same class of bug for V# bases that name placed-buffer title VAs).
 - Recommended env now: build 59 + re54.env (re48 - PTR_CHECK + HEAP_MIRROR=1). Never DISPATCH_SYNC.
+
+## agA18 (sender gen 18, 2026-11-25)
+- ri54 (B; build 59 + re54 = HEAP_MIRROR=1, no PTR_CHECK, 480 s): Confirm t=123.5, DEVICE LOST ~138 s after Confirm (t~261; furthest yet).
+  Checkpoints: direct queue stage 0x1 marker 0xCE01000000000000 = TOP OF AN ExecuteIndirect DRAW (kind 0; bottom = list begin);
+  compute queues at cs_c5b1005e (x2), cs_344692c2, cs_cee65a2d. ri53 had the same direct-queue marker. vkGetDeviceFaultInfo -13.
+  nvlddmkm Event 13 texts: "Graphics Exception: Class 0x0 Subchannel 0x0 Mismatch", "ESR 0x4041b0=0x0", "ESR 0x404000=0x80000002"
+  (FE/front-end method decoder: the GPU executed garbage methods), no MMU fault text. => Likely NOT a shader reading a bad address;
+  candidates: an indirect draw with garbage arguments/count (args written by GPU work through a title VA whose stand-in lives
+  elsewhere, same class as the heap bug), or corrupted command memory. Pace with the 38 MiB mirror: 12.5 fps before Confirm,
+  5-8 fps after. Presented-image probe reported all-zero frames; RTDIAG_DUMP wrote no ppm (use B's vshots.sh for screens).
+  Just before the loss in ri53 AND ri54 the title makes its FIRST calls of list slots 26 (ResourceBarrier), 43 (root SRV),
+  37, 45 (root UAV at title VA 0x103ddf21a0) and 80 (console-only, not forwarded, args 1,1,1,0xe00008020): a new render phase.
+- Title heap memory (Wine VirtualQuery): MEM_MAPPED, MEM_RESERVE, one 64 KiB view per physical page (xmem physical-page window,
+  committed on touch). VirtualProtect fails there with error 487 under Wine => write-watch / page protection cannot track it
+  (GetWriteWatch needs MEM_PRIVATE + MEM_WRITE_WATCH; also impossible).
+- Build 60 (gta6rt-60.exe, md5 ea00932c): LEONIDA_CE_HEAP_MIRROR=3 = host shadow + per-4 KiB compare each ExecuteCommandLists, write only changed
+  pages to the arena mirror. Wine sr4/sr5: 164 KiB/sync early, 9-14 KiB/sync later (vs 38912 KiB/sync), same boot timing.
+  =2 = VirtualProtect write tracking (VEH ce_hm_veh, also called first from xmem physical_page_fault via
+  rt::xmem::write_track_hook) with compare fallback; under Wine every protect fails -> same as =3. =1 unchanged.
+  LEONIDA_CE_HEAP_MIRROR_ROLL (default 8 chunks/sync) rolling re-compare (only matters for =2).
+  LEONIDA_CE_PTR_CHECK_ONLY=sub,sub: PTR_CHECK only for matching pipeline names (Wine sr5: works).
+  LEONIDA_CE_INDIRECT_LOG=1 (vulkan_replay.h ExecuteIndirect: one line per new kind/stride/max_count/count-buffer shape),
+  LEONIDA_CE_SKIP_INDIRECT=1|2 (skip indirect draws | + indirect dispatches; a test, not a fix).
+- Handed: ri55 = build 60 + re55 (re54 with HEAP_MIRROR=3 + INDIRECT_LOG), ri57 = re55 + SKIP_INDIRECT=1, ri56 = re55 + PTR_CHECK_ONLY on
+  the three compute faulters.
+- ri55 (B; build 60 + re55 = HEAP_MIRROR=3 + INDIRECT_LOG): Confirm t=143.6, pace before Confirm 4.5-5.1 s/60 (12-13 fps, = ri54), after
+  Confirm 4.7-16 s/60 (4-13 fps) => the post-Confirm slowdown is NOT the mirror copy (Likely); mirror now writes 8 KiB/sync on Windows
+  (8192 syncs, 67 MiB written in all). STILL DEVICE LOST, and the ONLY two INDIRECT lines of the whole run come right before it:
+  "kind 2 stride 12 max_count 1 count_buffer no args 0xfee6da00" then "kind 0 stride 16 max_count 1 count_buffer no args 0xfee85000",
+  then DEVICE LOST. => the first-ever indirect draw (args read from arena VA 0xfee85000) kills the device (Likely; with the FE exception
+  text). Next: ri57 (SKIP_INDIRECT=1); then find what writes the args at 0xfee85000 (title placed buffer whose stand-in is there? GPU
+  writes through a title VA?) and dump the 16 arg bytes at record/submit time.
+  vshots: the title window is black in VM shots (presents go to the passthrough GPU); a stale Application Error dialog from an earlier
+  run sits on screen. re57 adds LEONIDA_CE_PREVIEW=60 (GDI paint of read-back presents) so vshots can see frames.
+- ri57 (B; build 60 + re57 = re55 + SKIP_INDIRECT=1 + PREVIEW=60): Confirm t=159.3, LOST ~45 s after Confirm, BEFORE any ExecuteIndirect (0
+  INDIRECT/SKIP lines; SKIP never exercised). Different signature: direct queue at cs_25d19264 (old faulter), FaultInfo OK: READ_INVALID
+  0x51a3ff40e000, IP 0x20c5a9ca0; only Event 153, no FE Event 13. So two failure modes now: (a) FE exception at the first indirect
+  draw (ri53/54/55), (b) garbage-pointer read in fspx (ri57).
+  Frame state (B): target0 (tex 100053700) gets ~300 draws, all navy ff2c2020; the PRESENTED resource (tex 100000000) and target2 get 15
+  draws and are all zero => the window is black because the presented surface is not the one drawn into. PREVIEW=60 printed nothing.
+- Build 61 (md5 f89c44c5): HEAP_MIRROR=3 + an unconditional rolling title->mirror copy (HEAP_MIRROR_ROLL, default 32 chunks = 2 MiB/sync,
+  full refresh every 19 syncs). Theory (Plausible): another arena writer (title-VA ring sync) clobbers the mirror range; =1 repaired it
+  each submit, =3 did not -> ri57's cs_25d19264 garbage read. Handed ri58 (re58 = re55 + ROLL=32) and ri59 (re59 = re58 + PTR_CHECK only
+  on cs_25d19264/c5b1005e/344692c2/cee65a2d).
+- NEXT: (1) ri58/ri59 results. (2) Indirect-draw FE fault: dump the 16 arg bytes at arena 0xfee85000 at submit (CPU view) and find the
+  resource there (slot 133 placed buffers / stand-ins); clamp/validate args (vertexCount, instanceCount) in a prepass if garbage.
+  (3) Check whether draw ring sync can write into the mirror range (log sync_title_range hits in [mirror, mirror+38 MiB)).
+  (4) Present surface mismatch: 100000000 vs the drawn 100053700.
+- Recommended env now: build 61 + re58.env.

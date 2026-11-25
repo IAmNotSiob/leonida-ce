@@ -14,6 +14,7 @@
 #include "d3d12_com_object.h"
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
+#include "page_alias.h"
 #include "dxgi_com.h"
 #include "../src/ce_checkpoints.h"
 #include "../src/arena_size.h"
@@ -104,30 +105,180 @@ static void ce_arena_tally_report() {
 #include <set>
 // HACK (agA17, LEONIDA_CE_HEAP_MIRROR): console-addressed shader-visible descriptor heaps mirrored into the arena;
 // ExecuteCommandLists copies title bytes -> mirror before the lists replay (leonida::ce::heap_sync_fn).
-struct CeHeapMirror { const std::uint8_t* title; std::uint8_t* arena; std::size_t bytes; };
+// agA18: LEONIDA_CE_HEAP_MIRROR=2 tracks writes to the title heap instead of copying all of it on every submit.
+// The title heap is a physical-page window (MEM_MAPPED view of a SEC_RESERVE section, committed on touch by xmem's
+// physical_page_fault), so chunks can only be protected once committed. Per 64 KiB chunk: dirty=1 (copy at the next
+// sync, then try to make it PAGE_READONLY; stays dirty while the protect fails) or 0 (read-only, mirror current).
+// The first write to a clean chunk faults into ce_hm_veh (also called first from xmem's handler via
+// rt::xmem::write_track_hook), which marks it dirty and makes it writable. A rolling refresh re-copies
+// LEONIDA_CE_HEAP_MIRROR_ROLL chunks (default 8) per sync regardless, to bound staleness if a page is remapped
+// or written through another alias (not observed; a safety net).
+struct CeHeapMirror {
+    const std::uint8_t* title; std::uint8_t* arena; std::size_t bytes;
+    bool tracked = false; bool cmp_only = false; std::size_t chunks = 0; std::size_t roll = 0;
+    std::shared_ptr<std::atomic<std::uint8_t>[]> dirty;
+    std::shared_ptr<std::uint8_t[]> shadow;  // last bytes copied to the mirror (compare path)
+};
+static std::atomic<std::uint64_t> g_hm_cmp_pages{0};
+// Copies the 4 KiB pages of [off, off+n) that differ from the shadow into the shadow and the mirror; returns bytes copied.
+static std::uint64_t ce_hm_copy_diff(CeHeapMirror& m, std::size_t off, std::size_t n) {
+    std::uint64_t c = 0;
+    for (std::size_t p = off; p < off + n; p += 0x1000) {
+        const std::size_t k = std::min<std::size_t>(0x1000, off + n - p);
+        if (std::memcmp(m.shadow.get() + p, m.title + p, k) == 0) continue;
+        std::memcpy(m.shadow.get() + p, m.title + p, k);
+        std::memcpy(m.arena + p, m.shadow.get() + p, k);
+        c += k;
+    }
+    g_hm_cmp_pages.fetch_add(n / 0x1000, std::memory_order_relaxed);
+    return c;
+}
+static constexpr std::size_t kHmChunk = 0x10000;
 static std::mutex g_hm_mu;
 static std::vector<CeHeapMirror> g_hm;
+static SRWLOCK g_hm_track = SRWLOCK_INIT;  // protect state + dirty bits (the VEH and the sync)
+struct CeHmRange { std::atomic<std::uintptr_t> lo{0}, hi{0}; std::atomic<std::atomic<std::uint8_t>*> dirty{nullptr}; };
+static CeHmRange g_hm_ranges[8];
+static std::atomic<std::uint64_t> g_hm_faults{0}, g_hm_copied{0}, g_hm_syncs{0}, g_hm_protect_fail{0};
+static LONG CALLBACK ce_hm_veh(EXCEPTION_POINTERS* ep) {
+    const auto* r = ep ? ep->ExceptionRecord : nullptr;
+    if (!r || r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2 || r->ExceptionInformation[0] != 1)
+        return EXCEPTION_CONTINUE_SEARCH;
+    const std::uintptr_t a = r->ExceptionInformation[1];
+    for (auto& g : g_hm_ranges) {
+        const std::uintptr_t lo = g.lo.load(std::memory_order_acquire);
+        if (!lo || a < lo || a >= g.hi.load(std::memory_order_acquire)) continue;
+        auto* dirty = g.dirty.load(std::memory_order_acquire);
+        if (!dirty) return EXCEPTION_CONTINUE_SEARCH;
+        const std::size_t idx = (a - lo) / kHmChunk;
+        AcquireSRWLockExclusive(&g_hm_track);
+        dirty[idx].store(1, std::memory_order_relaxed);
+        DWORD old = 0;
+        const BOOL ok = VirtualProtect(reinterpret_cast<void*>(lo + idx * kHmChunk), kHmChunk, PAGE_READWRITE, &old);
+        ReleaseSRWLockExclusive(&g_hm_track);
+        g_hm_faults.fetch_add(1, std::memory_order_relaxed);
+        // Not ours to fix if the chunk was not read-only (uncommitted section page: xmem commits it).
+        return ok && old == PAGE_READONLY ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 static void ce_heap_mirror_sync() {
     std::lock_guard lock(g_hm_mu);
-    for (const auto& m : g_hm) std::memcpy(m.arena, m.title, m.bytes);
-    static std::atomic<std::uint64_t> n{0};
-    const std::uint64_t k = ++n;
-    if ((k & (k - 1)) == 0 && k >= 256) {
+    std::uint64_t copied = 0;
+    static const std::size_t roll_n = [] { const char* e = std::getenv("LEONIDA_CE_HEAP_MIRROR_ROLL"); return e ? std::size_t(std::strtoull(e, nullptr, 0)) : std::size_t(32); }();
+    std::vector<std::size_t> copy, cmp;
+    for (auto& m : g_hm) {
+        if (!m.tracked) { std::memcpy(m.arena, m.title, m.bytes); copied += m.bytes; continue; }
+        copy.clear();
+        cmp.clear();
+        AcquireSRWLockExclusive(&g_hm_track);
+        for (std::size_t i = 0; i < m.chunks; ++i) {
+            if (!m.dirty[i].load(std::memory_order_relaxed)) continue;
+            if (m.cmp_only) { cmp.push_back(i); continue; }  // =3: compare every chunk with the shadow, never protect
+            DWORD old = 0;
+            if (VirtualProtect(const_cast<std::uint8_t*>(m.title) + i * kHmChunk, kHmChunk, PAGE_READONLY, &old)) {
+                m.dirty[i].store(0, std::memory_order_relaxed);
+                copy.push_back(i);
+                continue;
+            }
+            // Not protectable (Wine: the physical-page views stay MEM_RESERVE, error 487): compare with the shadow.
+            cmp.push_back(i);
+            if (g_hm_protect_fail.fetch_add(1, std::memory_order_relaxed) < 4) {
+                const DWORD err = GetLastError();
+                MEMORY_BASIC_INFORMATION q{};
+                VirtualQuery(m.title + i * kHmChunk, &q, sizeof q);
+                std::fprintf(stderr, "[hack] HEAP_MIRROR=2: protect chunk %zu failed (error %lu): base %p alloc %p region 0x%llx "
+                             "state 0x%lx type 0x%lx protect 0x%lx\n", i, (unsigned long)err, q.BaseAddress, q.AllocationBase,
+                             (unsigned long long)q.RegionSize, (unsigned long)q.State, (unsigned long)q.Type, (unsigned long)q.Protect);
+            }
+        }
+        ReleaseSRWLockExclusive(&g_hm_track);
+        // Copy after re-protecting: a write racing the copy faults, re-marks the chunk, and the next sync copies it.
+        // agA18 (build 61): the roll copies title -> shadow -> mirror UNCONDITIONALLY, so a mirror chunk clobbered by another
+        // arena writer (e.g. a title-VA ring sync landing in the mirror range) is repaired within chunks/roll syncs.
+        for (std::size_t k = 0; k < roll_n && m.chunks; ++k) copy.push_back((m.roll++) % m.chunks);
+        for (const std::size_t i : copy) {
+            const std::size_t off = i * kHmChunk, n = std::min(m.bytes, off + kHmChunk) - off;
+            std::memcpy(m.shadow.get() + off, m.title + off, n);
+            std::memcpy(m.arena + off, m.shadow.get() + off, n);
+            copied += n;
+        }
+        for (const std::size_t i : cmp) {
+            const std::size_t off = i * kHmChunk, n = std::min(m.bytes, off + kHmChunk) - off;
+            copied += ce_hm_copy_diff(m, off, n);
+        }
+    }
+    g_hm_copied.fetch_add(copied, std::memory_order_relaxed);
+    const std::uint64_t k = g_hm_syncs.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((k & (k - 1)) == 0 && k >= 64) {
         std::size_t total = 0;
         for (const auto& m : g_hm) total += m.bytes;
-        std::fprintf(stderr, "[hack] HEAP_MIRROR: %llu syncs, %zu heaps, %zu KiB each sync\n", (unsigned long long)k,
-                     g_hm.size(), total / 1024);
+        std::fprintf(stderr, "[hack] HEAP_MIRROR: %llu syncs, %zu heaps, %zu KiB heap, %llu KiB copied in all (%llu KiB/sync), "
+                     "%llu write faults, %llu protect failures, %llu KiB compared\n",
+                     (unsigned long long)k, g_hm.size(), total / 1024, (unsigned long long)(g_hm_copied.load() / 1024),
+                     (unsigned long long)(g_hm_copied.load() / 1024 / k), (unsigned long long)g_hm_faults.load(),
+                     (unsigned long long)g_hm_protect_fail.load(), (unsigned long long)(g_hm_cmp_pages.load() * 4));
     }
 }
-static void ce_heap_mirror_add(const std::uint8_t* title, std::uint8_t* arena, std::size_t bytes) {
+static void ce_heap_mirror_add(const std::uint8_t* title, std::uint8_t* arena, std::size_t bytes, int mode) {
     std::lock_guard lock(g_hm_mu);
-    g_hm.push_back({title, arena, bytes});
+    CeHeapMirror m{title, arena, bytes};
+    MEMORY_BASIC_INFORMATION mbi{};
+    VirtualQuery(title, &mbi, sizeof(mbi));
+    std::fprintf(stderr, "[hack] HEAP_MIRROR: title heap %p: base %p alloc %p region 0x%llx state 0x%lx type 0x%lx protect 0x%lx\n",
+                 (const void*)title, mbi.BaseAddress, mbi.AllocationBase, (unsigned long long)mbi.RegionSize,
+                 (unsigned long)mbi.State, (unsigned long)mbi.Type, (unsigned long)mbi.Protect);
+    if (mode == 3) {  // agA18: compare-only (no page protection, no VEH)
+        m.tracked = m.cmp_only = true;
+        m.chunks = (bytes + kHmChunk - 1) / kHmChunk;
+        m.dirty.reset(new std::atomic<std::uint8_t>[m.chunks]);
+        for (std::size_t i = 0; i < m.chunks; ++i) m.dirty[i].store(1);
+        m.shadow.reset(new std::uint8_t[m.chunks * kHmChunk]);
+        std::memcpy(m.shadow.get(), title, bytes);
+        std::fprintf(stderr, "[hack] HEAP_MIRROR=3: comparing %p with a shadow in %zu chunks of 64 KiB per sync\n",
+                     (const void*)title, m.chunks);
+    } else if (mode == 2 && (reinterpret_cast<std::uintptr_t>(title) & (kHmChunk - 1)) == 0) {
+        int slot = -1;
+        for (int i = 0; i < 8; ++i) if (!g_hm_ranges[i].lo.load()) { slot = i; break; }
+        static const bool veh = [] {
+            rt::xmem::write_track_hook().store(&ce_hm_veh);
+            return AddVectoredExceptionHandler(1, &ce_hm_veh) != nullptr;
+        }();
+        if (slot >= 0) {
+            m.tracked = true;
+            m.chunks = (bytes + kHmChunk - 1) / kHmChunk;
+            m.dirty.reset(new std::atomic<std::uint8_t>[m.chunks]);
+            for (std::size_t i = 0; i < m.chunks; ++i) m.dirty[i].store(1);  // all copied + protected at the first sync
+            m.shadow.reset(new std::uint8_t[m.chunks * kHmChunk]);
+            std::memcpy(m.shadow.get(), title, bytes);  // the constructor already copied title -> mirror
+            g_hm_ranges[slot].dirty.store(m.dirty.get(), std::memory_order_release);
+            g_hm_ranges[slot].hi.store(reinterpret_cast<std::uintptr_t>(title) + m.chunks * kHmChunk, std::memory_order_release);
+            g_hm_ranges[slot].lo.store(reinterpret_cast<std::uintptr_t>(title), std::memory_order_release);
+        }
+        std::fprintf(stderr, "[hack] HEAP_MIRROR=2: %s writes to %p in %zu chunks of 64 KiB (veh %d)\n",
+                     m.tracked ? "tracking" : "NOT tracking", (const void*)title, m.chunks, int(veh));
+    }
+    g_hm.push_back(std::move(m));
     leonida::ce::heap_sync_fn().store(&ce_heap_mirror_sync);
 }
 static void ce_heap_mirror_remove(const std::uint8_t* title) {
     std::lock_guard lock(g_hm_mu);
     for (auto it = g_hm.begin(); it != g_hm.end(); ++it)
-        if (it->title == title) { g_hm.erase(it); break; }
+        if (it->title == title) {
+            if (it->tracked) {
+                for (auto& g : g_hm_ranges)
+                    if (g.lo.load() == reinterpret_cast<std::uintptr_t>(title)) { g.lo.store(0); g.hi.store(0); }
+                AcquireSRWLockExclusive(&g_hm_track);
+                for (std::size_t i = 0; i < it->chunks; ++i) {
+                    DWORD old = 0;
+                    if (!it->dirty[i].load()) VirtualProtect(const_cast<std::uint8_t*>(title) + i * kHmChunk, kHmChunk, PAGE_READWRITE, &old);
+                }
+                ReleaseSRWLockExclusive(&g_hm_track);
+                new std::shared_ptr<std::atomic<std::uint8_t>[]>(it->dirty);  // a VEH may still hold it: leak (tiny)
+            }
+            g_hm.erase(it);
+            break;
+        }
 }
 static std::uint8_t* g_pc_mapped = nullptr;
 static std::uint64_t g_pc_size = 0;
@@ -204,6 +355,32 @@ static void ce_pc_scan_buffer(std::uint64_t pipe, unsigned sgpr, unsigned slot, 
 }
 static void ce_ptr_check(const std::uint32_t* s, std::uint32_t vm, std::uint32_t tm, std::uint64_t pipe) {
     if (!g_pc_ctx || !g_pc_mapped) return;
+    // agA18: LEONIDA_CE_PTR_CHECK_ONLY=sub1,sub2,..: only pipelines whose name contains one of the substrings.
+    static const std::vector<std::string> only = [] {
+        std::vector<std::string> v;
+        if (const char* e = std::getenv("LEONIDA_CE_PTR_CHECK_ONLY")) {
+            std::string t = e; std::size_t p = 0;
+            while (p <= t.size()) { std::size_t q = t.find(',', p); if (q == std::string::npos) q = t.size();
+                if (q > p) v.push_back(t.substr(p, q - p)); p = q + 1; }
+        }
+        return v;
+    }();
+    if (!only.empty()) {
+        static std::mutex mu; static std::unordered_map<std::uint64_t, bool> keep;
+        bool k;
+        {
+            std::lock_guard lock(mu);
+            auto it = keep.find(pipe);
+            if (it == keep.end()) {
+                const std::string nm = leonida::ce::pipeline_name(pipe);
+                bool m = false;
+                for (const auto& o : only) m = m || nm.find(o) != std::string::npos;
+                it = keep.emplace(pipe, m).first;
+            }
+            k = it->second;
+        }
+        if (!k) return;
+    }
     const std::uint64_t n = ++g_pc_dispatches;
     bool deep = g_pc_level >= 2;
     if (deep) {
@@ -2094,7 +2271,7 @@ public:
             // arena + low 32 bits), so tables into this heap read unrelated arena bytes (ri49: floats, stack data;
             // the post-Confirm device loss). Give the heap an arena mirror: its GPU handle is the mirror's offset,
             // and every ExecuteCommandLists copies the title bytes into the mirror (ce_heap_mirror_sync).
-            static const bool mirror = [] { const char* e = std::getenv("LEONIDA_CE_HEAP_MIRROR"); return e && e[0] == '1'; }();
+            static const int mirror = [] { const char* e = std::getenv("LEONIDA_CE_HEAP_MIRROR"); return e && e[0] >= '1' && e[0] <= '3' ? e[0] - '0' : 0; }();
             std::fprintf(stderr, "[hack] console descriptor heap: type %d count %u flags 0x%x address 0x%llx size 0x%llx%s\n",
                          int(desc_.Type), desc_.NumDescriptors, unsigned(desc_.Flags),
                          (unsigned long long)console_address_, (unsigned long long)console_size_,
@@ -2103,7 +2280,7 @@ public:
                 device.arena_allocate(bytes, 256, arena_offset_, DeviceState::arena_descriptor_heap)) {
                 mirrored_ = true;
                 std::memcpy(device.arena.mapped + arena_offset_, cpu_, std::size_t(bytes));
-                ce_heap_mirror_add(cpu_, device.arena.mapped + arena_offset_, std::size_t(bytes));
+                ce_heap_mirror_add(cpu_, device.arena.mapped + arena_offset_, std::size_t(bytes), mirror);
                 std::fprintf(stderr, "[hack] HEAP_MIRROR: console heap 0x%llx (%llu KiB) -> arena VA 0x%llx\n",
                              (unsigned long long)console_address_, (unsigned long long)(bytes / 1024),
                              (unsigned long long)arena_offset_);

@@ -37,4 +37,14 @@ inline std::atomic<WritePageFn>& write_page_hook() {
     return hook;
 }
 
+// agA18 hack (LEONIDA_CE_HEAP_MIRROR=2): d3d12's write tracker for the console descriptor heap. xmem's
+// physical_page_fault calls it first, so a write to a chunk the tracker made read-only is not mistaken for an
+// already-committed page (which would return CONTINUE_EXECUTION and fault forever).
+using WriteTrackFn = long (__stdcall*)(struct _EXCEPTION_POINTERS*);
+
+inline std::atomic<WriteTrackFn>& write_track_hook() {
+    static std::atomic<WriteTrackFn> hook{nullptr};
+    return hook;
+}
+
 }  // namespace rt::xmem
