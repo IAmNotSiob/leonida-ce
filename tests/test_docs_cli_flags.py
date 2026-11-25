@@ -24,6 +24,11 @@ SOURCE_SUFFIXES = (".py", ".ps1", ".cpp", ".cc", ".c", ".h", ".hpp", ".cmake", "
                    ".bat", ".sh", ".yml", ".yaml", ".csproj")
 # Flags of other programs the docs quote: gh (AGENTS.md), pip (docs/shader_validation.md), argparse itself.
 FOREIGN = {"--search", "--state", "--index-url", "--help"}
+# spirv-opt's own passes, which docs/embedded_shaders.md names for runs made by hand; no tracked source runs them.
+FOREIGN |= {"--ssa-rewrite", "--eliminate-dead-code-aggressive", "--eliminate-dead-branches", "--merge-blocks",
+            "--cfg-cleanup", "--merge-return", "--scalar-replacement"}
+# A shell command substitution such as "$(brew --prefix llvm)" runs another program; its flags are not the tool's.
+SUBSTITUTION = re.compile(r"\$\([^()]*\)")
 # Pages that quote another project's tree (SCARAB, americas-recomp).
 OTHER_PROJECTS = {"docs/fssm_crosscheck.md", "docs/d3d12_xs_surface.md"}
 COMMAND = re.compile(r"\bpython3?(?: -I)? ((?:tools|scripts)/[\w/]+\.py|make_game\.py)\b")
@@ -179,7 +184,7 @@ def tool_flag_mismatches(pages, sources):
             source = sources.get(tool, "")
             if '"--" +' in source or "'--' +" in source:
                 continue
-            for flag in sorted(set(FLAG.findall(cmd))):
+            for flag in sorted(set(FLAG.findall(SUBSTITUTION.sub("", cmd)))):
                 if flag not in FOREIGN and flag not in source:
                     out.append((f"{page}:{n}", tool, flag))
     return out
@@ -228,8 +233,9 @@ class DocsCliFlags(unittest.TestCase):
 
     def test_checkers_report_only_the_missing_flag(self):
         pages = {"docs/a.md": "Use `--real` or `--gone`, and `gh --search`.\n"
-                              "```\npython -I tools/x.py --real --old \\\n    --more\npython -I tools/y.py --old\n```\n"}
-        self.assertEqual(unknown_flags(pages, '"--real" "--more" "--old"'), [("docs/a.md:1", "--gone")])
+                              "```\npython -I tools/x.py --real --old \\\n    --more\npython -I tools/y.py --old\n"
+                              "python -I tools/y.py --old \"$(brew --prefix llvm)/bin/llvm-mc\"\n```\n"}
+        self.assertEqual(unknown_flags(pages, '"--real" "--more" "--old" "--prefix"'), [("docs/a.md:1", "--gone")])
         sources = {"tools/x.py": 'add("--real") add("--more")', "tools/y.py": 'add("--old")'}
         self.assertEqual(tool_flag_mismatches(pages, sources), [("docs/a.md:3", "tools/x.py", "--old")])
         sources["tools/x.py"] += ' "--" + name'
