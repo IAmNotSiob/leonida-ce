@@ -148,3 +148,13 @@ These commands use the package in `game_path.txt`, the port's `overlay` for writ
 
 When the Vulkan backend is selected with `LEONIDA_D3D12=vulkan`, the packaged runtime finds the translated shaders
 in `<work>/shaders/spirv` using `shader_path.txt` beside `gta6rt.exe`. Set `LEONIDA_SHADERS` to use another directory.
+
+**Set `LEONIDA_ARENA_MB=4095`.** The title now creates far more GPU resources during boot than the default arena
+holds. When the arena is too small, the failure does not say so plainly: it shows up as thousands of
+`E_OUTOFMEMORY` (`0x8007000e`) results from `CreatePlacedResourceX` and `CreatePipelineState`, after a single
+`GPU address arena full` line. The arena lives in system RAM when the GPU has no Resizable BAR, so 4095 is fine
+on 8 GB cards too.
+
+The fixes that get the title's own UI on screen and the boot through first-boot setup and the legal terms live on
+the `first-light` branch, behind `LEONIDA_CE_*` switches that default to off. See `hacks/BOOT_NOTES.md` there for
+the switch set that is used in test runs.
