@@ -102,6 +102,10 @@ class TranslateLockedIndexTest(unittest.TestCase):
             return real_open(path, mode, *a, **k)
 
         class Exited(Done):
+            # translate() reaps its shards with poll(); wait() is kept for _stop_procs().
+            def poll(self):
+                return shard_code
+
             def wait(self):
                 return shard_code
 

@@ -159,6 +159,12 @@ eight slots and `ID3D12Pageable` adds none.
 | 17 | `0x088` | `GetClockCalibration` | `d3d12.h:8751` |
 | 18 | `0x090` | `GetDesc` (returns the 16-byte desc by value on MSVC) | `d3d12.h:8756` |
 
+The runtime's queue, fence and device proxies (`runtime/shims/d3d12_xs_device.cpp`) answer the title's own
+layout (queue slots 16–19 two ahead of this chain, `CopyPageMappingsBatchX` / `PresentX` / `ExecuteCommandListsX`
+at queue slots 31/32/35, the fence value address at fence slot 12, placed views at device slots 70/71) only while
+the retail title is mapped at its image base `0x140000000` (`xs_title_loaded()`); without a title, as in the unit
+tests, they keep the public order above. `LEONIDA_CE_TITLE_LAYOUT=1` or `=0` forces the answer.
+
 `ID3D12CommandAllocator` is declared at `d3d12.h:5193`; it has 9 slots (0–8), with
 `Reset` at slot 8 (`d3d12.h:5196`).
 

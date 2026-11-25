@@ -26,6 +26,7 @@ class BuildDestinationTest(unittest.TestCase):
         self.game = os.path.join(self.root, "game")
         os.mkdir(self.game)
         self.alias = os.path.join(self.root, "game-link")
+        self.version = {}  # what make_game.check() returns; see manifest_with()
 
     def link(self, target, path):
         if os.name == "nt":
@@ -39,13 +40,19 @@ class BuildDestinationTest(unittest.TestCase):
             os.symlink(target, path, target_is_directory=True)
             self.addCleanup(os.unlink, path)
 
+    @staticmethod
+    def manifest_with(entries):
+        """A version manifest whose top-level names are ``entries``: at a drive-root --game, make_game takes the
+        game folder's own entries from the manifest, not from listing the drive (#6798)."""
+        return {"expected_exe": f"{entries[0]}/Game.exe", "files": {f"{entry}/a.bin": {} for entry in entries}}
+
     def run_build(self, game, out, work, rejected):
         argv = ["make_game.py", "--game", game, "--out", out, "--work", work,
                 "--stages", "runtime", "--no-tui"]
         with ExitStack() as stack:
             stack.enter_context(patch.object(sys, "argv", argv))
             stack.enter_context(patch("make_game.below_normal"))
-            stack.enter_context(patch("make_game.check", return_value={}))
+            stack.enter_context(patch("make_game.check", return_value=self.version))
             stack.enter_context(patch("make_game.log"))
             preflight = stack.enter_context(patch("make_game.preflight"))
             build_runtime = stack.enter_context(patch("make_game.runtime"))
@@ -94,13 +101,13 @@ class BuildDestinationTest(unittest.TestCase):
         drive = os.path.splitdrive(self.root)[0] + "\\"
         content_dir = os.path.join(drive, "Content")
         independent_dir = os.path.join(drive, "Leonida_Build")
-        with patch("os.listdir", return_value=["Content"]):
-            # Allowed: destination is an independent folder on the drive root
-            self.run_build(drive, independent_dir, os.path.join(independent_dir, "work"), rejected=False)
-            # Rejected: destination is inside the game dump's own top-level entry
-            self.run_build(drive, os.path.join(content_dir, "out"), os.path.join(self.root, "work"), rejected=True)
-            # Rejected: destination is the drive root itself
-            self.run_build(drive, drive, os.path.join(self.root, "work"), rejected=True)
+        self.version = self.manifest_with(["Content"])
+        # Allowed: destination is an independent folder on the drive root
+        self.run_build(drive, independent_dir, os.path.join(independent_dir, "work"), rejected=False)
+        # Rejected: destination is inside the game dump's own top-level entry
+        self.run_build(drive, os.path.join(content_dir, "out"), os.path.join(self.root, "work"), rejected=True)
+        # Rejected: destination is the drive root itself
+        self.run_build(drive, drive, os.path.join(self.root, "work"), rejected=True)
 
     def test_drive_root_checks_entries_on_each_volume(self):
         if os.name != "nt":
@@ -120,7 +127,8 @@ class BuildDestinationTest(unittest.TestCase):
             (["MountedContent", "Content"], os.path.join(root, "Content")),
             (["Content", "MountedContent"], mounted_content),
         ):
-            with patch("os.listdir", return_value=entries), patch("os.path.realpath", side_effect=realpath):
+            self.version = self.manifest_with(entries)
+            with patch("os.path.realpath", side_effect=realpath):
                 for option in ("out", "work"):
                     with self.subTest(protected=protected, option=option):
                         destinations = {name: os.path.join(self.root, name) for name in ("out", "work")}

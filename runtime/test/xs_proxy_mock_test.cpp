@@ -747,10 +747,12 @@ int check_allocators() {
         EXPECT(xs::is_allocator_proxy(allocator) && word(xs::allocator_proxy_real_allocator(allocator)) == word(real));
         EXPECT(mock->args[9][0] == D3D12_COMMAND_LIST_TYPE_DIRECT && real->refs == 1);
         EXPECT(xs::allocator_proxy_slot_count(allocator) == 9 && xs::device_proxy_ref_count(device) == device_refs + 1);
-        // Reset (slot 8) reaches the real allocator; every slot past it up to the table end is refused.
+        // Reset (slot 8) reaches the real allocator; every slot past it up to the table end is refused, except slot 9,
+        // which answers S_OK without reaching the real allocator (the retail title loops on it; allocator_proxy_test
+        // pins the same answer).
         EXPECT(hr_of(raw(allocator, 8)) == S_OK && real->calls[8] == 1);
         for (unsigned slot = 9; slot < xs::allocator_proxy_table_size(); ++slot)
-            EXPECT(hr_of(raw(allocator, slot)) == E_NOTIMPL && real->calls[slot] == 0);
+            EXPECT(hr_of(raw(allocator, slot)) == (slot == 9 ? S_OK : E_NOTIMPL) && real->calls[slot] == 0);
         // The tag and the real object stay hidden: QueryInterface answers only the modelled interfaces.
         void* found = reinterpret_cast<void*>(1);
         EXPECT(hr_of(raw(allocator, 0, word(&xs::kLeonidaCommandAllocatorTag), word(&found))) == E_NOINTERFACE &&
@@ -1112,16 +1114,13 @@ int check_console_command_list() {
     EXPECT(xs::is_command_list_proxy(list_proxy));
     EXPECT(xs::command_list_proxy_table_size() == 160);
 
-    // 3. Inline cursor pinning: +0x18, +0x28, +0x30
+    // 3. Inline cursor: the put pointer (+0x18) and the four limits (+0x20..+0x38) are all zero, so every inline
+    // "room left?" check in the title fails and each command reaches the method table (Leonida CE, after VIctory's
+    // list.rs). The old pinning (one address at +0x18/+0x28/+0x30, +0x20/+0x38 left 0) let "limit - put" wrap.
     const auto base = reinterpret_cast<std::uintptr_t>(list_proxy);
-    std::uint64_t c18 = 0, c28 = 0, c30 = 0;
-    std::memcpy(&c18, reinterpret_cast<const void*>(base + 0x18), sizeof(c18));
-    std::memcpy(&c28, reinterpret_cast<const void*>(base + 0x28), sizeof(c28));
-    std::memcpy(&c30, reinterpret_cast<const void*>(base + 0x30), sizeof(c30));
-    const std::uint64_t expected_limit = static_cast<std::uint64_t>(base + 0x18 + 0x500);
-    EXPECT(c18 == expected_limit);
-    EXPECT(c28 == expected_limit);
-    EXPECT(c30 == expected_limit);
+    std::uint64_t cursor[5] = {1, 1, 1, 1, 1};
+    std::memcpy(cursor, reinterpret_cast<const void*>(base + 0x18), sizeof(cursor));
+    for (const std::uint64_t word_at : cursor) EXPECT(word_at == 0);
 
     // 4. Console slot routing on ListProxy
     Mock* real_list = reinterpret_cast<Mock*>(xs::command_list_proxy_real_list(list_proxy));
@@ -1161,22 +1160,27 @@ int check_console_command_list() {
     EXPECT(real_list->calls[59] == 1);
     EXPECT(real_list->args[59][0] == 0x10);
 
-    // Console slot 148 (AllocateUploadMemory stub) -> returns 0 without faulting
-    EXPECT(raw(list_proxy, 148, 2048, 512, 0, 0) == 0);
-    EXPECT(xs::list_slot_hits(148) == 1);
+    // Console slot 148 (AllocateUploadMemory(size, alignment)): CPU-writable memory at the asked alignment, kept until
+    // the list's next reset (Leonida CE; it used to be a stub returning 0). A non-power-of-two alignment gets 0.
+    const std::uint64_t upload = raw(list_proxy, 148, 2048, 512, 0, 0);
+    EXPECT(upload != 0 && upload % 512 == 0);
+    if (upload) std::memset(reinterpret_cast<void*>(upload), 0xab, 2048);
+    EXPECT(raw(list_proxy, 148, 64, 24, 0, 0) == 0);
+    EXPECT(xs::list_slot_hits(148) == 2);
     EXPECT(xs::list_slot_first_call_seen(148));
 
     // Console slot 146 (Barrier) on base 60-slot list returns E_NOTIMPL (PC slot 80 >= 60)
     EXPECT(hr_of(raw(list_proxy, 146, 0, 0, 0, 0)) == E_NOTIMPL);
 
     // Console slot 10 (Reset) unwraps allocator proxy and re-pins inline cursor
-    std::uint64_t zero = 0;
-    std::memcpy(reinterpret_cast<void*>(base + 0x18), &zero, sizeof(zero));
+    // (the title's inline writes would have moved the cursor: dirty all five words first)
+    const std::uint64_t dirty[5] = {0x1111, 0x2222, 0x3333, 0x4444, 0x5555};
+    std::memcpy(reinterpret_cast<void*>(base + 0x18), dirty, sizeof(dirty));
     EXPECT(hr_of(raw(list_proxy, 10, word(allocator), 0, 0, 0)) == S_OK);
     EXPECT(real_list->calls[10] == 1);
     EXPECT(real_list->args[10][0] == word(real_allocator));
-    std::memcpy(&c18, reinterpret_cast<const void*>(base + 0x18), sizeof(c18));
-    EXPECT(c18 == expected_limit);
+    std::memcpy(cursor, reinterpret_cast<const void*>(base + 0x18), sizeof(cursor));
+    for (const std::uint64_t word_at : cursor) EXPECT(word_at == 0);
 
     // Console slot 7 (GetDevice) returns device proxy
     void* list_dev = nullptr;

@@ -56,6 +56,16 @@
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
+#ifdef _WIN32
+// copy_title_bytes / title_readable query and read title memory directly (VirtualQuery, SEH).
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 #include <cstdlib>
 #include <cstring>
 #include <atomic>

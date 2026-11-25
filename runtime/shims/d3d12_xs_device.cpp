@@ -66,6 +66,12 @@ bool leonida_is_sf_batch_pso(std::uint64_t pso) {
         if (g_leonida_sf_batch_psos[i].load(std::memory_order_relaxed) == pso) return true;
     return false;
 }
+
+// Tests that compile this file without the XMem allocator (shims/xmem.cpp) still link: the commits before reads of
+// title memory (rt::xmem::commit_physical_range) fall back to a no-op there (MSVC / lld-link weak alias).
+extern "C" bool leonida_ce_xmem_commit_fallback(const void*, std::size_t) { return false; }
+#pragma comment(linker, "/alternatename:?commit_physical_range@xmem@rt@@YA_NPEBX_K@Z=leonida_ce_xmem_commit_fallback")
+
 namespace rt::d3d12_xs {
 namespace {
 
@@ -98,6 +104,25 @@ bool xs_readable(const void* p, std::size_t len) {
         at = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
         if (cache_on) cache[next++ % 32] = {reinterpret_cast<std::uintptr_t>(mbi.BaseAddress), at, now};
     }
+    return true;
+}
+
+// Leonida CE: whether the retail title is mapped (the loader puts it at its image base, 0x140000000). The title's own
+// method layouts (queue slots 16-19 two ahead of the PC chain, CopyPageMappingsBatchX/PresentX/ExecuteCommandListsX at
+// queue slots 31/32/35, the fence value address at fence slot 12, placed views at device slots 70/71) apply only then;
+// without a title (the unit tests, other titles' callers) the proxies keep the documented PC-chain behaviour.
+// LEONIDA_CE_TITLE_LAYOUT=1 or 0 forces the answer. A positive answer is kept: the title never unmaps.
+bool xs_title_loaded() {
+    static std::atomic<bool> seen{false};
+    if (seen.load(std::memory_order_relaxed)) return true;
+    static const int forced = [] {
+        char v[8] = {};
+        return GetEnvironmentVariableA("LEONIDA_CE_TITLE_LAYOUT", v, sizeof(v)) ? (v[0] == '1' ? 1 : 0) : -1;
+    }();
+    if (forced >= 0) return forced == 1;
+    const void* const base = reinterpret_cast<const void*>(0x140000000ull);
+    if (base == static_cast<const void*>(GetModuleHandleW(nullptr)) || !xs_readable(base, 1)) return false;
+    seen.store(true, std::memory_order_relaxed);
     return true;
 }
 
@@ -2081,7 +2106,7 @@ void note_heap_slot(unsigned slot) {
 __declspec(noinline) std::uint64_t hr_to_u64(HRESULT hr) {
     if (FAILED(hr)) {  // HACK diagnostic
         static std::atomic<int> n{0};
-        if (n++ < 40) { std::fprintf(stderr, "[hack] routed call FAILED 0x%08lx from %p\n", (unsigned long)hr, _ReturnAddress()); std::fflush(stderr); }
+        if (n++ < 40) { std::fprintf(stderr, "[hack] routed call failed 0x%08lx from %p\n", (unsigned long)hr, _ReturnAddress()); std::fflush(stderr); }
     }
     return static_cast<std::uint64_t>(static_cast<std::uint32_t>(hr));
 }
@@ -2406,7 +2431,7 @@ std::uint64_t WINAPI heap_slot(HeapProxy* self, std::uint64_t a1, std::uint64_t 
         const std::uint64_t r_ = fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
         if (static_cast<std::int32_t>(r_) < 0 && (static_cast<std::uint32_t>(r_) >> 16) >= 0x8000u) {  // HACK diagnostic
             static std::atomic<int> n_{0};
-            if (n_++ < 20) { std::fprintf(stderr, "[hack] %s slot %u FAILED 0x%08x caller %p\n", __FUNCTION__, Slot,
+            if (n_++ < 20) { std::fprintf(stderr, "[hack] %s slot %u failed 0x%08x caller %p\n", __FUNCTION__, Slot,
                                           static_cast<unsigned>(r_), _ReturnAddress()); std::fflush(stderr); }
         }
         return r_;
@@ -3362,7 +3387,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         // HACK: the console queue runs two slots ahead of the PC one past Wait: the title calls slot 18 with one
         // UINT64* (GetTimestampFrequency; PC 16). Forwarding it to PC slot 18 (GetDesc) wrote a 16-byte struct
         // over the caller's frame and corrupted its saved rbx.
-        if constexpr (K == ChildKind::queue && Slot == 32) {
+        if constexpr (K == ChildKind::queue && Slot == 32) if (xs_title_loaded()) {
             // HACK: PresentX(planeCount, planes, params) on this title (newer runtime layout, slot 32). No window yet:
             // accept the frame and count it. Plane: Token @0, ResourceCount @8, ppResources @0x10 (xbox_present.h).
             static std::atomic<std::uint64_t> frames{0};
@@ -3481,7 +3506,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             }
             return hr_to_u64(S_OK);
         }
-        if constexpr (K == ChildKind::queue && Slot == 35) {
+        if constexpr (K == ChildKind::queue && Slot == 35) if (xs_title_loaded()) {
             // HACK: console ExecuteCommandLists(count, lists, extra, flags) (PC slot 10 takes count, lists).
             auto* q = static_cast<ID3D12CommandQueue*>(static_cast<IUnknown*>(self->real));
             const UINT n = static_cast<UINT>(a1);
@@ -3519,26 +3544,26 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             }
             return value;
         }
-        if constexpr (K == ChildKind::fence && Slot == 12) {
+        if constexpr (K == ChildKind::fence && Slot == 12) if (xs_title_loaded()) {
             auto* fence = static_cast<ID3D12Fence*>(static_cast<IUnknown*>(self->real));
             return reinterpret_cast<std::uint64_t>(xs_fence_value_address(self, fence));
         }
-        if constexpr (K == ChildKind::queue && Slot == 31) {
+        if constexpr (K == ChildKind::queue && Slot == 31) if (xs_title_loaded()) {
             d3d12_trace::record(child_trace_name<K>(Slot));
             return hr_to_u64(copy_page_mappings_x(static_cast<std::uint32_t>(a1),
                                                   reinterpret_cast<const XsPageBatch*>(a2), a3,
                                                   static_cast<std::uint32_t>(a4)));
         }
-        if constexpr (K == ChildKind::queue && (Slot == 16 || Slot == 17)) {
+        if constexpr (K == ChildKind::queue && (Slot == 16 || Slot == 17)) if (xs_title_loaded()) {
             auto* q = static_cast<ID3D12CommandQueue*>(static_cast<IUnknown*>(self->real));
             auto* fence = reinterpret_cast<ID3D12Fence*>(unwrap_object(a1));
             return hr_to_u64(Slot == 16 ? q->Signal(fence, a2) : q->Wait(fence, a2));
         }
-        if constexpr (K == ChildKind::queue && Slot == 18) {
+        if constexpr (K == ChildKind::queue && Slot == 18) if (xs_title_loaded()) {
             auto* q = static_cast<ID3D12CommandQueue*>(static_cast<IUnknown*>(self->real));
             return hr_to_u64(q->GetTimestampFrequency(reinterpret_cast<UINT64*>(a1)));
         }
-        if constexpr (K == ChildKind::queue && Slot == 19) {
+        if constexpr (K == ChildKind::queue && Slot == 19) if (xs_title_loaded()) {
             auto* q = static_cast<ID3D12CommandQueue*>(static_cast<IUnknown*>(self->real));
             return hr_to_u64(q->GetClockCalibration(reinterpret_cast<UINT64*>(a1), reinterpret_cast<UINT64*>(a2)));
         }
@@ -3593,7 +3618,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         const std::uint64_t r_ = fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
         if (static_cast<std::int32_t>(r_) < 0 && (static_cast<std::uint32_t>(r_) >> 16) >= 0x8000u) {  // HACK diagnostic
             static std::atomic<int> n_{0};
-            if (n_++ < 20) { std::fprintf(stderr, "[hack] %s slot %u FAILED 0x%08x caller %p\n", __FUNCTION__, Slot,
+            if (n_++ < 20) { std::fprintf(stderr, "[hack] %s slot %u failed 0x%08x caller %p\n", __FUNCTION__, Slot,
                                           static_cast<unsigned>(r_), _ReturnAddress()); std::fflush(stderr); }
         }
         return r_;
@@ -4186,7 +4211,7 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
         }
         static std::atomic<int> n{0};
         if (n++ < 12) {
-            std::fprintf(stderr, "[hack] slot 76 CreateCommittedResource FAILED 0x%08lx (heap=%d hflags=0x%x dim=%d %llux%u fmt=%d flags=0x%x state=0x%x) retry -> 0x%08lx\n",
+            std::fprintf(stderr, "[hack] slot 76 CreateCommittedResource failed 0x%08lx (heap=%d hflags=0x%x dim=%d %llux%u fmt=%d flags=0x%x state=0x%x) retry -> 0x%08lx\n",
                          (unsigned long)hr, heap_properties ? (int)heap_properties->Type : -1, (unsigned)heap_flags,
                          (int)pc_desc.Dimension, (unsigned long long)pc_desc.Width, pc_desc.Height, (int)pc_desc.Format,
                          (unsigned)pc_desc.Flags, (unsigned)initial_state, (unsigned long)hr2);
@@ -4875,11 +4900,22 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                 std::fprintf(stderr, "[hack]   blob %d: len 0x%llx head %s map %s\n", i, static_cast<unsigned long long>(len),
                              head, stage.c_str());
             }
-            std::fprintf(stderr, "[hack] slot 57 CreatePipelineState FAILED 0x%08lx (stream %llu bytes)\n", (unsigned long)hr, (unsigned long long)desc->SizeInBytes);
+            std::fprintf(stderr, "[hack] slot 57 CreatePipelineState failed 0x%08lx (stream %llu bytes)\n", (unsigned long)hr, (unsigned long long)desc->SizeInBytes);
             std::fflush(stderr);
         }
         return hr_to_u64(hr);
     } else if constexpr (Slot == 70 || Slot == 71) {
+        if (!xs_title_loaded()) {  // no title: PC slots 70/71, forwarded as any other PC slot
+            note_slot(Slot);
+            if (!self->real || !self->real_vtable) return 0x80004001ull;
+            if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
+            using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                     std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                     std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                     std::uint64_t, std::uint64_t, std::uint64_t);
+            return reinterpret_cast<ForwardFn>(self->real_vtable[Slot])(self->real, a1, a2, a3, a4, a5, a6, a7, a8,
+                                                                         a9, a10, a11, a12, a13, a14);
+        }
         // Placed SRV (70) / UAV (71): (resource desc, view desc + title address at +40, handle).
         auto* rdesc = reinterpret_cast<const D3D12_RESOURCE_DESC*>(a1);
         const auto* vbytes = reinterpret_cast<const std::uint8_t*>(a2);
@@ -4956,6 +4992,14 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
     } else if constexpr (Slot == 133) {
         // HACK stand-in (docs/retail_boot_chain.md 3.4): CreatePlacedResourceX(va, desc, state, clear, riid, out).
         // A committed DEFAULT-heap resource with PC flags only; not tied to va, so CPU writes there never reach it.
+        // Without a title (Leonida CE gate) slot 133 keeps its documented path: the placed-at-VA handler, or
+        // E_NOTIMPL when none is installed.
+        if (!xs_title_loaded())
+            return hr_to_u64(proxy_create_placed_resource_x(self, reinterpret_cast<void*>(a1),
+                                                            reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2),
+                                                            static_cast<std::uint32_t>(a3),
+                                                            reinterpret_cast<const IID*>(a5),
+                                                            reinterpret_cast<void**>(a6)));
         auto* desc_in = reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2);
         auto* riid = reinterpret_cast<const IID*>(a5);
         auto** out = reinterpret_cast<void**>(a6);
@@ -5035,11 +5079,11 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             log_xbox_route_once(Slot, "CreateCommandQueueX", a1, a2, a3, a4, a5);
             // HACK: Xbox queue flags above bit 0 (seen: 2, 3) have no PC meaning; keep DISABLE_GPU_TIMEOUT only.
             D3D12_COMMAND_QUEUE_DESC qd{};
-            if (a1) {
+            // Only a description that carries such flags is copied; a PC-valid one is passed through as given.
+            if (a1 && (static_cast<unsigned>(reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1)->Flags) & ~1u)) {
                 qd = *reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1);
-                if (static_cast<unsigned>(qd.Flags) & ~1u)
-                    std::fprintf(stderr, "[hack] CreateCommandQueueX type=%d flags=0x%x -> 0x%x\n", (int)qd.Type,
-                                 (unsigned)qd.Flags, (unsigned)qd.Flags & 1u);
+                std::fprintf(stderr, "[hack] CreateCommandQueueX type=%d flags=0x%x -> 0x%x\n", (int)qd.Type,
+                             (unsigned)qd.Flags, (unsigned)qd.Flags & 1u);
                 qd.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(static_cast<unsigned>(qd.Flags) & 1u);
                 a1 = reinterpret_cast<std::uint64_t>(&qd);
             }
@@ -5082,7 +5126,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         if ((Slot < 17 || Slot > 24) && static_cast<std::int32_t>(r) < 0 && (static_cast<std::uint32_t>(r) >> 16) >= 0x8000u) {  // HACK diagnostic
             static std::atomic<int> n{0};
             if (n++ < 40) {
-                std::fprintf(stderr, "[hack] device slot %u FAILED 0x%08x  a1=%llx a2=%llx a3=%llx a4=%llx caller %p\n", Slot,
+                std::fprintf(stderr, "[hack] device slot %u failed 0x%08x  a1=%llx a2=%llx a3=%llx a4=%llx caller %p\n", Slot,
                              static_cast<unsigned>(r), (unsigned long long)a1, (unsigned long long)a2,
                              (unsigned long long)a3, (unsigned long long)a4, _ReturnAddress());
                 std::fflush(stderr);

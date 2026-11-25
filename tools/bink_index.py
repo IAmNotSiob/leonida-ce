@@ -396,7 +396,7 @@ def main(argv=None):
     if not rows and not os.path.isdir(a.target) and not is_rpf_archive(a.target):
         # A named file with no Bink 2 stream and no RPF header is a wrong path or
         # format, not an empty index; a directory scan still reports 0 streams.
-        print(f"bink_index: error: {a.target}: not a Bink 2 stream or an RPF archive", file=sys.stderr)
+        print(f"bink_index: error: {a.target}: not a Bink 2 stream (KB2) or an RPF archive", file=sys.stderr)
         return 2
     probe = False
     if a.probe:

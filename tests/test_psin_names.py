@@ -225,9 +225,11 @@ class TestCli(unittest.TestCase):
                 f.write("prop_crate_01\n")
 
             folded_names = os.path.join(tmp, "NAMES.TXT")
-            with (mock.patch.object(report_paths, "path_key", side_effect=str),
+            # same_report_path resolves each path once and then calls the resolved-path helpers (#6268), so those are
+            # the names to patch; patching the public path_key / same_name_on_folding_volume no longer reaches it.
+            with (mock.patch.object(report_paths, "_resolved_key", side_effect=str),
                   mock.patch.object(report_paths.os.path, "samefile", side_effect=OSError("not same")),
-                  mock.patch.object(report_paths, "same_name_on_folding_volume", return_value=True) as probe,
+                  mock.patch.object(report_paths, "_same_resolved_name", return_value=True) as probe,
                   mock.patch.object(sys, "argv", ["psin_names.py", src, "--names", names, "--refs", folded_names])):
                 with self.assertRaises(SystemExit) as cm:
                     N.main()

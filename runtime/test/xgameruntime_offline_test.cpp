@@ -293,22 +293,38 @@ int main() {
     check(at<EnumVoices>(acc, 8)(acc, reinterpret_cast<void*>(&on_state), nullptr) == S_OK &&
               at<EnumVoices>(acc, 8)(acc, nullptr, nullptr) == E_INVALIDARG,
           "XSpeechSynthesizerEnumerateInstalledVoices: no voices, S_OK (a callback is required)");
-    void* synth = reinterpret_cast<void*>(1);
-    check(at<SpeechCreate>(acc, 9)(acc, &synth) == E_FAIL && synth == nullptr,
-          "XSpeechSynthesizerCreate fails offline and nulls the handle");
-    void* stream = reinterpret_cast<void*>(1);
+    // Speech synthesis is silent offline (Leonida CE, after VIctory's speech.rs): the synthesizer and its streams are
+    // fixed handles and every stream is a WAVE file with an empty data chunk, so the title's narration plays nothing
+    // and goes on.
+    void* synth = nullptr;
+    check(at<SpeechCreate>(acc, 9)(acc, &synth) == S_OK && synth != nullptr &&
+              at<SpeechCreate>(acc, 9)(acc, nullptr) == E_POINTER,
+          "XSpeechSynthesizerCreate hands out a synthesizer (a null out pointer is E_POINTER)");
+    void* stream = nullptr;
+    void* ssml_stream = nullptr;
     size_t size = 5, got = 5;
-    check(at<SpeechClose>(acc, 10)(acc, nullptr) == E_INVALIDARG && at<SpeechClose>(acc, 11)(acc, nullptr) == E_INVALIDARG &&
-              at<SpeechClose>(acc, 12)(acc, nullptr) == E_INVALIDARG && at<SpeechClose>(acc, 14)(acc, nullptr) == E_INVALIDARG,
-          "close and set-voice calls on a null handle: E_INVALIDARG");
-    check(at<SpeechStream>(acc, 13)(acc, nullptr, "hi", &stream) == E_INVALIDARG && stream == nullptr,
-          "CreateStreamFromText on a null synthesizer: E_INVALIDARG, no stream");
-    stream = reinterpret_cast<void*>(1);
-    check(at<SpeechStream>(acc, 21)(acc, nullptr, "<speak/>", &stream) == E_INVALIDARG && stream == nullptr,
-          "CreateStreamFromSsml on a null synthesizer: E_INVALIDARG, no stream");
-    check(at<StreamSize>(acc, 15)(acc, nullptr, &size) == E_INVALIDARG && size == 0 &&
-              at<StreamData>(acc, 16)(acc, nullptr, 8, nullptr, &got) == E_INVALIDARG && got == 0,
-          "stream size and data on a null stream: E_INVALIDARG, zero written");
+    check(at<SpeechClose>(acc, 11)(acc, synth) == S_OK && at<SpeechClose>(acc, 12)(acc, synth) == S_OK,
+          "set-voice calls on the synthesizer succeed");
+    check(at<SpeechStream>(acc, 13)(acc, synth, "hi", &stream) == S_OK && stream != nullptr &&
+              at<SpeechStream>(acc, 13)(acc, synth, "hi", nullptr) == E_POINTER,
+          "CreateStreamFromText hands out a stream (a null out pointer is E_POINTER)");
+    check(at<SpeechStream>(acc, 21)(acc, synth, "<speak/>", &ssml_stream) == S_OK && ssml_stream != nullptr,
+          "CreateStreamFromSsml hands out a stream");
+    unsigned char wave[64] = {};
+    unsigned char tiny[8] = {};
+    check(at<StreamSize>(acc, 15)(acc, stream, &size) == S_OK && size == 44 &&
+              at<StreamSize>(acc, 15)(acc, stream, nullptr) == E_POINTER,
+          "the stream is a 44-byte WAVE file");
+    check(at<StreamData>(acc, 16)(acc, stream, sizeof(wave), wave, &got) == S_OK && got == 44 &&
+              std::memcmp(wave, "RIFF", 4) == 0 && std::memcmp(wave + 8, "WAVEfmt ", 8) == 0 &&
+              std::memcmp(wave + 36, "data", 4) == 0 && wave[40] == 0 && wave[41] == 0 && wave[42] == 0 && wave[43] == 0,
+          "the stream data is a RIFF/WAVE header with an empty data chunk (silence)");
+    check(at<StreamData>(acc, 16)(acc, stream, sizeof(tiny), tiny, &got) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) &&
+              at<StreamData>(acc, 16)(acc, stream, sizeof(wave), nullptr, &got) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+          "a short or null data buffer is refused with ERROR_INSUFFICIENT_BUFFER");
+    check(at<SpeechClose>(acc, 14)(acc, stream) == S_OK && at<SpeechClose>(acc, 14)(acc, ssml_stream) == S_OK &&
+              at<SpeechClose>(acc, 10)(acc, synth) == S_OK,
+          "closing the streams and the synthesizer succeeds");
     bool speech_to_text_fails = true;
     for (int slot : {6, 7, 17, 18, 19, 20}) speech_to_text_fails = speech_to_text_fails && FAILED(at<NoArgs>(acc, slot)(acc));
     check(speech_to_text_fails, "speech-to-text display calls fail offline");

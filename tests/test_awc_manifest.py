@@ -360,8 +360,9 @@ class ManifestTest(unittest.TestCase):
         previous = '{"previous": true}\n'
         with open(out, "w", encoding="utf-8") as f:
             f.write(previous)
-        os.chmod(out, 0o444)
-        self.addCleanup(lambda: os.path.exists(out) and os.chmod(out, 0o600))
+        # write_manifest opens a read-only destination for writing before it stages (4d3b63afc), so for anyone but
+        # root a 0o444 manifest is refused before a staging file exists. Give the staging file the read-only mode
+        # it would publish instead, which is what the cleanup has to undo.
         made_writable = []
         real_chmod = os.chmod
 
@@ -371,6 +372,7 @@ class ManifestTest(unittest.TestCase):
             return real_chmod(path, mode, *args, **kwargs)
 
         with mock.patch.object(awc_manifest, "replace_retry", side_effect=OSError("replace denied")), \
+                mock.patch.object(awc_manifest, "published_mode", return_value=0o444), \
                 mock.patch.object(awc_manifest.os, "chmod", chmod):
             with self.assertRaises(OSError):
                 awc_manifest.write_manifest([], 0, 0, "json", out)

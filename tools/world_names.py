@@ -671,6 +671,9 @@ def main(argv=None) -> int:
     try:
         return args.func(args)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
+        # str(OSError) quotes the path as a repr, which doubles every backslash of a Windows path; name it as given.
+        if isinstance(exc, OSError) and exc.filename:
+            exc = f"{exc.filename}: {exc.strerror or exc}"
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 

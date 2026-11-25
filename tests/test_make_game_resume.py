@@ -40,7 +40,24 @@ class ResumeShardsTest(unittest.TestCase):
                 self.n = int(args[args.index("--shard") + 1].split("/")[1])
                 started.append(self.i)
 
-            def wait(self):
+                self.code = None
+
+            def poll(self):
+                # translate() polls its shards; the first poll finishes the fake shard.
+                if self.code is None:
+                    self.code = self._run()
+                return self.code
+
+            def wait(self, timeout=None):
+                return self.poll()
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+            def _run(self):
                 if self.i in crash:
                     return 1
                 with open(os.path.join(spirv, f"shard{self.i}.json"), "w", encoding="utf-8") as f:
