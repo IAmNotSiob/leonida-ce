@@ -1570,3 +1570,26 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   0x4000 bytes, 0) looks like a GPU memcpy by VA (fn 0x140979650: dst [rdx+0x50], src = f([rdx+0x30]), size [rdx+0x24]); 101 at
   0x1450a6651 = (2, 1); 129 via helper 0x14555e640 (0x5c, 1, 1, ..); 70, 74, 75, 126, 131, 132, 142. All start BEFORE Confirm (the
   screens work with them dropped), but slot 62 is the next candidate if a missing copy shows up.
+- rk72 (build 66 + re72 PTR_CHECK): stopped by B before Confirm (budget) to make room for rk73 - lead 1 (high-VA V#s) still untested.
+- rk73 (build 67 + re73): slot 80 forwarded (SLOT80_DISPATCH up to #256: callers BVH RVAs 0x149c0 (1,1,1,W=0x8020), 0x15263 / 0x153ba
+  (x=1..7, W=0x20)). STILL LOST ~139 s after Confirm (Confirm 132.5 s, last probe frame ~2400), same checkpoints (direct
+  cs_956fdcc6, compute cs_c5b1005e x2 / cs_cee65a2d / cs_344692c2), FaultInfo 2 records type 4 (IP_UNKNOWN) 0x2084d0190/0x2084d00a0.
+  Screen: navy from frame 810 to the end (flat loading screen, no UI); vshots /root/rb/rk73v, frames /root/rb/rk73_frames.
+- W word decoded (Likely, RDNA COMPUTE_DISPATCH_INITIATOR): bit 5 USE_THREAD_DIMENSIONS (x,y,z = THREAD counts, hardware masks the
+  partial group), bit 15 CS_W32_EN. The builder computes x as an element count (0x14972 site: ceil((144 n^2 + 64)/16) or [rcx+0x38]).
+  Build 67 therefore over-dispatched by the workgroup size.
+- Build 68 (gta6rt-68.exe, md5 28058f36, commit d02be80ec): LEONIDA_CE_SLOT80_THREADS (default ON with SLOT80_DISPATCH; =0 = build 67):
+  groups = ceil(threads / workgroup size of the bound compute PSO) (list slot 25 tracked per list proxy; Vulkan PSO workgroup size
+  through leonida::ce::local_size_fn, src/ce_checkpoints.h). Partial last group runs full width (no hardware masking on Vulkan).
+- rk74 (build 68 + re74 = re69, rtdump94): conversion works (e.g. (75,1,1) W=0x20 -> 2 groups of 64; ls 32 for the W32 kind).
+  STILL LOST ~148 s after Confirm (Confirm 166.8 s, last probe frame 2640; direct queue had NO checkpoint), same compute checkpoints (cs_c5b1005e x2, cs_344692c2, cs_cee65a2d), FaultInfo
+  1 record type 4 0x20851bb90. => the BVH slot-80 dispatches (dropped, over-dispatched, or exact) are NOT the loss cause (Likely,
+  2 runs). Keep build 68 anyway: it is the correct behaviour for slot 80.
+- NEXT: (1) lead 1 still open: staged as rk75 = build 68 + /root/handoff/re75.env, PTR_CHECK_ONLY on cs_c5b1005e,cs_344692c2,cs_cee65a2d,cs_956fdcc6 (the four
+  checkpoint shaders of rk73/rk74), let it run past Confirm. (2) The loss is at a near-constant ~135-145 s after Confirm while the
+  streamer reads core_bvh4.rpf / ttdb terrain (dstorage #80000, ~2.1 GiB) - check arena/VRAM growth (LEONIDA_ARENA_LOG) right
+  before the loss; a time-based trigger (streaming reaching some asset) fits better than a first-call trigger now. (3) Per-queue
+  localization needs a new switch (no env routes all queues to one VkQueue today): e.g. a vkQueueWaitIdle after each submit on
+  compute queues only, to see whether the hang is on the compute or direct side.
+- Recommended env: build 68 + /root/handoff/re74.env (= re69). Screens: title UI (ACCOUNT PICKER / PLAYER prompts) then the navy
+  post-Confirm loading screen; nothing past it yet.
