@@ -387,6 +387,11 @@ struct RootArgumentLayout {
     std::uint32_t flags = 0;  // D3D12_ROOT_SIGNATURE_FLAGS from the serialized blob
     bool graphics_ok = true;
     bool compute_ok = true;
+    // HACK (agG, LEONIDA_CE_GFX_S8, default on): graphics uses pack_stage(Vertex) -- the console layout from s8, one
+    // dword per table -- instead of pack(). graphics_end is one past its last SGPR; when it is <= 16 every graphics
+    // write is mirrored 8 dwords up as well, so a mesh shader (root arguments from s16) sees the same arguments.
+    bool graphics_console = false;
+    std::uint32_t graphics_end = 0;
 };
 
 // For the command list: the argument layout of a root signature from a Vulkan device, and the id it records for a

@@ -514,3 +514,136 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
 - Probe mode LEONIDA_CE_PROBE_TEX=1 (or ",tex" at the end of LEONIDA_CE_PROBE) logs generated-texture requests
   (+0x1335be6 / +0x1335c05 / +0x133609a): image mips against the node and whether its vtable survives.
 - Open: why the texture lock fails (the console takes the direct path); the screen is still black at state 3.
+- Compute shader coverage (2026-11-24): the runtime had dumped 2,680 untranslated compute containers. Parallel pass:
+  2,675 unpack, 1,536 translate (was 621); in-game untranslated programs 2,064 -> 1,148. Use rdna2spirv --shard i/n
+  and --merge for parallel runs (plain parallel runs corrupt the shared index.json).
+  Of the 1,139 failures, 938 are "fall-through into undecodable words" and about 500+ of those are one thing: a 4-byte
+  word 0xF800xxxx that llvm-mc (gfx1030) decodes as an 8-byte EXP, desyncing the rest of the listing (30,343
+  occurrences; the dword after it is always ordinary code, e.g. s_waitcnt 0xBF8CC07F). The low 16 bits look like byte
+  offsets (0x1160, 0x540, 0xc20, 0x470: multiples of 16; 224 distinct values) and it often sits inside s_clause next
+  to s_load/s_buffer_load: probably an Xbox-GPU-specific compact scalar memory op (load or prefetch). Unknown semantics:
+  treating it as s_nop would be a guess. Other failures: CS thread-group-size SGPR (90), s_bitreplicate on a lane mask
+  (26), ds_append (23), branch into data (20).
+
+## agSA (sender loop, 2026-11-24 evening)
+- LEONIDA_CE_RING_IN_ARENA=1 now also registers the 64 MiB ring (arena VA 0x10000) as a ResourceBinding over the arena
+  VkBuffer (reserve_console_upload_ring), so buffer_at/host_at/RECTLIST resolve ring VAs. Wine sa1 and Windows rb1:
+  PAINT=0x100001900 presents 100% ff7fbf40 at frame 600. Windows composite path works with it (Definite).
+- After boot state 3 (Windows frame ~1200-2400; Wine never gets there, stalls ~frame 700) the UI layer gets no draws;
+  a new 3840x2160 target at 0x100053700/0x100053800 (run-dependent) gets 19 draws/frame. Presented, 0x100000100 and
+  it all read back exactly 1/8 bytes non-zero: pixels (0,0,1)-ish dither, i.e. near black.
+- TDIAG and RTDIAG_PAINT accept <lo>-<hi>; TDIAG range also logs textures in range bound for sampling.
+
+## agA2 (sender loop restart, 2026-11-24 night)
+- rc3 (build 3): 0 RECTLIST misses, every topo-17 draw takes the IA expansion. The state-3 RECTLIST is
+  VS_Blit_a250f417 with NO pixel shader (colour output undefined in Vulkan; the old (0,0,1) upper-left triangle).
+  Its table at root = V#(base = IA view, 0x60 bytes) + the same 3 vertices (-1,1),(-1,-1),(1,-1) stride 24.
+- rb2b/rc3: PAINT on the state-3 target (0x1000537xx..53axx) makes presented 100% teal: it IS composited (Definite).
+- State-3 content = Scaleform: %VVertexCxformEAlpha / _VBatchVertexCxformEAlpha (~17 draws/frame). Batch entries
+  (64 B: cxform mul, add, matrix rows 0/1) in root V#0: 37 entries mul rgb 1.8e-7 (black), 9 entries 0.976 (white),
+  translations y=-0.92, x 0.29..0.76 (text along the bottom of the screen).
+- rc5: on native the ring snapshots xs_gpu_address makes at IASetVertexBuffers/IASetIndexBuffer time go STALE for the
+  Scaleform buffers (vertex 1.1 MB, index 393 KB, title d84c00780/d84d20800). LEONIDA_CE_SNAP_RESYNC=1 re-copies them
+  at replay. Wine never shows it.
+- Pre-existing crash: xs_refresh_placed_textures -> xs_upload_placed_texture -> GetDesc on a released stand-in
+  (vtable 0, read 0x50); guarded in build 6.
+- New env: LEONIDA_CE_RECT_VS (moot), LEONIDA_CE_RECT_TABLE_SRC (default on), LEONIDA_CE_SNAP_RESYNC,
+  LEONIDA_CE_CXFORM_FORCE (experiment).
+
+## agA3 (sender gen 3, 2026-11-24 night)
+- Scaleform input layout mismatch (Definite, from PSODIAG under Wine, sc1): _VBatchVertexCxformEAlpha / %VVertexCxformEAlpha
+  declare COLOR0 R32G32B32A32_FLOAT, COLOR1 R32G32B32A32_FLOAT, POSITION0 R32G32_FLOAT, all APPEND_ALIGNED (0/16/32,
+  stride 40), but IASetVertexBuffers gives stride 16 and the bytes are {rgba8 colour, rgba8 factor, float x, float y}
+  (rc6 tdiag: ffffffff ff004a00 c5a12800 c6f9f000). VTexTGCxform*: COLOR0 float4 + POSITION float2 @16 (same story).
+  The VS (disasm) uses v10 = factor.z: index = v10*1020.04 + {0.1,1.1,2.1,3.1} -> entry*4 + row of V#0 (rows: cxform
+  mul, add, matrix row0, row1), i.e. factor byte 2 = batch entry. factor byte 3 = edge-AA alpha (ff inner / 00 fringe).
+  Positions are float, integral, in +-32767 (XY16i-style quantised local space); matrix ~4.8e-7*32767 = 0.016 NDC
+  = ~30 px at 4K, i.e. glyph/icon sized. Earlier "byte 2 always 0" was only the first 4 vertices of each draw.
+  Fix: VS names containing "Cxform" get COLOR* as R8G8B8A8_UNORM (attrs 0/4/8), default on, LEONIDA_CE_SF_VCOLOR=0 off.
+  LEONIDA_CE_VCOLOR_FIX takes a comma list now.
+- Crash game+0x55e2ef6 (rb2, rc4, rc7) = the title TLS callback (game+0x55e2ebc) on DLL_THREAD_DETACH (edx==3):
+  mov r14,[gs:58][tls_index]; mov rdi,[r14+0x10] with r14 == 0 (the thread has no block in the slot). Called from
+  pe_loader on_host_thread_event -> run_callbacks. Hack: thread attach/detach callbacks run under SEH (AV only),
+  "[hack] TLS callback .. faulted"; LEONIDA_CE_TLS_CB_SEH=0 off.
+- rc7b: SNAP_RESYNC run reached state 3 at 1200 then hung (like rc5b); all probes 0. Added a hang watchdog
+  (LEONIDA_CE_HANG_WATCH, default on): no present for 15/45/120 s -> "[hang]" per-thread stacks.
+- rc8 (build 8 = layout fix): FIRST Scaleform output on Windows (Definite): presented = full-screen (32,32,44) =
+  vertex colour ff2c2020 of the first %VVertexCxformEAlpha draw (matrix 3.05e-5 = 1/32768, so a +-32767 quad = whole
+  screen), plus a 1-2 px white anti-diagonal (seam/edge-AA of that quad, not understood). Correction to agA2: the
+  batch entry rows are {add ~1e-7, mul 1.0 / 0.976, matrix row0, row1} in effect: the GPU output equals the vertex
+  colour, so the "1.8e-7 = black" reading was wrong.
+- rc8/rc8b: the stall at state 3 is NOT the GPU readbacks (rc8b has DUMP=0). Busy game thread at both stalls:
+  game+0x164f01 -> slot 18 (CreateShaderResourceView) -> xs_upload_placed_texture (detile memcpy / WC readback loop),
+  which also blocked up to 2 s per texture on a fence of the title's own queue. Build 9: no blocking wait (objects
+  freed when the fence completes; LEONIDA_CE_UPLOAD_WAIT=1 = old), sparser WC sampling, NO_PLACED_REFRESH really works
+  now (was compared with 1, not '1'). Only one [hang] block was ever printed and the log froze, so the watchdog now
+  writes with WriteFile to C:\zroot\logs\hang.txt (LEONIDA_CE_HANG_FILE) at 15/30/60/90/150 s.
+- rc9 (build 9): no pre-state-3 stall any more (upload wait gone), state 3 at 1200, same navy frame, then no log
+  lines at all and NO watchdog output (hang.txt never created) => presents kept coming (the heartbeat is in PresentX),
+  so it is a crawl, not a deadlock (Likely). Suspect: SNAP_RESYNC memcmp + zero scan READ the ring (GPU-mapped,
+  likely write-combined) ~1.5 MB per Scaleform draw. Build 10: blind write-only title->ring copy after the first 64
+  views (LEONIDA_CE_SNAP_RESYNC=2 = old compare), plus "[pace] frame N, X ms for the last 60" lines (WriteFile) from
+  frame 1080. Every state-3 run with SNAP_RESYNC=1 stalled; runs without it (rb2b, rc3) ran to 4500.
+- rd1 (receiver B3, build 9, RTDIAG off): DEADLOCK at frame 329 (Definite, cdb): xs_dump_thread_stacks
+  (LEONIDA_CE_STACKS=1, frame 300) suspended a game thread that was inside fprintf(stderr) (xs_upload_placed_texture
+  log) and then called fprintf itself before ResumeThread -> CRT stderr lock held forever, every logging thread
+  blocks. Build 11 resumes right after GetThreadContext. (Any SuspendThread + CRT/heap use is a deadlock hazard.)
+- rd2 (build 11): NO freeze; frames run past state 3 (1200 -> 1620+), but ~6 fps from frame 1140 onward. B3 with cdb
+  (2 samples): the submit thread (ExecuteCommandLists -> prepare_draw) burns a full core of KERNEL time in
+  VirtualQuery (copy_title_bytes / title_readable, 2 queries per call, many calls per draw). Build 13: per-thread
+  cache of VirtualQuery answers (200 ms), LEONIDA_CE_VQ_CACHE=0 off.
+- PSO translation (slot 57, d3d12_xs_device.cpp ~4285) builds the D3D12 PSO from the shaders ONLY: blend off, depth
+  off, cull none, RT R8G8B8A8, triangle topology (Definite; PSODIAG under Wine: all 13388 pipelines blend off).
+  Build 12/13: Scaleform ("Cxform" VS) gets SRC_ALPHA/INV_SRC_ALPHA (LEONIDA_CE_SF_BLEND=0 off). The real fix is to
+  decode the console PSO stream's blend/depth/raster state.
+- Screen state (rc8..rd2): navy (32,32,44) full screen = Scaleform backdrop + a white anti-diagonal seam; nothing else yet.
+- rd3 (build 13): VQ cache in vulkan_replay.h -> ~6 s per 60 frames (rd2 9-10 s; ~10 fps). SF blending made the
+  screen BLACK (navy quad contributes nothing with SRC_ALPHA blending => PS alpha output is not ~1; unknown why), so
+  build 14 turns SF blending OFF by default (LEONIDA_CE_SF_BLEND=1 on). rd3 cdb: remaining kernel VirtualQuery
+  in xs_readable (xs_gpu_address :822 via list slot 48, xs_refresh_placed_textures :1546) -> build 14 caches positive
+  xs_readable answers per thread (200 ms), same switch LEONIDA_CE_VQ_CACHE.
+- Wine note: a first-chance AV at ntdll+0x563ac from gta6rt+0x19371 (thread gta6rt+0xe77d2) appears ~110 s in sc5 and
+  sc7 (builds 10 and 14); not fatal there, not investigated.
+- Recommended env (Windows): RING_IN_ARENA=1, CB_FIX=1, VCOLOR_FIX=sga_dr_vs, SNAP_RESYNC=1 (+RTDIAG for probes);
+  defaults on: SF_VCOLOR, TLS_CB_SEH, HANG_WATCH, VQ_CACHE, NOPS_NOCOLOR; SF_BLEND off.
+- Next: (1) why the Scaleform content beyond the backdrop is invisible (glyph/text draws use VTexTG* + textures;
+  check their textures and the cxform rows); (2) the white anti-diagonal seam; (3) decode the console PSO stream's
+  blend/depth state instead of the slot-57 defaults; (4) remaining fps (pace lines).
+- rd4 (build 14, receiver B3): [pace] ~2.4-2.6 s per 60 frames (~24 fps; rd2 6 fps), state 3 at 1200, navy back (probe 1200 = ff2c2020). Build 14 is the current best.
+
+## agA4 (sender gen 4, 2026-11-24 late night)
+- Console PSO record (slot 57/86, 0x160 B): w[0] root sig, w[1..12] six {ptr,len} blobs; #2/#4 are VS/PS code,
+  #1 = input signature (POSITION/COLOR/TEXCOORD names), #3/#5 = per-stage resource tables, #0 (0x17c or 0x184 B) =
+  GCN context registers at FIXED offsets (Very likely, from 3365 records under Wine sd1):
+    +0xd0..+0xef CB_BLEND0..7_CONTROL (0x80000000 = off + DISABLE_ROP3; 0xe5010504 = SRC_ALPHA/INV_SRC_ALPHA colour,
+                 ONE/INV_SRC_ALPHA alpha; e5010508 = DST_COLOR (multiply); e1000104 = SRC_ALPHA/ONE (additive))
+    +0xcc CB_TARGET_MASK (ffffffff normal, 0 = no colour writes), +0x78 CB_SHADER_MASK-like (0xf)
+    +0x3c DB_DEPTH_CONTROL-like (0x10 off/LESS, 0x12 test, 0x14, 0x18 on all Scaleform), +0x38 082c034x (raster? unknown)
+  Every Scaleform shader pair exists in ~18 state variants (tmask 0 mask draws, alpha, additive, multiply).
+- Build 15: RT0 blend + write mask come from blob #0 (LEONIDA_CE_PSO_BLEND=0 / LEONIDA_CE_PSO_WMASK=0 off).
+  "[psodec]" lines log the decode; pipeline-name logs end in " [cb0 .. tm .. db ..]". Depth/stencil not translated.
+- State 3 on Windows (rd4) uses only two Scaleform pipelines: %VVertexCxformEAlpha (backdrop, 30 indices) and
+  _VBatchVertexCxformEAlpha (vector shapes, incl. the bottom-right text batch). No VTexTG* glyph pipeline is drawn.
+- Scaleform PS (%FVertexCxformEAlpha): rgb = sat(col*param3 + param2), a = sat(col.a*param3.a + param2.a)*factor.a;
+  batch VS: param2 = entry row 0 (add), param3 = row 1 (mul), rows 2/3 = matrix.
+- rd5 (build 15, real blend): unchanged screen, navy + white diagonal; dumps hold exactly 2 colours. The rd3 "black
+  with SF_BLEND" is explained by rd6a/b: with the navy draw (30@0) dropped, the frame is black + the diagonal.
+- Build 16: LEONIDA_CE_SKIP_DRAWS="count@first,.." drops matching draws at replay (experiment switch).
+  rd6a (30@0,60@32 dropped) / rd6b (30@0): black + the SAME white diagonal => the diagonal is not the backdrop seam.
+- Diagonal = the text (Likely): the batch VS reads rows {add, mul, m0, m1} of entry e with buffer_load_dwordx4 idxen
+  (index e*4+row) through root V#0, but the title V# there has stride 0 (e.g. 01421800 00000000 00000600 30014fac,
+  num_records in bytes), so every row = row 0: m0 == m1 -> x == y -> every glyph lands on the corner-to-corner
+  line; white entries (add 0.976 + col*0.976) saturate to 255. rdna2spirv honours V# stride exactly, so the
+  console V# must carry stride 16 from somewhere we do not emulate (not found).
+- Build 17/18: LEONIDA_CE_SF_STRIDE (default on, =0 off): for pipelines whose VS name contains "VBatch" (table
+  filled at slot-57 create; 512 entries were too few in 17, 16384 in 18) the replay ORs stride 16 into that V#
+  word 1 in title memory before the draw ("[hack] SF_STRIDE" lines).
+- rd8 (build 18, receiver B3): FIRST REAL UI (Definite). SF_STRIDE fired; diagonal gone; presented dump shows the
+  bottom-right prompt bar "ACCOUNT PICKER (Y)  SCREEN NARRATION (OFF) (X)  PLAYER (A)" (white text with black
+  outline, round button glyphs, AA edges) over the navy backdrop, px x 2461-3762, y 2044-2104
+  (/root/rb/rd8-crop-a4.png). State 3 = the account/profile prompt, waiting for a button press.
+- Recommended env (Windows): RING_IN_ARENA=1, CB_FIX=1, VCOLOR_FIX=sga_dr_vs, SNAP_RESYNC=1; defaults on:
+  PSO_BLEND, PSO_WMASK, SF_STRIDE, SF_VCOLOR, TLS_CB_SEH, HANG_WATCH, VQ_CACHE, NOPS_NOCOLOR; SF_BLEND off (superseded).
+- Next: input (press A/Y) to move past the prompt; stencil/depth (DB_DEPTH_CONTROL +0x3c, Scaleform mask variants with
+  tmask 0) not translated; the stride-0 V# probably affects other idxen shaders too (a generic fix would find where
+  the console derives the stride, likely blob #3/#5 resource tables, which carry 0x10 values).

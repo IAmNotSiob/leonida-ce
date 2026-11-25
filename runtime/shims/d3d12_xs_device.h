@@ -107,6 +107,10 @@ void set_console_descriptor_heap_factory(ConsoleDescriptorHeapFactory factory);
 // HACK (Leonida CE boot): the Vulkan layer's GPU addresses are arena offsets and the CPU sees the arena at
 // `mapped`. The console uses one address for both, so a title passes CPU pointers as GPU addresses: the proxy turns
 // pointers inside the arena back into offsets, and hands out console upload memory from a ring reserved there.
+// HACK (agA2, LEONIDA_CE_RECT_VS): copy bytes into the console upload ring, returning their GPU VA (0 on failure).
+std::uint64_t upload_snapshot(const void* data, std::uint64_t size);
+// HACK (agA2, LEONIDA_CE_SNAP_RESYNC): the title address a ring VA was snapshotted from (and bytes left from there).
+bool snapshot_source(std::uint64_t va, std::uint64_t& title, std::uint64_t& size);
 void set_console_arena(std::uint8_t* mapped, std::uint64_t arena_size, std::uint64_t ring_cpu, std::uint64_t ring_va,
                        std::uint64_t ring_size);
 // The device proxy an IDXGIDevice pointer handed out by one belongs to, or null.

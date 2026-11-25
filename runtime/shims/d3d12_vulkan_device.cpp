@@ -1271,6 +1271,19 @@ struct DeviceState {
         namespace g = leonida::gfx10;
         std::lock_guard lock(descriptor_mutex);
         if (!bindless) return false;
+        if (leonida::rtdiag::on() && !storage && leonida::rtdiag::tdiag_match(image.address)) {  // agSA: who samples the TDIAG range
+            static std::atomic<int> told_s{0};
+            if (told_s++ < 24)
+                std::fprintf(stderr, "[rtdiag] tdiag-range texture bound for sampling: %llx (%08x %08x %08x %08x)\n",
+                             (unsigned long long)image.address, words[0], words[1], words[2], words[3]);
+        }
+        if (leonida::rtdiag::on() && image.address == leonida::rtdiag::paint_address()) {  // agD
+            static std::atomic<int> told{0};
+            if (told++ < 8)
+                std::fprintf(stderr, "[rtdiag] bind_image %llx storage %d: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                             (unsigned long long)image.address, int(storage), words[0], words[1], words[2], words[3],
+                             words[4], words[5], words[6], words[7]);
+        }
         const auto existing = image_entries.find(words);
         if (existing != image_entries.end() && (existing->second.storage || !storage)) return true;
 
@@ -2393,6 +2406,8 @@ public:
         uint_backed_ = format.uint_backed;
         aspects_ = format.aspects;
         image_address_ = device_.next_image_address.fetch_add(256);
+        leonida::rtdiag::note_image(id(), image_address_, std::uint32_t(desc_.Width), desc_.Height,
+                                    std::uint32_t(desc_.Format), std::uint32_t(desc_.Flags));
         binding_ = binding;
         if (host_transfer_) {
             // Moved to GENERAL and zero-filled on the host now, so the CPU can copy into it before any command
@@ -2475,6 +2490,25 @@ public:
     // no pointer to give (its layout is the driver's), so D3D12 only lets it be mapped with a null pointer, before
     // WriteToSubresource/ReadFromSubresource.
     HRESULT STDMETHODCALLTYPE Map(UINT subresource, const D3D12_RANGE* read, void** data) override {
+        // HACK (Leonida CE, bw): on the console a texture's memory is its address, and the title locks textures
+        // with Map(0, range, &p) and writes the console layout through p (+0x1336320 -> +0x1336364 -> +0x5121690).
+        // A texture given console memory (console_va_, registered as placed so the refresh copies it in) maps to
+        // that memory. Was E_INVALIDARG, so every texture lock failed. LEONIDA_CE_NO_TEX_MAP=1: off.
+        static const bool tex_map = [] {
+            const char* v = std::getenv("LEONIDA_CE_NO_TEX_MAP");
+            return !(v && v[0] == '1');
+        }();
+        if (image_ && data && console_va_ && tex_map) {
+            *data = reinterpret_cast<void*>(console_va_);
+            static std::atomic<int> told{0};
+            if (told++ < 16) {
+                std::fprintf(stderr, "[hack] texture Map(%u) -> console memory %llx (%llux%u fmt %d)\n", subresource,
+                             static_cast<unsigned long long>(console_va_),
+                             static_cast<unsigned long long>(desc_.Width), desc_.Height, static_cast<int>(desc_.Format));
+                std::fflush(stderr);
+            }
+            return S_OK;
+        }
         if (image_) {
             VkImageSubresourceRange range{};
             return !data && cpu_visible() && subresource != leonida::all_subresources &&
@@ -3790,6 +3824,36 @@ public:
                 log_once("vertex attribute format not supported yet:", element.Format);
                 return E_INVALIDARG;
             }
+            // HACK (agF, LEONIDA_CE_VCOLOR_FIX=<VS name substring>): the title's input layout for its UI shaders
+            // declares COLOR0 as R32G32B32A32_FLOAT, but the vertices (stride 24: float3 position, a packed colour
+            // dword, float2 uv) hold an 8-bit RGBA colour; read it as R8G8B8A8_UNORM so TEXCOORD0 lands at 16.
+            // agA3: the list is comma-separated, and Scaleform VS (name contains "Cxform") are matched by default
+            // (LEONIDA_CE_SF_VCOLOR=0 turns that off): their layout says COLOR0/COLOR1 float4 + POSITION float2 at
+            // 32, but the vertices are stride 16 {rgba8 colour, rgba8 factor (z = batch index), float2 position}.
+            auto vcolor_match = [&](const std::string& name) {
+                static const bool sf = [] { const char* v = std::getenv("LEONIDA_CE_SF_VCOLOR"); return !v || *v != '0'; }();
+                if (sf && name.find("Cxform") != std::string::npos) return true;
+                const char* want = std::getenv("LEONIDA_CE_VCOLOR_FIX");
+                if (!want) return false;
+                std::string list(want);
+                std::size_t pos = 0;
+                while (pos <= list.size()) {
+                    std::size_t comma = list.find(',', pos);
+                    if (comma == std::string::npos) comma = list.size();
+                    std::string item = list.substr(pos, comma - pos);
+                    if (!item.empty() && name.find(item) != std::string::npos) return true;
+                    pos = comma + 1;
+                }
+                return false;
+            };
+            if (stages[0].entry && vcolor_match(stages[0].entry->name) && equal_semantic("COLOR", element.SemanticName) &&
+                element.Format == DXGI_FORMAT_R32G32B32A32_FLOAT) {
+                format = VK_FORMAT_R8G8B8A8_UNORM;
+                bytes = 4;
+                static std::atomic<int> told{0};
+                if (told++ < 16) std::fprintf(stderr, "[hack] vcolor fix: %s COLOR%u -> R8G8B8A8_UNORM\n",
+                                             stages[0].entry->name.c_str(), element.SemanticIndex);
+            }
             const UINT alignment = std::min(bytes, 4u);
             const UINT offset = element.AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT
                                     ? (slot_end[element.InputSlot] + alignment - 1) / alignment * alignment
@@ -3911,6 +3975,11 @@ public:
             blends[i].dstAlphaBlendFactor = blend_factor(b.DestBlendAlpha);
             blends[i].alphaBlendOp = blend_op(b.BlendOpAlpha);
             blends[i].colorWriteMask = b.RenderTargetWriteMask & 0xf;  // R, G, B, A in both APIs
+            {   // HACK (agA2, LEONIDA_CE_NOPS_NOCOLOR, default on): no pixel shader = no colour output in D3D; Vulkan
+                // leaves the attachment undefined (NVIDIA: state-3 VS_Blit RECTLIST painted the screen pure green).
+                static const bool nops = [] { const char* v = std::getenv("LEONIDA_CE_NOPS_NOCOLOR"); return !v || v[0] != 0; }();
+                if (nops && (!desc.PS.pShaderBytecode || !desc.PS.BytecodeLength)) blends[i].colorWriteMask = 0;
+            }
             // B8G8R8X8 has no alpha, so blending reads destination alpha as 1 there (WARP and AMD's D3D12 driver),
             // where its BGRA8 Vulkan image would read the X byte. For colour SRC_ALPHA_SAT is min(As, 1 - Ad), so 0;
             // for alpha it is 1 in both APIs already.
@@ -3969,6 +4038,38 @@ public:
         if (raster.depthClampEnable && !features.depthClamp)
             return refuse("DepthClipEnable = FALSE needs depthClamp, which the device lacks; flag", 0);
 
+        // HACK diagnostic (agE, LEONIDA_CE_PSODIAG=<substring>): the fixed-function state of matching pipelines.
+        if (const char* want = std::getenv("LEONIDA_CE_PSODIAG"); want && stages[0].entry &&
+            stages[0].entry->name.find(want) != std::string::npos) {
+            const auto& b0 = desc.BlendState.RenderTarget[0];
+            std::fprintf(stderr, "[psodiag] %s: rts %u fmt0 %d dsv %d samples %u mask %x a2c %d | blend en %d %d/%d op %d a %d/%d op %d wmask %x logic %d | "
+                                 "depth en %d write %d func %d stencil %d | cull %d ccw %d clip %d fill %d | topo %d | elements %u attrs %zu\n",
+                         stages[0].entry->name.c_str(), desc.NumRenderTargets, int(desc.RTVFormats[0]), int(desc.DSVFormat),
+                         unsigned(samples), unsigned(desc.SampleMask), int(desc.BlendState.AlphaToCoverageEnable), int(b0.BlendEnable),
+                         int(b0.SrcBlend), int(b0.DestBlend), int(b0.BlendOp), int(b0.SrcBlendAlpha), int(b0.DestBlendAlpha),
+                         int(b0.BlendOpAlpha), unsigned(b0.RenderTargetWriteMask), int(b0.LogicOpEnable), int(ds.DepthEnable),
+                         int(ds.DepthWriteMask), int(ds.DepthFunc), int(ds.StencilEnable), int(r.CullMode),
+                         int(r.FrontCounterClockwise), int(r.DepthClipEnable), int(r.FillMode), int(desc.PrimitiveTopologyType),
+                         desc.InputLayout.NumElements, attributes.size());
+            for (UINT i = 0; i < desc.InputLayout.NumElements; ++i) {
+                const auto& e = desc.InputLayout.pInputElementDescs[i];
+                std::fprintf(stderr, "[psodiag]   element %u: %s%u fmt %d slot %u off %u class %d\n", i, e.SemanticName,
+                             e.SemanticIndex, int(e.Format), e.InputSlot, e.AlignedByteOffset, int(e.InputSlotClass));
+            }
+            for (const auto& a : attributes)
+                std::fprintf(stderr, "[psodiag]   attr loc %u binding %u vkfmt %d off %u\n", a.location, a.binding, int(a.format), a.offset);
+            for (const auto& e : stages[0].entry->input_signature)
+                std::fprintf(stderr, "[psodiag]   input sig %s%u reg %u sv %u\n", e.semantic.c_str(), e.semantic_index,
+                             e.register_index, unsigned(e.system_value));
+        }
+        // HACK experiment (agE, LEONIDA_CE_PSO_LOGICSET=<substring>): matching pipelines write all-ones to every
+        // covered pixel (logic op SET), whatever the pixel shader outputs: tells "nothing rasterized" from "zeros written".
+        if (const char* want = std::getenv("LEONIDA_CE_PSO_LOGICSET"); want && stages[0].entry && features.logicOp &&
+            stages[0].entry->name.find(want) != std::string::npos) {
+            blend.logicOpEnable = VK_TRUE;
+            blend.logicOp = VK_LOGIC_OP_SET;
+            std::fprintf(stderr, "[hack] logic op SET on %s\n", stages[0].entry->name.c_str());
+        }
         graphics_.color_formats.assign(desc.NumRenderTargets, VK_FORMAT_UNDEFINED);
         for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
             if (desc.RTVFormats[i] == DXGI_FORMAT_UNKNOWN) continue;
@@ -5915,6 +6016,20 @@ public:
         mapped = state_.arena.mapped;
         arena_size = state_.arena.size;
         ring_va = va;
+        // HACK (agSA, LEONIDA_CE_RING_IN_ARENA): register the ring as an addressable range of the arena buffer so
+        // VulkanContext::buffer_at / host_at resolve vertex, index and constant views at ring VAs.
+        if (ring_bytes > 65536 && state_.arena.buffer != VK_NULL_HANDLE) {
+            static int ring_id_tag = 0;
+            leonida::ResourceBinding binding{};
+            binding.size = ring_bytes;
+            binding.buffer = state_.arena.buffer;
+            binding.buffer_offset = va;
+            binding.va = va;
+            binding.host = state_.arena.mapped + va;
+            state_.context->add_resource(reinterpret_cast<leonida::ResourceId>(&ring_id_tag), binding);
+            std::fprintf(stderr, "[hack] console upload ring in arena: va %llx bytes %llx registered\n",
+                         (unsigned long long)va, (unsigned long long)ring_bytes);
+        }
         return true;
     }
 
@@ -6460,6 +6575,19 @@ public:
         layout.flags = parsed.sig.flags;
         layout.graphics_ok = packed.ok;
         layout.compute_ok = compute.ok;
+        // HACK (agG): the translated VS/PS read their root arguments from s8 in the console layout (one-dword tables):
+        // the UI shaders load their table pointer from s[8:9] with s9 forced 0. pack() put it in s0, so they read VA 0.
+        static const bool gfx_s8 = [] { const char* v = std::getenv("LEONIDA_CE_GFX_S8"); return !v || v[0] != '0'; }();
+        const rt::rootsig::StagePackResult vertex =
+            gfx_s8 ? rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Vertex) : rt::rootsig::StagePackResult{};
+        if (vertex.ok) {
+            layout.graphics_ok = true;
+            layout.graphics_console = true;
+            layout.graphics_end = vertex.end_sgpr;
+        } else if (gfx_s8) {
+            std::fprintf(stderr, "[rt] d3d12: GFX_S8: root signature does not fit from s8 (%s); graphics keeps pack()\n",
+                         vertex.error.c_str());
+        }
         for (std::size_t i = 0; i < parsed.sig.params.size(); ++i) {
             std::uint32_t first = UINT32_MAX;
             for (std::uint32_t d = 0; packed.ok && d < packed.dword_count; ++d)
@@ -6467,6 +6595,7 @@ public:
                     first = d;
                     break;
                 }
+            if (vertex.ok) first = vertex.first_sgpr[i];
             layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values,
                                          compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr});
         }
@@ -9243,7 +9372,24 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer) {
         std::uint64_t arena_size = 0, ring_va = 0;
         bool reserved = false;
         // The arena's mapping (descriptor heaps live there) without keeping a reservation.
-        if (d->reserve_console_upload_ring(65536, mapped, arena_size, ring_va)) {
+        // HACK (Leonida CE, agWin, LEONIDA_CE_RING_IN_ARENA=1): carve the ring out of the GPU address arena itself.
+        // A separate UPLOAD buffer gets VA = its BDA - arena address, which is negative when the driver places it
+        // below the arena (NVIDIA on Windows: 0xfffffffd...); the title stores ring addresses in 48-bit V# bases,
+        // so CB/VB V#s pointing into the ring then read garbage.
+        static const bool ring_in_arena = [] { const char* e = std::getenv("LEONIDA_CE_RING_IN_ARENA"); return e && e[0] == '1'; }();
+        if (ring_in_arena) {
+            for (std::uint64_t ring : {64ull << 20, 32ull << 20, 16ull << 20}) {
+                if (!d->reserve_console_upload_ring(ring, mapped, arena_size, ring_va)) continue;
+                std::memset(mapped + ring_va, 0, std::size_t(ring));
+                rt::d3d12_xs::set_console_arena(mapped, arena_size, reinterpret_cast<std::uint64_t>(mapped + ring_va),
+                                                ring_va, ring);
+                leonida::detail::g_rect_snapshot = &rt::d3d12_xs::upload_snapshot;  // agA2
+                leonida::detail::g_snapshot_source = &rt::d3d12_xs::snapshot_source;
+                reserved = true;
+                break;
+            }
+        }
+        if (!reserved && d->reserve_console_upload_ring(65536, mapped, arena_size, ring_va)) {
             for (std::uint64_t ring : {64ull << 20, 32ull << 20, 16ull << 20}) {
                 D3D12_HEAP_PROPERTIES hp{};
                 hp.Type = D3D12_HEAP_TYPE_UPLOAD;

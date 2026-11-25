@@ -1204,9 +1204,13 @@ private:
 
     // Dwords beyond the 32 user registers are what the console spills to memory; that layout is still open.
     void write(RootState& state, std::uint32_t dword, std::uint32_t value) {
-        if (dword < rt::rootsig::kMaxUserSgprs)
+        if (dword < rt::rootsig::kMaxUserSgprs) {
             state.data[dword] = value;
-        else
+            // HACK (agG): mesh shaders read root arguments from s16; mirror the s8 layout there when it fits.
+            if (!is_compute(state) && state.layout && state.layout->graphics_console && state.layout->graphics_end <= 16 &&
+                dword + 8 < rt::rootsig::kMaxUserSgprs)
+                state.data[dword + 8] = value;
+        } else
             stub("root arguments beyond 32 user-data dwords (spill not modelled)");
     }
 
@@ -1245,7 +1249,8 @@ private:
         write(state, first, std::uint32_t(va));
         // In the compute layout a descriptor table is one dword, the 32-bit VA of its first descriptor (the heaps
         // live below 4 GiB); a root view keeps both halves. The graphics layout gives every address two dwords.
-        if (!(is_compute(state) && type == rt::rootsig::ParamType::Table)) write(state, first + 1, std::uint32_t(va >> 32));
+        const bool one_dword_table = is_compute(state) || (state.layout && state.layout->graphics_console);  // agG
+        if (!(one_dword_table && type == rt::rootsig::ParamType::Table)) write(state, first + 1, std::uint32_t(va >> 32));
     }
 
     D3D12_COMMAND_LIST_TYPE type_;

@@ -2333,7 +2333,11 @@ private:
         bool has_queries = false;
         for (std::size_t i = 0; i < lists.size(); ++i) {
             const auto result = prepare(*lists[i], resolve, replay, prepared[i], can_resolve_occlusion);
-            if (result != ReplayResult::success) return result;
+            if (result != ReplayResult::success) {
+                rtdiag::count_list(int(result), false);
+                return result;
+            }
+            rtdiag::count_list(0, false);
             if (prepared[i].segment_count > UINT32_MAX - segments ||
                 prepared[i].statistics_segment_count > UINT32_MAX - statistics_segments)
                 return ReplayResult::unsupported;

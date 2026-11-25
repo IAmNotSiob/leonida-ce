@@ -543,6 +543,20 @@ void uninstall_thread_block(Module& m) {
 
 // `trace`: record each callback in the startup trace. Only the Loader's own calls (process attach and detach) pass
 // true; the thread events run under the Windows loader lock and stay out of the trace.
+// HACK (agA3): the title TLS callback (game+0x55e2ebc) on DLL_THREAD_DETACH reads [TLS block + 0x10] without checking
+// the block; a thread whose slot is empty then faulted (read 0x10 at game+0x55e2ef6) and killed the run (rb2, rc4,
+// rc7). Thread attach/detach callbacks run under SEH and a fault is skipped. LEONIDA_CE_TLS_CB_SEH=0 turns it off.
+#ifdef _WIN32
+static bool call_tls_callback_guarded(PIMAGE_TLS_CALLBACK cb, void* base, DWORD reason) {
+    __try {
+        cb(base, reason, nullptr);
+        return true;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+}
+#endif
+
 void run_callbacks(Module& m, uint32_t reason, bool trace = false) {
     auto* tls = tls_directory(m);
     if (!tls || !tls->AddressOfCallBacks) return;
@@ -559,6 +573,19 @@ void run_callbacks(Module& m, uint32_t reason, bool trace = false) {
             startup_trace::event("tls_callback", "\"module\":" + startup_trace::quote(m.name) + ",\"at\":" +
                                                      startup_trace::quote(startup_trace::where(reinterpret_cast<uint64_t>(callback))) +
                                                      ",\"reason\":" + std::to_string(reason));
+#ifdef _WIN32
+        static const bool guard = [] { const char* v = std::getenv("LEONIDA_CE_TLS_CB_SEH"); return !v || *v != 0; }();
+        if (guard && (reason == DLL_THREAD_ATTACH || reason == DLL_THREAD_DETACH)) {
+            if (!call_tls_callback_guarded(callback, m.base, static_cast<DWORD>(reason))) {
+                static std::atomic<int> told{0};
+                if (told++ < 8)
+                    std::fprintf(stderr, "[hack] TLS callback %s+0x%llx faulted on thread %s (tid %lu), skipped\n",
+                                 m.name.c_str(), (unsigned long long)(reinterpret_cast<uint64_t>(callback) - reinterpret_cast<uint64_t>(m.base)),
+                                 reason == DLL_THREAD_DETACH ? "detach" : "attach", GetCurrentThreadId());
+            }
+            continue;
+        }
+#endif
         callback(m.base, static_cast<DWORD>(reason), nullptr);
     }
 }

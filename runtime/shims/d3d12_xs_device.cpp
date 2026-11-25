@@ -37,6 +37,8 @@
 #include "../src/shader_library.h"
 #include "../src/resource_detile.h"  // leonida::fspx_payload_from_parts for slot 67
 #include "../src/xg_texture.h"
+#include "rtdiag_probe.h"  // agD hack
+#include "startup_trace.h"  // agA3 hang watch
 
 #include <windows.h>
 #include <dxgi1_4.h>
@@ -54,6 +56,15 @@
 #include <memory>
 #include <utility>
 
+// HACK (agA4): pipelines whose VS is a Scaleform batch shader (_VBatch*), for the replay's SF_STRIDE fix.
+std::atomic<std::uint64_t> g_leonida_sf_batch_psos[16384];
+std::atomic<int> g_leonida_sf_batch_n{0};
+bool leonida_is_sf_batch_pso(std::uint64_t pso) {
+    const int n = g_leonida_sf_batch_n.load(std::memory_order_acquire);
+    for (int i = 0; i < n && i < 16384; ++i)
+        if (g_leonida_sf_batch_psos[i].load(std::memory_order_relaxed) == pso) return true;
+    return false;
+}
 namespace rt::d3d12_xs {
 namespace {
 
@@ -64,13 +75,27 @@ bool xs_readable(const void* p, std::size_t len) {
     auto at = reinterpret_cast<std::uintptr_t>(p);
     const std::uintptr_t end = at + len;
     if (end < at) return false;
+    // HACK (agA3, LEONIDA_CE_VQ_CACHE, default on): rd3 caught the title thread in kernel VirtualQuery from here
+    // (xs_gpu_address per command-list call). Readable regions are remembered per thread for 200 ms (only positive
+    // answers: a commit-on-touch view that was not committed yet is asked again).
+    static const bool cache_on = [] { const char* v = std::getenv("LEONIDA_CE_VQ_CACHE"); return !v || *v != '0'; }();
+    struct Entry { std::uintptr_t base, end; std::uint64_t tick; };
+    thread_local Entry cache[32] = {};
+    thread_local unsigned next = 0;
+    const std::uint64_t now = cache_on ? GetTickCount64() : 0;
     while (at < end) {
+        bool hit = false;
+        if (cache_on)
+            for (const Entry& e : cache)
+                if (e.end && at >= e.base && at < e.end && now - e.tick < 200) { at = e.end; hit = true; break; }
+        if (hit) continue;
         MEMORY_BASIC_INFORMATION mbi{};
         if (!VirtualQuery(reinterpret_cast<const void*>(at), &mbi, sizeof(mbi))) return false;
         if (mbi.State != MEM_COMMIT) return false;
         const DWORD prot = mbi.Protect & 0xFF;
         if ((mbi.Protect & PAGE_GUARD) || prot == PAGE_NOACCESS || prot == PAGE_EXECUTE) return false;
         at = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        if (cache_on) cache[next++ % 32] = {reinterpret_cast<std::uintptr_t>(mbi.BaseAddress), at, now};
     }
     return true;
 }
@@ -593,6 +618,91 @@ void xs_paint_preview(const std::uint8_t* pixels, std::uint64_t width, UINT rows
     }
 }
 
+// HACK (agA3, LEONIDA_CE_HANG_WATCH, default on; =0 off): rc5b/rc7b hung right after state 3 with no log. A watchdog
+// thread: when no present has happened for 15 s, it prints every thread's stack ([hang] lines), again at 45 s and 120 s.
+std::atomic<std::uint64_t> g_hang_last_tick{0}, g_hang_last_frame{0};
+HANDLE g_hang_file = INVALID_HANDLE_VALUE;
+void hang_write(const char* text, std::size_t n) {
+    DWORD wr = 0;
+    if (g_hang_file != INVALID_HANDLE_VALUE) WriteFile(g_hang_file, text, static_cast<DWORD>(n), &wr, nullptr);
+    HANDLE err = GetStdHandle(STD_ERROR_HANDLE);  // straight to the handle: no CRT lock
+    if (err && err != INVALID_HANDLE_VALUE) WriteFile(err, text, static_cast<DWORD>(n), &wr, nullptr);
+}
+void hang_dump_threads(std::uint64_t idle_ms) {
+    if (g_hang_file == INVALID_HANDLE_VALUE) {
+        char path[260] = "C:\\zroot\\logs\\hang.txt";
+        if (GetEnvironmentVariableA("LEONIDA_CE_HANG_FILE", path, sizeof path) == 0 &&
+            GetFileAttributesA("C:\\zroot\\logs") == INVALID_FILE_ATTRIBUTES)
+            std::snprintf(path, sizeof path, "hang.txt");
+        g_hang_file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS,
+                                  FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+    }
+    char line[4096];
+    int n = std::snprintf(line, sizeof line, "[hang] no present for %llu ms (last frame %llu); thread stacks:\n",
+                          (unsigned long long)idle_ms, (unsigned long long)g_hang_last_frame.load());
+    hang_write(line, n);
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te{};
+    te.dwSize = sizeof te;
+    const DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+        HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+        if (!t) continue;
+        CONTEXT c{};
+        c.ContextFlags = CONTEXT_FULL;
+        bool got = false;
+        if (SuspendThread(t) != DWORD(-1)) {
+            got = GetThreadContext(t, &c) != 0;
+            ResumeThread(t);
+        }
+        CloseHandle(t);
+        if (!got) continue;
+        // Raw frames first (no allocation): rip + a scan of the top of the stack for return-looking values.
+        n = std::snprintf(line, sizeof line, "[hang]   tid %lu rip %s\n", te.th32ThreadID,
+                          ::rt::startup_trace::where(c.Rip).c_str());
+        hang_write(line, n);
+        const std::string st = ::rt::startup_trace::detail::stack_from(c);
+        n = std::snprintf(line, sizeof line, "[hang]   tid %lu: %s\n", te.th32ThreadID, st.c_str());
+        hang_write(line, n);
+    }
+    CloseHandle(snap);
+}
+void hang_heartbeat(std::uint64_t frame) {
+    static const bool on = [] { const char* v = std::getenv("LEONIDA_CE_HANG_WATCH"); return !v || *v != '0'; }();
+    if (!on) return;
+    g_hang_last_tick.store(GetTickCount64());
+    g_hang_last_frame.store(frame);
+    if (frame % 60 == 0 && frame >= 1080) {  // agA3: pace lines (WriteFile, no CRT lock)
+        static std::uint64_t prev = 0;
+        const std::uint64_t now = GetTickCount64();
+        char line[96];
+        const int n = std::snprintf(line, sizeof line, "[pace] frame %llu, %llu ms for the last 60\n",
+                                    (unsigned long long)frame, (unsigned long long)(prev ? now - prev : 0));
+        prev = now;
+        DWORD wr = 0;
+        HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+        if (err && err != INVALID_HANDLE_VALUE) WriteFile(err, line, static_cast<DWORD>(n), &wr, nullptr);
+    }
+    static std::once_flag once;
+    std::call_once(once, [] {
+        HANDLE h = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+            std::uint64_t reported_for = 0;
+            int stage = 0;
+            for (;;) {
+                Sleep(1000);
+                const std::uint64_t last = g_hang_last_tick.load();
+                const std::uint64_t idle = GetTickCount64() - last;
+                if (last != reported_for) { reported_for = last; stage = 0; }
+                static const std::uint64_t marks[] = {15000, 30000, 60000, 90000, 150000};
+                if (stage < 5 && idle >= marks[stage]) { ++stage; hang_dump_threads(idle); }
+            }
+        }, nullptr, 0, nullptr);
+        if (h) CloseHandle(h);
+    });
+}
+
 void xs_capture_frame(ID3D12CommandQueue* queue, ID3D12Resource* texture, std::uint64_t frame, bool preview_only = false) {
     if (!queue || !texture) return;
     const D3D12_RESOURCE_DESC rd = texture->GetDesc();
@@ -718,6 +828,17 @@ std::uint64_t xs_upload_alloc(std::uint64_t size, std::uint64_t align) {
 
 // HACK (Leonida CE boot): a GPU address in the title's own memory becomes a snapshot in the arena (the title wrote
 // the data before binding it); addresses already in the arena become offsets. VIctory copies changed title memory.
+// HACK (agA2, LEONIDA_CE_SNAP_RESYNC): which title address each ring snapshot was copied from, so the replay can
+// copy the title bytes again when it records the draw (the title may write the data after binding it).
+std::mutex g_snap_mu;
+std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> g_snaps;  // ring VA -> (title address, bytes)
+void xs_note_snapshot(std::uint64_t va, std::uint64_t title, std::uint64_t size) {
+    std::lock_guard l(g_snap_mu);
+    auto it = g_snaps.lower_bound(va);
+    if (it != g_snaps.begin()) { auto pv = std::prev(it); if (pv->first + pv->second.second > va) it = pv; }
+    while (it != g_snaps.end() && it->first < va + size) it = g_snaps.erase(it);
+    g_snaps[va] = {title, size};
+}
 std::uint64_t xs_gpu_address(std::uint64_t address, std::uint64_t size) {
     const std::uint64_t translated = xs_va_from_cpu(address);
     if (translated != address || !address || !size || size > (8u << 20)) return translated;
@@ -725,6 +846,7 @@ std::uint64_t xs_gpu_address(std::uint64_t address, std::uint64_t size) {
     const std::uint64_t copy = xs_upload_alloc(size, 256);
     if (!copy) return translated;
     std::memcpy(reinterpret_cast<void*>(copy), reinterpret_cast<const void*>(address), static_cast<std::size_t>(size));
+    xs_note_snapshot(xs_va_from_cpu(copy), address, size);  // agA2
     return xs_va_from_cpu(copy);
 }
 
@@ -789,6 +911,15 @@ XsTexFormat xs_tex_format(DXGI_FORMAT f) {
     }
 }
 
+bool xs_safe_get_desc(ID3D12Resource* t, D3D12_RESOURCE_DESC* out) {  // HACK (agA2)
+    __try {
+        *out = t->GetDesc();
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 void xs_upload_placed_texture(ID3D12Device* dev, const D3D12_RESOURCE_DESC& console_desc, ID3D12Resource* tex,
                               std::uint64_t va, bool force = false) {
     ID3D12CommandQueue* queue = g_upload_queue.load();
@@ -822,8 +953,14 @@ void xs_upload_placed_texture(ID3D12Device* dev, const D3D12_RESOURCE_DESC& cons
     rt::xmem::commit_physical_range(reinterpret_cast<const void*>(va), src_bytes);  // XMem views commit on touch
     if (!src_bytes || !xs_readable(reinterpret_cast<const void*>(va), src_bytes)) return;
     const auto* src = reinterpret_cast<const std::uint8_t*>(va);
-
-    D3D12_RESOURCE_DESC rd = tex->GetDesc();
+    // HACK (agA2): rc5/rc6 crashed here in GetDesc of a released stand-in (vtable 0, then a dangling pointer).
+    if (!xs_readable(tex, sizeof(void*)) || !*reinterpret_cast<void* const*>(tex)) return;
+    D3D12_RESOURCE_DESC rd{};
+    if (!xs_safe_get_desc(tex, &rd)) {
+        static std::atomic<int> told_gd{0};
+        if (told_gd++ < 4) std::fprintf(stderr, "[hack] placed texture refresh: GetDesc faulted on %p, skipped\n", (void*)tex);
+        return;
+    }
     const UINT mips = std::min<UINT>(rd.MipLevels ? rd.MipLevels : 1, static_cast<UINT>(lay.mips.size()));
     const UINT slices = std::min<UINT>(rd.DepthOrArraySize ? rd.DepthOrArraySize : 1, lay.slices ? lay.slices : 1);
     const UINT pc_mips = rd.MipLevels ? rd.MipLevels : 1;
@@ -874,7 +1011,7 @@ void xs_upload_placed_texture(ID3D12Device* dev, const D3D12_RESOURCE_DESC& cons
                 }
                 ++copied;
                 if (m == 0 && s == 0)
-                    for (std::size_t i = 0; i < depth_pitch; i += 97, ++sampled) nz += dst_base[fp.Offset + i] != 0;
+                    for (std::size_t i = 0; i < depth_pitch; i += 4099, ++sampled) nz += dst_base[fp.Offset + i] != 0;  // agA3: was 97 (WC reads)
             }
         up->Unmap(0, nullptr);
         for (UINT s = 0; s < slices; ++s)
@@ -893,7 +1030,27 @@ void xs_upload_placed_texture(ID3D12Device* dev, const D3D12_RESOURCE_DESC& cons
         ID3D12CommandList* lists[] = {list};
         queue->ExecuteCommandLists(1, lists);
         queue->Signal(fence, 1);
-        for (int i = 0; i < 2000 && fence->GetCompletedValue() < 1; ++i) Sleep(1);
+        // HACK (agA3, LEONIDA_CE_UPLOAD_WAIT=1 restores the old wait): no blocking wait; the objects are released
+        // later, once their fence completes (rc8: a game thread sat in here while state 3 began).
+        static const bool wait_old = [] { const char* v = std::getenv("LEONIDA_CE_UPLOAD_WAIT"); return v && v[0] == '1'; }();
+        if (wait_old) {
+            for (int i = 0; i < 2000 && fence->GetCompletedValue() < 1; ++i) Sleep(1);
+        } else {
+            struct Pending { ID3D12Fence* f; ID3D12GraphicsCommandList* l; ID3D12CommandAllocator* a; ID3D12Resource* u; };
+            static std::mutex pend_mu;
+            static std::vector<Pending> pend;
+            std::lock_guard pl(pend_mu);
+            pend.push_back({fence, list, alloc, up});
+            fence = nullptr; list = nullptr; alloc = nullptr; up = nullptr;
+            for (auto it = pend.begin(); it != pend.end();) {
+                if (it->f->GetCompletedValue() >= 1) {
+                    it->f->Release(); it->l->Release(); it->a->Release(); it->u->Release();
+                    it = pend.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
         static std::atomic<int> n{0};
         const bool has_data = nz != 0;
         static std::atomic<int> with_data{0};
@@ -1055,7 +1212,11 @@ void xs_dump_thread_stacks() {
         ctx.ContextFlags = CONTEXT_FULL;
         char line[2048];
         int len = 0;
-        if (GetThreadContext(th, &ctx)) {
+        // agA3: resume BEFORE unwinding/printing. rd1 deadlocked: the suspended thread held the CRT stderr lock
+        // (inside fprintf) and this fprintf then waited on it forever, with the thread never resumed.
+        const BOOL got_ctx = GetThreadContext(th, &ctx);
+        ResumeThread(th);
+        if (got_ctx) {
             bool any_game = false;
             for (int depth = 0; depth < 40 && ctx.Rip; ++depth) {
                 const std::uint64_t rip = ctx.Rip;
@@ -1092,7 +1253,6 @@ void xs_dump_thread_stacks() {
                 ++dumped;
             }
         }
-        ResumeThread(th);
         CloseHandle(th);
     }
     CloseHandle(snap);
@@ -1395,6 +1555,8 @@ void xs_trap_tick(std::uint64_t /*frame*/) {
 std::mutex g_placed_hash_mu;
 std::map<const void*, std::uint64_t> g_placed_hash;
 void xs_refresh_placed_textures(ID3D12Device* dev) {
+    static const bool no_refresh = [] { const char* v = std::getenv("LEONIDA_CE_NO_PLACED_REFRESH"); return v && v[0] == '1'; }();  // agA2
+    if (no_refresh) return;
     std::vector<XsPlaced> textures;
     {
         std::lock_guard lock(g_placed_mu);
@@ -1419,7 +1581,15 @@ void xs_refresh_placed_textures(ID3D12Device* dev) {
             changed = old != h;
             old = h;
         }
-        if (changed && nonzero) xs_upload_placed_texture(dev, t.desc, t.resource, t.va, true);
+        if (changed && nonzero) {
+            static std::atomic<int> told_rf{0};  // DIAGNOSTIC (bw): which placed textures the refresh re-uploads
+            if (told_rf++ < 60) {
+                std::fprintf(stderr, "[refresh] re-upload va %llx %llux%u fmt %d\n", (unsigned long long)t.va,
+                             (unsigned long long)t.desc.Width, t.desc.Height, (int)t.desc.Format);
+                std::fflush(stderr);
+            }
+            xs_upload_placed_texture(dev, t.desc, t.resource, t.va, true);
+        }
     }
 }
 
@@ -2961,6 +3131,10 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                 const auto* plane = reinterpret_cast<const std::uint8_t*>(a2);
                 const unsigned count = plane ? *reinterpret_cast<const unsigned*>(plane + 8) : 0;
                 void* const* res = plane ? *reinterpret_cast<void* const* const*>(plane + 0x10) : nullptr;
+                hang_heartbeat(f);  // agA3
+                if (leonida::rtdiag::on() && f % 300 == 0)  // agD: LEONIDA_CE_RTDIAG
+                    leonida::rtdiag::at_present(static_cast<ID3D12CommandQueue*>(static_cast<IUnknown*>(self->real)),
+                                                count && res ? static_cast<ID3D12Resource*>(res[0]) : nullptr, f);
                 if ((pow2 || f % 2000 == 0) && count && res && res[0])
                     xs_capture_frame(static_cast<ID3D12CommandQueue*>(static_cast<IUnknown*>(self->real)),
                                      static_cast<ID3D12Resource*>(res[0]), f);
@@ -4135,6 +4309,102 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                 g.InputLayout = {vs->elements.data(), static_cast<UINT>(vs->elements.size())};
                 if (ps) g.PS = {ps->dxbc.data(), ps->dxbc.size()};
                 for (auto& rt : g.BlendState.RenderTarget) rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+                // HACK (agA3, LEONIDA_CE_SF_BLEND, default on, =0 off): this PSO is built from the shaders only, the
+                // title's blend/depth state is not translated (every pipeline: blend off). Scaleform (VS names with
+                // "Cxform") draws text and edge-AA fringes with alpha: give those normal alpha blending.
+                static const bool sf_blend = [] { const char* v = std::getenv("LEONIDA_CE_SF_BLEND"); return v && *v == '1'; }();  // OFF by default: rd3 went black (the PS alpha is not what we assumed)
+                if (sf_blend && vs->name.find("Cxform") != std::string::npos) {
+                    auto& b = g.BlendState.RenderTarget[0];
+                    b.BlendEnable = TRUE;
+                    b.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+                    b.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+                    b.BlendOp = D3D12_BLEND_OP_ADD;
+                    b.SrcBlendAlpha = D3D12_BLEND_ONE;
+                    b.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+                    b.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+                }
+                char psostate[64] = "";
+                // HACK (agA4, LEONIDA_CE_PSO_BLEND, default on, =0 off): blob #0 of the console record (0x17c/0x184 bytes)
+                // carries GCN context registers at fixed offsets. +0xd0..+0xef = CB_BLEND0..7_CONTROL (0x80000000 =
+                // blend off + DISABLE_ROP3; 0xe5040504 = SRC_ALPHA/INV_SRC_ALPHA, separate alpha, enable), +0xcc =
+                // CB_TARGET_MASK (4 bits per RT), +0x3c = DB_DEPTH_CONTROL (logged only). Translate RT0 blend + mask.
+                {
+                    static const bool pso_blend = [] { const char* v = std::getenv("LEONIDA_CE_PSO_BLEND"); return !v || *v != '0'; }();
+                    static const bool pso_wmask = [] { const char* v = std::getenv("LEONIDA_CE_PSO_WMASK"); return !v || *v != '0'; }();
+                    const auto* b0 = reinterpret_cast<const std::uint8_t*>(w[1]);
+                    const std::uint64_t b0len = w[2];
+                    if (b0 && b0len >= 0x100 && b0len <= 0x400 && xs_readable(b0, 0x100)) {
+                        std::uint32_t cb[8], tmask, dbc, r38;
+                        std::memcpy(cb, b0 + 0xd0, 32);
+                        std::memcpy(&tmask, b0 + 0xcc, 4);
+                        std::memcpy(&dbc, b0 + 0x3c, 4);
+                        std::memcpy(&r38, b0 + 0x38, 4);
+                        const auto fac = [](std::uint32_t f, bool& ok) -> D3D12_BLEND {
+                            switch (f) {
+                            case 0: return D3D12_BLEND_ZERO; case 1: return D3D12_BLEND_ONE;
+                            case 2: return D3D12_BLEND_SRC_COLOR; case 3: return D3D12_BLEND_INV_SRC_COLOR;
+                            case 4: return D3D12_BLEND_SRC_ALPHA; case 5: return D3D12_BLEND_INV_SRC_ALPHA;
+                            case 6: return D3D12_BLEND_DEST_ALPHA; case 7: return D3D12_BLEND_INV_DEST_ALPHA;
+                            case 8: return D3D12_BLEND_DEST_COLOR; case 9: return D3D12_BLEND_INV_DEST_COLOR;
+                            case 10: return D3D12_BLEND_SRC_ALPHA_SAT;
+                            case 13: return D3D12_BLEND_BLEND_FACTOR; case 14: return D3D12_BLEND_INV_BLEND_FACTOR;
+                            case 15: return D3D12_BLEND_SRC1_COLOR; case 16: return D3D12_BLEND_INV_SRC1_COLOR;
+                            case 17: return D3D12_BLEND_SRC1_ALPHA; case 18: return D3D12_BLEND_INV_SRC1_ALPHA;
+                            case 19: return D3D12_BLEND_ALPHA_FACTOR; case 20: return D3D12_BLEND_INV_ALPHA_FACTOR;
+                            default: ok = false; return D3D12_BLEND_ONE;
+                            }
+                        };
+                        const auto op = [](std::uint32_t f, bool& ok) -> D3D12_BLEND_OP {
+                            switch (f) {
+                            case 0: return D3D12_BLEND_OP_ADD; case 1: return D3D12_BLEND_OP_SUBTRACT;
+                            case 2: return D3D12_BLEND_OP_MIN; case 3: return D3D12_BLEND_OP_MAX;
+                            case 4: return D3D12_BLEND_OP_REV_SUBTRACT;
+                            default: ok = false; return D3D12_BLEND_OP_ADD;
+                            }
+                        };
+                        const std::uint32_t c = cb[0];
+                        bool ok = true;
+                        D3D12_RENDER_TARGET_BLEND_DESC d = g.BlendState.RenderTarget[0];
+                        if (c & (1u << 30)) {
+                            d.BlendEnable = TRUE;
+                            d.SrcBlend = fac(c & 31, ok);
+                            d.BlendOp = op((c >> 5) & 7, ok);
+                            d.DestBlend = fac((c >> 8) & 31, ok);
+                            if (c & (1u << 29)) {
+                                d.SrcBlendAlpha = fac((c >> 16) & 31, ok);
+                                d.BlendOpAlpha = op((c >> 21) & 7, ok);
+                                d.DestBlendAlpha = fac((c >> 24) & 31, ok);
+                            } else {
+                                d.SrcBlendAlpha = d.SrcBlend; d.BlendOpAlpha = d.BlendOp; d.DestBlendAlpha = d.DestBlend;
+                            }
+                            // colour factors are not valid for alpha in D3D12: use their alpha forms
+                            const auto amap = [](D3D12_BLEND& f) {
+                                if (f == D3D12_BLEND_SRC_COLOR) f = D3D12_BLEND_SRC_ALPHA;
+                                else if (f == D3D12_BLEND_INV_SRC_COLOR) f = D3D12_BLEND_INV_SRC_ALPHA;
+                                else if (f == D3D12_BLEND_DEST_COLOR) f = D3D12_BLEND_DEST_ALPHA;
+                                else if (f == D3D12_BLEND_INV_DEST_COLOR) f = D3D12_BLEND_INV_DEST_ALPHA;
+                                else if (f == D3D12_BLEND_SRC1_COLOR) f = D3D12_BLEND_SRC1_ALPHA;
+                                else if (f == D3D12_BLEND_INV_SRC1_COLOR) f = D3D12_BLEND_INV_SRC1_ALPHA;
+                                else if (f == D3D12_BLEND_BLEND_FACTOR) f = D3D12_BLEND_ALPHA_FACTOR;
+                                else if (f == D3D12_BLEND_INV_BLEND_FACTOR) f = D3D12_BLEND_INV_ALPHA_FACTOR;
+                            };
+                            amap(d.SrcBlendAlpha); amap(d.DestBlendAlpha);
+                        }
+                        if (pso_blend && ok) g.BlendState.RenderTarget[0] = d;
+                        if (pso_wmask) g.BlendState.RenderTarget[0].RenderTargetWriteMask = static_cast<UINT8>(tmask & 0xf);
+                        std::snprintf(psostate, sizeof(psostate), " [cb0 %08x tm %x db %x]", cb[0], tmask & 0xf, dbc);
+                        static std::atomic<int> dec_logged{0};
+                        const bool sf = vs->name.find("Cxform") != std::string::npos || vs->name.find("TexTG") != std::string::npos;
+                        if (dec_logged++ < 40 || (sf && dec_logged < 4000)) {
+                            std::fprintf(stderr, "[psodec] %s + %s: len 0x%llx cb0 %08x cb1 %08x tmask %08x db %08x r38 %08x -> blend %d %d/%d op %d a %d/%d op %d wmask %x%s\n",
+                                         vs->name.c_str(), ps ? ps->name.c_str() : "(no PS)", (unsigned long long)b0len, cb[0], cb[1], tmask, dbc, r38,
+                                         int(d.BlendEnable), int(d.SrcBlend), int(d.DestBlend), int(d.BlendOp), int(d.SrcBlendAlpha),
+                                         int(d.DestBlendAlpha), int(d.BlendOpAlpha), unsigned(g.BlendState.RenderTarget[0].RenderTargetWriteMask),
+                                         ok ? "" : " (unknown factor: not applied)");
+                            std::fflush(stderr);
+                        }
+                    }
+                }
                 g.SampleMask = UINT_MAX;
                 g.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
                 g.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
@@ -4151,7 +4421,11 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                 }
                 if (SUCCEEDED(hr) && out && *out) {  // HACK diagnostic: pipeline -> shader names
                     std::lock_guard names_lock(g_pso_names_mu);
-                    g_pso_names[*out] = vs->name + " + " + (ps ? ps->name : std::string("(no PS)"));
+                    g_pso_names[*out] = vs->name + " + " + (ps ? ps->name : std::string("(no PS)")) + psostate;
+                    if (vs->name.find("VBatch") != std::string::npos) {
+                        const int k = g_leonida_sf_batch_n.load();
+                        if (k < 16384) { g_leonida_sf_batch_psos[k].store(reinterpret_cast<std::uint64_t>(*out)); g_leonida_sf_batch_n.store(k + 1, std::memory_order_release); }
+                    }
                 }
                 static std::atomic<int> logged{0};
                 if (logged++ < 8 || FAILED(hr)) {
@@ -4483,6 +4757,23 @@ unsigned detect_slot_count(ID3D12Device* real) {
 
 }  // namespace
 
+bool snapshot_source(std::uint64_t va, std::uint64_t& title, std::uint64_t& size) {  // HACK (agA2)
+    std::lock_guard l(g_snap_mu);
+    auto it = g_snaps.upper_bound(va);
+    if (it == g_snaps.begin()) return false;
+    --it;
+    if (va >= it->first + it->second.second) return false;
+    title = it->second.first + (va - it->first);
+    size = it->second.second - (va - it->first);
+    return true;
+}
+
+std::uint64_t upload_snapshot(const void* data, std::uint64_t size) {  // HACK (agA2, LEONIDA_CE_RECT_VS)
+    const std::uint64_t a = reinterpret_cast<std::uint64_t>(data);
+    const std::uint64_t va = xs_gpu_address(a, size);
+    return va == a ? 0 : va;
+}
+
 HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out) {
     if (!real) return E_POINTER;
     if (!out) return E_POINTER;
@@ -4691,6 +4982,32 @@ LONG CALLBACK xs_probe_handler(EXCEPTION_POINTERS* info) {
                                  (unsigned long long)c->Rsi, (unsigned long long)nvt, vt_ok ? "" : " BAD VTABLE");
                     std::fflush(stderr);
                 }
+            }
+        }
+        // DIAGNOSTIC (Leonida CE, bw): the texture lock +0x1336320 calls lockobj->vtable[1](lockobj, tex, 0, mips) at
+        // +0x1336364 and tests al at +0x1336367. Logs the lock object, its vtable, the target and the result.
+        if (tex_mode && (at == 0x141336364ull || at == 0x141336367ull)) {
+            in_range = false;
+            static std::atomic<int> told_lk{0};
+            if (told_lk++ < 200) {
+                if (at == 0x141336364ull) {
+                    const auto* o = reinterpret_cast<const std::uint64_t*>(c->Rcx);
+                    const std::uint64_t vt = xs_readable(o, 0x40) ? o[0] : 0;
+                    const auto* v = reinterpret_cast<const std::uint64_t*>(vt);
+                    std::fprintf(stderr, "[lock] call tid %lx obj %llx vt %llx fn %llx tex %llx r8 %llx r9 %llx obj+8..+38 %llx %llx %llx %llx %llx %llx %llx\n",
+                                 GetCurrentThreadId(), (unsigned long long)c->Rcx, (unsigned long long)vt,
+                                 xs_readable(v, 16) ? (unsigned long long)v[1] : 0ull, (unsigned long long)c->Rdx,
+                                 (unsigned long long)c->R8, (unsigned long long)c->R9,
+                                 vt ? (unsigned long long)o[1] : 0ull, vt ? (unsigned long long)o[2] : 0ull,
+                                 vt ? (unsigned long long)o[3] : 0ull, vt ? (unsigned long long)o[4] : 0ull,
+                                 vt ? (unsigned long long)o[5] : 0ull, vt ? (unsigned long long)o[6] : 0ull,
+                                 vt ? (unsigned long long)o[7] : 0ull);
+                } else {
+                    std::fprintf(stderr, "[lock] ret tid %lx al %llx rcx %llx rdx %llx\n", GetCurrentThreadId(),
+                                 (unsigned long long)(c->Rax & 0xff), (unsigned long long)c->Rcx,
+                                 (unsigned long long)c->Rdx);
+                }
+                std::fflush(stderr);
             }
         }
         if (in_range && pr.hits++ < 60) {

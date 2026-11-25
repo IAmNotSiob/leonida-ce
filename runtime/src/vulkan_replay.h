@@ -33,6 +33,7 @@
 #include "command_list.h"
 #include "depth24.h"
 #include "uav_clear.h"
+#include "rtdiag.h"
 
 #include <vulkan/vulkan.h>
 #include "vulkan_predicate.h"
@@ -56,6 +57,7 @@
 #include <atomic>
 #include <vector>
 
+bool leonida_is_sf_batch_pso(std::uint64_t pso);  // d3d12_xs_device.cpp (agA4)
 namespace leonida {
 // Diagnostic: a refused copy names the check that refused it, so a rejected ExecuteCommandLists can be traced.
 #define COPY_REJECTED() (std::fprintf(stderr, "[copy] rejected at line %d\n", __LINE__), ReplayResult::invalid_copy)
@@ -954,8 +956,34 @@ struct ReplayFunctions {
 };
 
 namespace detail {
+// HACK (agA2, LEONIDA_CE_RECT_VS): copies bytes into the console upload ring and returns their GPU VA (set by the device).
+inline std::uint64_t (*g_rect_snapshot)(const void*, std::uint64_t) = nullptr;
+// HACK (agA2, LEONIDA_CE_SNAP_RESYNC): ring VA -> title address it was snapshotted from (set by the device).
+inline bool (*g_snapshot_source)(std::uint64_t, std::uint64_t&, std::uint64_t&) = nullptr;
 // Copies [va, va + n) from title memory; false if it faults. A read in user mode lets the XMem page handler commit
 // a mapped view of physical pages on first touch (the kernel would not), so a merely reserved view reads fine.
+#ifdef _WIN32
+// HACK (agA3, LEONIDA_CE_VQ_CACHE, default on, =0 off): rd2 (Windows) spent a full core in kernel VirtualQuery from
+// copy_title_bytes / title_readable on the submit thread (~6 fps). VirtualQuery on the big XMem reservations is
+// expensive; cache the answers per thread for 200 ms (the copy itself is still under SEH).
+inline bool cached_virtual_query(std::uint64_t at, MEMORY_BASIC_INFORMATION& out) {
+    static const bool on = [] { const char* v = std::getenv("LEONIDA_CE_VQ_CACHE"); return !v || *v != '0'; }();
+    if (!on) return VirtualQuery(reinterpret_cast<const void*>(at), &out, sizeof(out)) != 0;
+    struct Entry { std::uint64_t base, end, tick; MEMORY_BASIC_INFORMATION mbi; };
+    thread_local Entry cache[32] = {};
+    thread_local unsigned next = 0;
+    const std::uint64_t now = GetTickCount64();
+    for (const Entry& e : cache)
+        if (e.end && at >= e.base && at < e.end && now - e.tick < 200) { out = e.mbi; return true; }
+    if (!VirtualQuery(reinterpret_cast<const void*>(at), &out, sizeof(out))) return false;
+    Entry& e = cache[next++ % 32];
+    e.base = reinterpret_cast<std::uint64_t>(out.BaseAddress);
+    e.end = e.base + out.RegionSize;
+    e.tick = now;
+    e.mbi = out;
+    return true;
+}
+#endif
 inline bool copy_title_bytes(std::uint64_t va, void* dst, std::size_t n) {
 #ifdef _WIN32
     // Only memory this process has (committed, or a reserved view the XMem handler commits on touch): a garbage VA
@@ -963,7 +991,7 @@ inline bool copy_title_bytes(std::uint64_t va, void* dst, std::size_t n) {
     if (!n || va < 0x10000 || va >= 0x0000800000000000ull || va + n < va) return false;
     for (const std::uint64_t at : {va, va + n - 1}) {
         MEMORY_BASIC_INFORMATION mbi{};
-        if (!VirtualQuery(reinterpret_cast<const void*>(at), &mbi, sizeof(mbi)) || mbi.State == MEM_FREE) return false;
+        if (!cached_virtual_query(at, mbi) || mbi.State == MEM_FREE) return false;
         if (mbi.State == MEM_RESERVE && mbi.Type != MEM_MAPPED) return false;
     }
     __try {
@@ -984,7 +1012,7 @@ inline bool title_readable(std::uint64_t va, std::uint64_t size) {
     MEMORY_BASIC_INFORMATION mbi{};
     std::uint64_t at = va;
     while (at < va + size) {
-        if (!VirtualQuery(reinterpret_cast<const void*>(at), &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+        if (!cached_virtual_query(at, mbi) || mbi.State != MEM_COMMIT ||
             (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
             return false;
         at = reinterpret_cast<std::uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
@@ -1104,6 +1132,7 @@ struct PreparedDraw {
     std::vector<VkDeviceSize> vertex_offsets, vertex_sizes, vertex_strides;
     // Title-memory vertex bytes to write into vertex_buffers[slot] before the draw (Leonida CE, see prepare).
     std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>> vertex_uploads;
+    std::uint32_t rect_count = 0;  // HACK (agG, RECTLIST): non-zero = draw this many vertices as a triangle list
     VkBuffer index_buffer = VK_NULL_HANDLE;
     VkDeviceSize index_offset = 0;
     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
@@ -1122,6 +1151,7 @@ struct PreparedDraw {
         vertex_sizes.clear();
         vertex_strides.clear();
         vertex_uploads.clear();
+        rect_count = 0;
         index_buffer = VK_NULL_HANDLE;
         index_offset = 0;
         index_type = VK_INDEX_TYPE_UINT16;
@@ -2129,12 +2159,60 @@ void round_trip(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const
     }
 }
 
+
+// HACK (agA2, LEONIDA_CE_SNAP_RESYNC=1): a vertex/index view at a ring snapshot of title memory (xs_gpu_address at
+// bind time) gets the title bytes copied again when the draw is recorded: the title can write the data after it binds
+// it, and the snapshot then holds zeros or stale data. Writes straight into the ring (host-coherent arena memory).
+template<typename VK>
+inline void snap_resync(const VK& vk, std::uint64_t va, std::uint64_t size, const char* kind) {
+    static const bool on = [] { const char* v = std::getenv("LEONIDA_CE_SNAP_RESYNC"); return v && (v[0] == '1' || v[0] == '2'); }();
+    if (!on || !g_snapshot_source || !vk.host_at || !size || size > (8u << 20)) return;
+    std::uint64_t title = 0, left = 0;
+    if (!g_snapshot_source(va, title, left) || left < size) return;
+    const std::uint8_t* h = nullptr;
+    if (vk.host_at(va, size, h) != HostReadStatus::ok || !h) return;
+    // agA3: the ring is mapped GPU memory (likely write-combined): the memcmp / zero scan below READ it, ~1.5 MB per
+    // Scaleform draw, which on Windows made state 3 crawl (rc5b/rc7b/rc8/rc8b/rc9 "hangs" with presents still
+    // coming, no watchdog). After the first 64 views it is a blind title -> ring copy (write only).
+    // LEONIDA_CE_SNAP_RESYNC=2 keeps comparing (diagnostic, slow).
+    static const bool compare_always = [] { const char* v = std::getenv("LEONIDA_CE_SNAP_RESYNC"); return v && v[0] == '2'; }();
+    static std::atomic<std::uint64_t> n_calls{0};
+    if (!compare_always && n_calls++ >= 64) {
+        copy_title_bytes(title, const_cast<std::uint8_t*>(h), static_cast<std::size_t>(size));
+        return;
+    }
+    std::vector<std::uint8_t> fresh(static_cast<std::size_t>(size));
+    if (!copy_title_bytes(title, fresh.data(), fresh.size())) return;
+    static std::atomic<std::uint64_t> n_seen{0}, n_changed{0}, n_was_zero{0};
+    static std::atomic<int> told{0};
+    const bool changed = std::memcmp(h, fresh.data(), fresh.size()) != 0;
+    ++n_seen;
+    if (changed) {
+        bool was_zero = true;
+        for (std::size_t i = 0; i < fresh.size() && was_zero; ++i) was_zero = h[i] == 0;
+        if (was_zero) ++n_was_zero;
+        ++n_changed;
+        std::memcpy(const_cast<std::uint8_t*>(h), fresh.data(), fresh.size());
+        if (told++ < 12)
+            std::fprintf(stderr, "[hack] SNAP_RESYNC %s va %llx bytes %llu from title %llx: snapshot was %s\n", kind,
+                         (unsigned long long)va, (unsigned long long)size, (unsigned long long)title, was_zero ? "ZERO" : "stale");
+    }
+    if ((n_seen & 0x3FFF) == 0)
+        std::fprintf(stderr, "[hack] SNAP_RESYNC stats: %llu views, %llu changed (%llu were zero)\n", (unsigned long long)n_seen.load(),
+                     (unsigned long long)n_changed.load(), (unsigned long long)n_was_zero.load());
+}
 } // namespace detail
 
 namespace detail {
 
 // Resolves a draw's pipeline, attachments and buffers. Attachment views take the pipeline's formats, so a
 // typeless texture is viewed as the format the pipeline renders.
+// HACK (agG): the first user-data word that looks like a title VA (the root table; s0 under pack(), s8 under GFX_S8).
+inline std::uint32_t agg_root_word(const std::array<std::uint32_t, 32>& u) {
+    for (std::uint32_t w : u) if (w >= 0x10000) return w;
+    return 0;
+}
+
 template<typename Resolve>
 ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunctions& vk, PreparedDraw& p) {
     if (!vk.graphics_pipeline || !vk.buffer_at || !vk.image_view || !vk.begin_rendering || !vk.end_rendering ||
@@ -2154,6 +2232,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     p.pipeline = pipeline->pipeline ? pipeline->pipeline : pipeline->variant(0);
     if (!p.pipeline) {
         p.skip = true;  // compiling in the background (Leonida CE): this draw is left out
+        rtdiag::count_draw(p.colors, 0, 1);
         return ReplayResult::success;
     }
     p.area = {UINT32_MAX, UINT32_MAX};
@@ -2216,15 +2295,160 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         p.pipeline = pipeline->variant ? pipeline->variant(unbound) : VK_NULL_HANDLE;
         if (!p.pipeline) {
             p.skip = true;
+            rtdiag::count_draw(p.colors, 0, 2);
             return ReplayResult::success;
         }
     }
+    rtdiag::count_draw(p.colors, p.depth.id, 0);
 
     // HACK (Leonida CE): the shaders read the title's per-draw data (root arguments point into its upload ring) at
     // heap_base + VA, but the title writes it in its own memory; copy a window around each such address into the arena.
     if (vk.sync_title_range) {
+        // HACK (agD, LEONIDA_CE_CB_FIX=1): the UI composite root block names its 128-byte constant buffer (two
+        // matrices, which the title wrote right before the block) at an address 0xaf0000 lower that holds other data;
+        // point descriptor 0 at block - 0x80 when it is a 128-byte V# whose base is not that.
+        static const bool cb_fix = [] { const char* v = std::getenv("LEONIDA_CE_CB_FIX"); return v && v[0] == '1'; }();
+        {   // HACK experiment (agA2, LEONIDA_CE_CXFORM_FORCE=1): Scaleform "*CxformEAlpha" draws read 64-byte batch
+            // entries {cxform mul rgba, add rgba, matrix row 0, row 1} from the root table's first V#. At state 3
+            // every entry has mul rgb ~1.8e-7 and a = 1 (a fade from black?). Force mul rgb to 1 to see the geometry.
+            static const bool cx_on = [] { const char* v = std::getenv("LEONIDA_CE_CXFORM_FORCE"); return v && v[0] == '1'; }();
+            const std::uint32_t root = agg_root_word(draw.user_data);
+            std::uint32_t w[4] = {};
+            if (cx_on && root && copy_title_bytes(root, w, sizeof(w)) && !((w[1] >> 16) & 0x3FFF) && w[2] >= 64 &&
+                w[2] <= 65536 && !(w[2] & 63) && vk.host_at) {
+                const std::uint64_t base = w[0] | (std::uint64_t(w[1] & 0xFFFF) << 32);
+                const std::uint8_t* h = nullptr;
+                if (vk.host_at(base, w[2], h) == HostReadStatus::ok && h) {
+                    static std::atomic<std::uint64_t> cx_n{0};
+                    static std::atomic<int> cx_told{0};
+                    int patched = 0;
+                    for (std::uint32_t e = 0; e + 64 <= w[2]; e += 64) {
+                        float f[8];
+                        std::memcpy(f, h + e, sizeof(f));
+                        const bool fade = f[0] == f[1] && f[1] == f[2] && f[0] >= 0.f && f[0] < 1e-3f && f[3] > 0.f &&
+                                          f[3] <= 1.f && f[4] == 0.f && f[5] == 0.f && f[6] == 0.f && f[7] == 0.f;
+                        if (!fade) break;
+                        const float one[3] = {1.f, 1.f, 1.f};
+                        std::memcpy(const_cast<std::uint8_t*>(h + e), one, sizeof(one));
+                        ++patched;
+                    }
+                    if (patched) {
+                        ++cx_n;
+                        if (cx_told++ < 6)
+                            std::fprintf(stderr, "[hack] CXFORM_FORCE: root %x V# %llx (%u bytes): %d entries mul rgb -> 1\n", root,
+                                         (unsigned long long)base, w[2], patched);
+                    }
+                }
+            }
+        }
+        {   // HACK (agA4, LEONIDA_CE_SF_STRIDE, default on, =0 off): Scaleform batch VSs (_VBatch*) read their 64-byte
+            // entries {add, mul, matrix row 0, row 1} with buffer_load_dwordx4 idxen, index = entry*4 + row, through the
+            // root table's V#0, but the title's V# has stride 0 (num_records in bytes): every row reads row 0, so the
+            // matrix rows equal the cxform rows, x == y, and all text collapses onto the screen diagonal (the white
+            // line). Give that V# stride 16.
+            static const bool sf_stride = [] { const char* v = std::getenv("LEONIDA_CE_SF_STRIDE"); return !v || v[0] != '0'; }();
+            const std::uint32_t root = agg_root_word(draw.user_data);
+            std::uint32_t w[4] = {};
+            if (sf_stride && root && ::leonida_is_sf_batch_pso((std::uint64_t)draw.pipeline) && copy_title_bytes(root, w, sizeof(w)) &&
+                !((w[1] >> 16) & 0x3FFF) && w[2] >= 64 && !(w[2] & 15) && (w[3] >> 30) == 0) {
+                bool ok = true;
+                __try {
+                    *reinterpret_cast<volatile std::uint32_t*>(std::uint64_t(root) + 4) = w[1] | (16u << 16);
+                } __except (1) { ok = false; }
+                static std::atomic<int> told{0};
+                if (told++ < 4) std::fprintf(stderr, "[hack] SF_STRIDE: root %x V# %08x %08x %08x %08x -> stride 16 (%d)\n", root, w[0], w[1], w[2], w[3], int(ok));
+            }
+        }
+        if (cb_fix && agg_root_word(draw.user_data)) {
+            const std::uint32_t root = agg_root_word(draw.user_data);
+            std::uint32_t w[4] = {};
+            if (copy_title_bytes(root, w, sizeof(w)) && w[2] == 128 && (w[3] >> 30) == 0 && (w[3] & 0xFFF) &&
+                w[0] != root - 0x80 && (w[1] & 0xFFFF) == 0) {
+                __try {
+                    *reinterpret_cast<volatile std::uint32_t*>(std::uint64_t(root)) = root - 0x80;
+                } __except (1) {}
+                static std::atomic<int> told{0};
+                if (told++ < 4) std::fprintf(stderr, "[hack] CB fix: root %x V# base %x -> %x\n", root, w[0], root - 0x80);
+            }
+        }
         for (const std::uint32_t word : draw.user_data)
             if (word >= 0x10000) vk.sync_title_range(word & ~0xFFFull, 0x2000);
+        // HACK diagnostic (agE, LEONIDA_CE_POSDIAG=1): for the UI composite (root block whose descriptor 1 is the UI
+        // layer's T#, word 0 0x01000019), compute on the CPU the clip positions the VS would produce from title memory.
+        static const bool posdiag = [] { const char* v = std::getenv("LEONIDA_CE_POSDIAG"); return v && v[0] == '1'; }();
+        if (posdiag && agg_root_word(draw.user_data)) {
+            const std::uint32_t root = agg_root_word(draw.user_data);
+            std::uint32_t b[24] = {};
+            static std::atomic<int> told{0};
+            if (copy_title_bytes(root, b, sizeof(b)) && b[8] == 0x01000019 && told < 6) {
+                ++told;
+                const std::uint64_t cb0 = b[0] | (std::uint64_t(b[1] & 0xFFFF) << 32);
+                const std::uint64_t cb1 = b[16] | (std::uint64_t(b[17] & 0xFFFF) << 32);
+                float m0[16] = {}, m1[16] = {}, v[18] = {};
+                const bool ok0 = copy_title_bytes(cb0, m0, sizeof(m0));
+                const bool ok1 = copy_title_bytes(cb1 + 0x160, m1, sizeof(m1));
+                const std::uint64_t vva = draw.views ? draw.views->vertex_buffers[0].va : 0;
+                const bool okv = vva && copy_title_bytes(vva, v, sizeof(v));
+                std::fprintf(stderr, "[posdiag] root %x cb0 %llx (%d, size %u) cb1 %llx (%d, size %u) vb %llx (%d stride %u size %u)\n", root,
+                             (unsigned long long)cb0, int(ok0), b[2], (unsigned long long)cb1, int(ok1), b[18],
+                             (unsigned long long)vva, int(okv), draw.views ? draw.views->vertex_buffers[0].stride : 0,
+                             draw.views ? unsigned(draw.views->vertex_buffers[0].size) : 0);
+                std::fprintf(stderr, "[posdiag]   user_data:"); for (auto u : draw.user_data) std::fprintf(stderr, " %x", u);
+                std::fprintf(stderr, "\n");
+                std::fprintf(stderr, "[posdiag]   m0:"); for (float f : m0) std::fprintf(stderr, " %g", f);
+                std::fprintf(stderr, "\n[posdiag]   m1:"); for (float f : m1) std::fprintf(stderr, " %g", f);
+                std::fprintf(stderr, "\n");
+                for (int k = 0; k < 3; ++k) {
+                    const float* x = v + 6 * k;
+                    std::uint32_t col; std::memcpy(&col, &x[3], 4);
+                    // VS: w = row0*x + row1*y + row2*z + row3 (rows of m0, xyz); clip = m1 rows 0..2 by w + row 3
+                    float w[3];
+                    for (int c = 0; c < 3; ++c) w[c] = m0[c] * x[0] + m0[4 + c] * x[1] + m0[8 + c] * x[2] + m0[12 + c];
+                    float o[4];
+                    for (int c = 0; c < 4; ++c) o[c] = m1[c] * w[0] + m1[4 + c] * w[1] + m1[8 + c] * w[2] + m1[12 + c];
+                    std::fprintf(stderr, "[posdiag]   v%d pos %g %g %g col %08x uv %g %g -> world %g %g %g -> clip %g %g %g %g\n", k,
+                                 x[0], x[1], x[2], col, x[4], x[5], w[0], w[1], w[2], o[0], o[1], o[2], o[3]);
+                }
+            }
+        }
+        // HACK (agD, LEONIDA_CE_VSHARP_SYNC=1): the root block holds V#s (constant buffers) that can lie outside that
+        // window; sync each buffer a V# in the first 8 descriptors names, too.
+        static const bool vsharp_sync = [] {
+            const char* v = std::getenv("LEONIDA_CE_VSHARP_SYNC");
+            return v && v[0] == '1';
+        }();
+        if (vsharp_sync) {
+            for (const std::uint32_t word : draw.user_data) {
+                if (word < 0x10000) continue;
+                std::uint32_t w[64] = {};
+                if (!copy_title_bytes(word, w, sizeof(w))) continue;
+                for (int i = 0; i < 64; i += 4) {  // V#s are 4 dwords; T#s 8 (their word 3 type bits differ)
+                    const std::uint64_t base = w[i] | (std::uint64_t(w[i + 1] & 0xFFFF) << 32);
+                    const std::uint32_t stride = (w[i + 1] >> 16) & 0x3FFF;
+                    const std::uint64_t bytes = std::uint64_t(w[i + 2]) * (stride ? stride : 1);
+                    // DST_SEL/format word with type 0 (buffer) in bits 31:30 and a non-zero DST_SEL: a V#.
+                    if (base < 0x10000 || !bytes || bytes > (8u << 20) || (w[i + 3] >> 30) != 0 || !(w[i + 3] & 0xFFF))
+                        continue;
+                    const std::uint64_t first = base & ~0xFFFull;
+                    const std::uint64_t last = (base + bytes + 0xFFF) & ~0xFFFull;
+                    vk.sync_title_range(first, last - first);
+                    static std::atomic<int> told{0};
+                    if (told++ < 12) {
+                        std::uint32_t c[8] = {}, e[32] = {}, g[32] = {};
+                        copy_title_bytes(base, c, sizeof(c));
+                        copy_title_bytes(base, g, sizeof(g));
+                        copy_title_bytes(word - 0x80, e, sizeof(e));
+                        std::fprintf(stderr, "[hack] V# at base:");
+                        for (int k = 0; k < 32; ++k) std::fprintf(stderr, " %08x", g[k]);
+                        std::fprintf(stderr, "\n[hack] root-0x80 :");
+                        for (int k = 0; k < 32; ++k) std::fprintf(stderr, " %08x", e[k]);
+                        std::fprintf(stderr, "\n");
+                        std::fprintf(stderr, "[hack] V# sync: root %x desc %d base %llx bytes %llu; title %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                     word, i / 4, (unsigned long long)base, (unsigned long long)bytes, c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]);
+                    }
+                }
+            }
+        }
     }
     // An unbound vertex-buffer slot reads zeros, as in D3D12: the zero page with stride 0. Per-instance slots with
     // step rate 0 also take stride 0, so every instance reads element 0.
@@ -2261,6 +2485,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         }
         p.vertex_sizes[slot] = size;
         p.vertex_strides[slot] = (pipeline->zero_step_slots & (1u << slot)) ? 0 : view.stride;
+        snap_resync(vk, view.va, size, "vertex");  // agA2
         // HACK (Leonida CE): the title writes dynamic vertices (its UI, every frame) into a large placed buffer in its
         // own memory (a 174 MB ring) whose GPU copy nothing refreshes, so draws read stale zeros and the frame stays
         // black. Copy exactly this view's bytes from title memory into the GPU copy when it is CPU-mapped.
@@ -2310,6 +2535,95 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
                                  static_cast<unsigned long long>(view.va), static_cast<unsigned long long>(size));
             }
         }
+        // HACK (agG, LEONIDA_CE_RECTLIST, default on): D3D topology 17 (Xbox RECTLIST) draws 3 vertices per rectangle;
+        // the 4th corner is v0 + v2 - v1 (VIctory). Expand every rectangle to two triangles {0,1,2},{0,2,4th}, written
+        // over the GPU copy of this view right before the draw (vkCmdUpdateBuffer), and draw them as a triangle list.
+        // Words equal in all three vertices are copied (packed colours), others are treated as float32.
+        {
+            static const bool rect_on = [] { const char* v = std::getenv("LEONIDA_CE_RECTLIST"); return !v || v[0] != '0'; }();
+            const std::uint64_t stride = view.stride;
+            const std::uint64_t n = draw.count / 3;
+            if (rect_on && draw.topology == 17 && !draw.indexed && n && draw.count % 3 == 0 && stride && !(stride & 3) &&
+                p.vertex_strides[slot] == stride && std::uint64_t(draw.first + draw.count) * stride <= size &&
+                (std::uint64_t(draw.first) * stride + 6 * n * stride) <= 65536 && !(p.vertex_offsets[slot] & 3)) {
+                std::vector<std::uint8_t> src(std::size_t(3 * n * stride));
+                // The GPU copy first (it is the title bytes after the sync above, and the only copy when the VA is an
+                // arena offset, e.g. LEONIDA_CE_RING_IN_ARENA), then title memory.
+                const auto read_view = [&](std::uint64_t off, void* dst, std::size_t bytes) {
+                    const std::uint8_t* h = nullptr;
+                    if (vk.host_at && vk.host_at(view.va, size, h) == HostReadStatus::ok && h) {
+                        std::memcpy(dst, h + off, bytes);
+                        return true;
+                    }
+                    return detail::copy_title_bytes(view.va + off, dst, bytes);
+                };
+                if (read_view(std::uint64_t(draw.first) * stride, src.data(), src.size())) {
+                    // HACK (agA2, LEONIDA_CE_RECT_TABLE_SRC, default on): the view's bytes are zero when the draw is
+                    // recorded, but the title keeps the same vertices right after the first V# of the root table
+                    // (state-3 VS_Blit: table = V#(base = this view, 0x60 bytes) + 3 x 24-byte vertices). Use those.
+                    static const bool tsrc_on = [] { const char* v = std::getenv("LEONIDA_CE_RECT_TABLE_SRC"); return !v || v[0] != '0'; }();
+                    bool zsrc = true;
+                    for (auto b : src) if (b) { zsrc = false; break; }
+                    if (zsrc && tsrc_on && !draw.first) {
+                        const std::uint32_t root = agg_root_word(draw.user_data);
+                        std::uint32_t w[4] = {};
+                        if (root && copy_title_bytes(root, w, sizeof(w)) &&
+                            (w[0] | (std::uint64_t(w[1] & 0xFFFF) << 32)) == view.va &&
+                            copy_title_bytes(std::uint64_t(root) + 0x20, src.data(), src.size())) {
+                            static std::atomic<int> told_ts{0};
+                            if (told_ts++ < 6) std::fprintf(stderr, "[hack] RECTLIST: view %llx read zero, vertices from table %x+0x20\n",
+                                                            (unsigned long long)view.va, root);
+                        }
+                    }
+                    {   // DIAGNOSTIC (agA2): what the expansion read
+                        static std::atomic<std::uint64_t> rz{0}, rall{0};
+                        bool z = true;
+                        for (auto b : src) if (b) { z = false; break; }
+                        const std::uint64_t k = ++rall;
+                        if (z) ++rz;
+                        static std::atomic<int> told_src{0};
+                        if ((z && told_src < 6) || (k & 1023) == 0) {
+                            ++told_src;
+                            float f[3][2] = {};
+                            for (int v = 0; v < 3; ++v) std::memcpy(f[v], src.data() + v * stride, 8);
+                            std::fprintf(stderr, "[hack] RECTLIST src #%llu va %llx first %u: %s (%g,%g) (%g,%g) (%g,%g); zero so far %llu\n",
+                                         (unsigned long long)k, (unsigned long long)view.va, draw.first, z ? "ALL ZERO" : "data",
+                                         f[0][0], f[0][1], f[1][0], f[1][1], f[2][0], f[2][1], (unsigned long long)rz.load());
+                        }
+                    }
+                    std::vector<std::uint8_t> out(std::size_t(6 * n * stride));
+                    static const int order[5] = {0, 1, 2, 0, 2};
+                    for (std::uint64_t r = 0; r < n; ++r) {
+                        const std::uint8_t* q = src.data() + r * 3 * stride;
+                        std::uint8_t* o = out.data() + r * 6 * stride;
+                        for (int k = 0; k < 5; ++k) std::memcpy(o + k * stride, q + order[k] * stride, stride);
+                        for (std::uint64_t at = 0; at < stride; at += 4) {
+                            std::uint32_t a, b, c;
+                            std::memcpy(&a, q + at, 4); std::memcpy(&b, q + stride + at, 4); std::memcpy(&c, q + 2 * stride + at, 4);
+                            std::uint32_t d = a;
+                            if (!(a == b && b == c)) {
+                                float fa, fb, fc;
+                                std::memcpy(&fa, &a, 4); std::memcpy(&fb, &b, 4); std::memcpy(&fc, &c, 4);
+                                const float fd = fa + fc - fb;
+                                std::memcpy(&d, &fd, 4);
+                            }
+                            std::memcpy(o + 5 * stride + at, &d, 4);
+                        }
+                    }
+                    std::vector<std::uint8_t> bytes(std::size_t(std::uint64_t(draw.first) * stride) + out.size());
+                    if (draw.first) read_view(0, bytes.data(), std::size_t(std::uint64_t(draw.first) * stride));
+                    std::memcpy(bytes.data() + std::uint64_t(draw.first) * stride, out.data(), out.size());
+                    for (auto it = p.vertex_uploads.begin(); it != p.vertex_uploads.end();)
+                        it = it->first == slot ? p.vertex_uploads.erase(it) : it + 1;
+                    p.vertex_uploads.emplace_back(slot, std::move(bytes));
+                    p.vertex_sizes[slot] = std::max<std::uint64_t>(size, std::uint64_t(draw.first) * stride + out.size());
+                    p.rect_count = std::uint32_t(6 * n);
+                    static std::atomic<int> told_r{0};
+                    if (told_r++ < 3) std::fprintf(stderr, "[hack] RECTLIST: %llu rects -> %u vertices (slot %u stride %llu)\n",
+                                                   (unsigned long long)n, p.rect_count, slot, (unsigned long long)stride);
+                }
+            }
+        }
         if (p.vertex_buffers[slot] == vk.zero_buffer && false) {  // SMOKE/diagnostic: a bound view that resolved to zeros
             static std::atomic<int> told{0};
             if (told++ < 4)
@@ -2317,6 +2631,116 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
                              static_cast<unsigned long long>(view.va), static_cast<unsigned long long>(view.size),
                              static_cast<unsigned>(view.stride), static_cast<unsigned long long>(p.vertex_offsets[slot]));
         }
+    }
+    // HACK (agA2, LEONIDA_CE_RECT_VS=1): a topology-17 (RECTLIST) draw with no input-assembler views fetches its
+    // vertices in the vertex shader from the first V# of its root table. Expand it like LEONIDA_CE_RECTLIST: read
+    // the 3n vertices (the V#'s bytes in the arena, or when those are still zero, the copy the title keeps right after
+    // the V# in the table), write 6n vertices into the upload ring, and point the V# (title memory, as CB_FIX does)
+    // at them. Vertex stride: the V# stride, else LEONIDA_CE_RECT_VSTRIDE (default 24).
+    if (draw.topology == 17 && !p.rect_count && !draw.indexed && draw.count && draw.count % 3 == 0 && !draw.mesh) {
+        static const bool rvs_on = [] { const char* v = std::getenv("LEONIDA_CE_RECT_VS"); return v && v[0] == '1'; }();
+        static const std::uint64_t rvs_stride = [] { const char* v = std::getenv("LEONIDA_CE_RECT_VSTRIDE"); return v ? std::strtoull(v, nullptr, 0) : 24ull; }();
+        static std::atomic<int> rvs_told{0};
+        const std::uint32_t root = agg_root_word(draw.user_data);
+        const bool no_ia = !draw.views || draw.views->vertex_buffers.empty() || !draw.views->vertex_buffers[0].va;
+        if (rvs_on && root && no_ia && g_rect_snapshot) {
+            std::uint32_t w[4] = {};
+            const char* why = nullptr;
+            const char* from = "-";
+            if (!copy_title_bytes(root, w, sizeof(w))) why = "table unreadable";
+            const std::uint64_t base = w[0] | (std::uint64_t(w[1] & 0xFFFF) << 32);
+            const std::uint64_t vs_stride = (w[1] >> 16) & 0x3FFF;
+            const std::uint64_t S = vs_stride ? vs_stride : rvs_stride;
+            const std::uint64_t n = draw.count / 3;
+            const std::uint64_t first = draw.first;
+            const std::uint64_t in_bytes = (first + 3 * n) * S;
+            const std::uint64_t out_bytes = (first + 6 * n) * S;
+            std::vector<std::uint8_t> src(std::size_t(in_bytes), 0);
+            if (!why && (!S || (S & 3) || !base || out_bytes > 65536)) why = "bad shape";
+            const auto nonzero = [&] { for (auto b : src) if (b) return true; return false; };
+            if (!why) {
+                const std::uint8_t* h = nullptr;
+                if (vk.host_at && vk.host_at(base, in_bytes, h) == HostReadStatus::ok && h) {
+                    std::memcpy(src.data(), h, src.size());
+                    from = "arena";
+                }
+                if (!nonzero() && copy_title_bytes(base, src.data(), src.size())) from = "title-base";
+                if (!nonzero() && copy_title_bytes(std::uint64_t(root) + 0x20, src.data(), src.size())) from = "table+0x20";
+                if (!nonzero()) why = "vertices all zero";
+            }
+            if (!why) {
+                std::vector<std::uint8_t> out(std::size_t(out_bytes), 0);
+                std::memcpy(out.data(), src.data(), std::size_t(first * S));
+                static const int order[5] = {0, 1, 2, 0, 2};
+                for (std::uint64_t r = 0; r < n; ++r) {
+                    const std::uint8_t* q = src.data() + (first + r * 3) * S;
+                    std::uint8_t* o = out.data() + (first + r * 6) * S;
+                    for (int k = 0; k < 5; ++k) std::memcpy(o + k * S, q + order[k] * S, std::size_t(S));
+                    for (std::uint64_t at = 0; at < S; at += 4) {
+                        std::uint32_t a, b, c;
+                        std::memcpy(&a, q + at, 4); std::memcpy(&b, q + S + at, 4); std::memcpy(&c, q + 2 * S + at, 4);
+                        std::uint32_t dd = a;
+                        if (!(a == b && b == c)) {
+                            float fa, fb, fc;
+                            std::memcpy(&fa, &a, 4); std::memcpy(&fb, &b, 4); std::memcpy(&fc, &c, 4);
+                            const float fd = fa + fc - fb;
+                            std::memcpy(&dd, &fd, 4);
+                        }
+                        std::memcpy(o + 5 * S + at, &dd, 4);
+                    }
+                }
+                const std::uint64_t va = g_rect_snapshot(out.data(), out.size());
+                if (!va) why = "ring snapshot failed";
+                else {
+                    std::uint32_t nw[3] = {std::uint32_t(va), (w[1] & 0xFFFF0000u) | std::uint32_t((va >> 32) & 0xFFFF),
+                                           vs_stride ? std::uint32_t(first + 6 * n) : std::uint32_t(out_bytes)};
+                    bool patched = false;
+#ifdef _WIN32
+                    __try {
+                        auto* t = reinterpret_cast<volatile std::uint32_t*>(std::uint64_t(root));
+                        t[0] = nw[0]; t[1] = nw[1]; t[2] = nw[2];
+                        patched = true;
+                    } __except (1) {}
+#endif
+                    const std::uint8_t* hr = nullptr;  // the arena copy of the table, if it has one
+                    if (vk.host_at && vk.host_at(root, 16, hr) == HostReadStatus::ok && hr) {
+                        std::memcpy(const_cast<std::uint8_t*>(hr), nw, sizeof(nw));
+                    }
+                    if (!patched) why = "table write faulted";
+                    else {
+                        p.rect_count = std::uint32_t(first + 6 * n) - std::uint32_t(first);
+                        if (rvs_told++ < 8) {
+                            float f[12] = {};
+                            std::memcpy(f, src.data() + first * S, std::min<std::size_t>(sizeof(f), std::size_t(3 * S)));
+                            std::fprintf(stderr, "[hack] RECT_VS: pipe %llx root %x V# %llx stride %llu nr %u (%s) %llu rects -> VA %llx (%u verts); v0 %g %g %g %g %g %g | v1 %g %g %g %g %g %g\n",
+                                         (unsigned long long)draw.pipeline, root, (unsigned long long)base, (unsigned long long)S, w[2], from,
+                                         (unsigned long long)n, (unsigned long long)va, p.rect_count, f[0], f[1], f[2], f[3], f[4], f[5],
+                                         S >= 24 ? f[6] : 0.f, S >= 24 ? f[7] : 0.f, S >= 24 ? f[8] : 0.f, S >= 24 ? f[9] : 0.f,
+                                         S >= 24 ? f[10] : 0.f, S >= 24 ? f[11] : 0.f);
+                        }
+                    }
+                }
+            }
+            if (why && rvs_told++ < 8)
+                std::fprintf(stderr, "[hack] RECT_VS skip (%s): pipe %llx root %x V# %08x %08x %08x %08x count %u first %u (%s)\n", why,
+                             (unsigned long long)draw.pipeline, root, w[0], w[1], w[2], w[3], draw.count, draw.first, from);
+        }
+    }
+    if (draw.topology == 17) {  // DIAGNOSTIC (agSA): RECTLIST draws the expansion above did not catch
+        static std::atomic<std::uint64_t> rl_total{0}, rl_done{0};
+        static std::atomic<int> rl_miss_told{0};
+        const std::uint64_t t = ++rl_total;
+        if (p.rect_count) ++rl_done;
+        else if (rl_miss_told++ < 12) {
+            const std::uint64_t vva = draw.views && !draw.views->vertex_buffers.empty() ? draw.views->vertex_buffers[0].va : 0;
+            const std::uint64_t vst = draw.views && !draw.views->vertex_buffers.empty() ? draw.views->vertex_buffers[0].stride : 0;
+            std::fprintf(stderr, "[hack] RECTLIST miss: pipe %llx count %u first %u inst %u indexed %d vertex_slots %x view0 va %llx stride %llu\n",
+                         (unsigned long long)draw.pipeline, draw.count, draw.first, draw.instances, int(draw.indexed),
+                         pipeline->vertex_slots, (unsigned long long)vva, (unsigned long long)vst);
+        }
+        if ((t & 2047) == 0)
+            std::fprintf(stderr, "[hack] RECTLIST stats: %llu topo-17 draws, %llu expanded\n", (unsigned long long)t,
+                         (unsigned long long)rl_done.load());
     }
     if (draw.indexed) {
         if (draw.index.format == 57) p.index_type = VK_INDEX_TYPE_UINT16;
@@ -2328,6 +2752,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
             p.index_offset = vk.zero_offset;
         } else {
             std::uint64_t size = draw.index.size;
+            snap_resync(vk, draw.index.va, draw.index.size, "index");  // agA2
             if (!vk.buffer_at(draw.index.va, size, p.index_buffer, p.index_offset)) {
                 // HACK (Leonida CE boot): index data in title memory, as above: every index reads 0.
                 static bool told_ = false;
@@ -3233,8 +3658,33 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             auto& prepared_draw = out.draws[out.draw_count];
             prepared_draw.reset();
             p.draw = std::uint32_t(out.draw_count++);
-            if (const auto r = detail::prepare_draw(*draw, resolve, vk, prepared_draw); r != ReplayResult::success)
+            if (const auto r = detail::prepare_draw(*draw, resolve, vk, prepared_draw); r != ReplayResult::success) {
+                rtdiag::count_list(int(r), true);
                 return r;
+            }
+            {   // EXPERIMENT (agA4, LEONIDA_CE_SKIP_DRAWS="count@first,..."): drop matching draws at replay (e.g. the
+                // Scaleform backdrop 30@0 / 60@32) to see what is underneath.
+                static const std::vector<std::pair<std::uint32_t, std::uint32_t>> skips = [] {
+                    std::vector<std::pair<std::uint32_t, std::uint32_t>> v;
+                    const char* e = std::getenv("LEONIDA_CE_SKIP_DRAWS");
+                    while (e && *e) {
+                        char* end = nullptr;
+                        const unsigned long c = std::strtoul(e, &end, 0);
+                        unsigned long f = ~0ul;
+                        if (end && *end == '@') f = std::strtoul(end + 1, &end, 0);
+                        v.emplace_back(std::uint32_t(c), std::uint32_t(f));
+                        if (!end || !*end) break;
+                        e = end + 1;
+                    }
+                    return v;
+                }();
+                for (const auto& [c, f] : skips)
+                    if (draw->count == c && (f == 0xFFFFFFFFu || draw->first == f)) {
+                        prepared_draw.skip = true;
+                        static std::atomic<int> told_skip{0};
+                        if (told_skip++ < 4) std::fprintf(stderr, "[hack] SKIP_DRAWS: dropped draw count %u first %u\n", draw->count, draw->first);
+                    }
+            }
         }
     }
     if (ordinary_active || binary_active) return ReplayResult::invalid_query;
@@ -4229,6 +4679,18 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
 
             ShaderUserData data{};
             std::copy(draw->user_data.begin(), draw->user_data.end(), data.s);
+            {
+                // HACK (agF, LEONIDA_CE_UD8=1): the UI shaders (sga_dr_vs_pos_color*, default_ps_tex) read their root
+                // block pointer from user SGPR 8 (s[8:9], s9 forced 0), but the replay puts it in user data word 0 and
+                // leaves word 8 zero, so they read their V#s/T#s at VA 0 (the zero page): every vertex collapses to
+                // the origin and nothing rasterizes. Mirror word 0 into word 8 when only word 0 is set.
+                static const bool ud8 = [] { const char* v = std::getenv("LEONIDA_CE_UD8"); return v && v[0] == '1'; }();
+                if (ud8 && draw->user_data.size() > 8 && data.s[0] >= 0x10000) {
+                    bool rest_zero = true;
+                    for (std::size_t k = 1; k < draw->user_data.size(); ++k) rest_zero = rest_zero && data.s[k] == 0;
+                    if (rest_zero) data.s[8] = data.s[0];
+                }
+            }
             data.heap_base = vk.heap_base;
             data.code_base = graphics.code_base;
             vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline);
@@ -4251,7 +4713,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             // A mesh pipeline has no input assembly: its topology comes from the shader, and neither the topology
             // nor primitive restart is dynamic state there (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065).
             if (!draw->mesh) {
-                const VkPrimitiveTopology topology = detail::vulkan_topology(draw->topology);
+                const VkPrimitiveTopology topology = d.rect_count ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : detail::vulkan_topology(draw->topology);
                 vk.set_primitive_topology(command_buffer, topology);
                 const bool restart = draw->indexed && detail::strip_topology(topology) &&
                                      ((graphics.strip_cut == 1 && d.index_type == VK_INDEX_TYPE_UINT16) ||
@@ -4273,7 +4735,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.draw_indexed(command_buffer, draw->count, draw->instances, draw->first, draw->base_vertex,
                                 draw->first_instance);
             } else {
-                vk.draw(command_buffer, draw->count, draw->instances, draw->first, draw->first_instance);
+                vk.draw(command_buffer, d.rect_count ? d.rect_count : draw->count, draw->instances, draw->first, draw->first_instance);
             }
             // SMOKE TEST (Leonida CE): LEONIDA_CE_SMOKE=1 paints a 64x64 magenta square into the top-left of colour
             // target 0 after every draw. Magenta in the presented frame = this target reaches the screen (so black
@@ -4306,11 +4768,126 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     std::fprintf(stderr, "\n");
                     std::fprintf(stderr, "[smoke]   vertex slots %zu:", d.vertex_buffers.size());
                     for (std::size_t i = 0; i < d.vertex_buffers.size(); ++i)
-                        std::fprintf(stderr, " [%zu %s stride %llu]", i,
+                        std::fprintf(stderr, " [%zu %s stride %llu off %llx (zero off %llx) size %llu]", i,
                                      !d.vertex_buffers[i] ? "none" : d.vertex_buffers[i] == vk.zero_buffer ? "ZERO" : "buffer",
-                                     static_cast<unsigned long long>(d.vertex_strides[i]));
+                                     static_cast<unsigned long long>(d.vertex_strides[i]),
+                                     static_cast<unsigned long long>(d.vertex_offsets[i]),
+                                     static_cast<unsigned long long>(vk.zero_offset),
+                                     static_cast<unsigned long long>(d.vertex_sizes[i]));
                     std::fprintf(stderr, "\n");
                 }
+            }
+            {  // DIAGNOSTIC (agG, LEONIDA_CE_TDIAG=<T# address>): what the draws into that colour target look like
+                static const std::uint64_t tdiag = [] { const char* e = std::getenv("LEONIDA_CE_TDIAG"); return e ? std::strtoull(e, nullptr, 0) : 0ull; }();
+                static std::atomic<int> told_t{0};
+                if (tdiag && !d.colors.empty() && d.colors[0].id && rtdiag::tdiag_match(rtdiag::address_for_id(d.colors[0].id)) && told_t < 48 && [&] {
+                        static std::mutex mt; static std::vector<std::tuple<std::uint64_t, std::uint32_t, std::uint32_t>> seen;
+                        std::lock_guard l(mt);
+                        const auto key = std::make_tuple(std::uint64_t(draw->pipeline), draw->count, draw->topology);
+                        if (std::find(seen.begin(), seen.end(), key) != seen.end()) return false;
+                        seen.push_back(key); ++told_t; return true; }()) {
+                    std::fprintf(stderr, "[tdiag] draw pipe %llx count %u inst %u first %u idx %d topo %d vp %.0f,%.0f %.0fx%.0f sc %d,%d..%d,%d ud:",
+                                 (unsigned long long)draw->pipeline, draw->count, draw->instances, draw->first, int(draw->indexed), int(draw->topology),
+                                 draw->viewport.x, draw->viewport.y, draw->viewport.width, draw->viewport.height,
+                                 draw->scissor.left, draw->scissor.top, draw->scissor.right, draw->scissor.bottom);
+                    for (auto u : draw->user_data) std::fprintf(stderr, " %x", u);
+                    std::fprintf(stderr, "\n");
+                    const std::uint32_t root = detail::agg_root_word(draw->user_data);
+                    std::uint32_t w[48] = {};
+                    if (root && detail::copy_title_bytes(root, w, sizeof(w))) {
+                        std::fprintf(stderr, "[tdiag]   table %x:", root);
+                        for (int i = 0; i < 48; ++i) std::fprintf(stderr, "%s%08x", i % 8 ? " " : "  |", w[i]);
+                        std::fprintf(stderr, "\n");
+                    }
+                    if (root) {  // the first descriptor V# contents (agG)
+                        const std::uint64_t base = w[0] | (std::uint64_t(w[1] & 0xFFFF) << 32);
+                        float c[24] = {};
+                        {
+                            const std::uint8_t* host = nullptr;
+                            const auto hs = vk.host_at ? vk.host_at(base, 96, host) : HostReadStatus::absent;
+                            std::fprintf(stderr, "[tdiag]   V#0 %llx host_at %d host %p:", (unsigned long long)base, int(hs), (const void*)host);
+                            if (hs == HostReadStatus::ok && host) { float h[24]; std::memcpy(h, host, sizeof(h)); for (float f : h) std::fprintf(stderr, " %g", f); }
+                            std::fprintf(stderr, "\n");
+                            {   // scan +-128 KiB around the table for an identity matrix (agG)
+                                static const float id[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+                                std::vector<std::uint8_t> buf(0x1000);
+                                int hits = 0;
+                                for (std::int64_t pg = std::int64_t(root & ~0xFFFull) - 0x20000; pg < std::int64_t(root) + 0x20000 && hits < 12; pg += 0x1000) {
+                                    if (!detail::copy_title_bytes(std::uint64_t(pg), buf.data(), 0x1000)) continue;
+                                    for (int o = 0; o + 64 <= 0x1000 && hits < 12; o += 16)
+                                        if (!std::memcmp(buf.data() + o, id, 64)) {
+                                            ++hits;
+                                            float nx[8]; std::memcpy(nx, buf.data() + (o + 96 <= 0x1000 ? o + 64 : o), 32);
+                                            std::fprintf(stderr, "[tdiag]   identity at %llx (root%+lld) next %g %g %g %g %g %g %g %g\n", (unsigned long long)(pg + o),
+                                                         (long long)(pg + o) - (long long)root, nx[0], nx[1], nx[2], nx[3], nx[4], nx[5], nx[6], nx[7]);
+                                        }
+                                }
+                            }
+                            float pre[40] = {};
+                            if (detail::copy_title_bytes(root - 0xa0, pre, sizeof(pre))) {
+                                std::fprintf(stderr, "[tdiag]   title root-0xa0:");
+                                for (float f : pre) std::fprintf(stderr, " %g", f);
+                                std::fprintf(stderr, "\n");
+                            }
+                        }
+                        if (base && detail::copy_title_bytes(base, c, sizeof(c))) {
+                            std::fprintf(stderr, "[tdiag]   V#0 %llx:", (unsigned long long)base);
+                            for (float f : c) std::fprintf(stderr, " %g", f);
+                            std::fprintf(stderr, "\n");
+                        }
+                    }
+                    {   // DIAGNOSTIC (agA2): IA views and index data through the arena (host_at), not title memory
+                        const GraphicsPipeline* gp = vk.graphics_pipeline ? vk.graphics_pipeline(draw->pipeline) : nullptr;
+                        std::fprintf(stderr, "[tdiag]   ia: slots %x views %zu idx va %llx fmt %u size %llu\n", gp ? gp->vertex_slots : 0u,
+                                     draw->views ? draw->views->vertex_buffers.size() : std::size_t(0),
+                                     (unsigned long long)draw->index.va, unsigned(draw->index.format), (unsigned long long)draw->index.size);
+                        for (std::size_t i = 0; draw->views && i < draw->views->vertex_buffers.size() && i < 4; ++i) {
+                            const auto& vb = draw->views->vertex_buffers[i];
+                            if (!vb.va) continue;
+                            const std::uint8_t* h = nullptr;
+                            const auto hs = vk.host_at ? vk.host_at(vb.va, 64, h) : HostReadStatus::absent;
+                            std::fprintf(stderr, "[tdiag]   vb%zu va %llx stride %u size %u host %d:", i, (unsigned long long)vb.va, unsigned(vb.stride),
+                                         unsigned(vb.size), int(hs));
+                            if (hs == HostReadStatus::ok && h) {
+                                const std::uint64_t at = std::uint64_t(draw->indexed ? 0 : draw->first) * vb.stride;
+                                if (vk.host_at(vb.va, at + 64, h) == HostReadStatus::ok && h)
+                                    for (int k = 0; k < 16; ++k) { std::uint32_t u; std::memcpy(&u, h + at + 4 * k, 4); std::fprintf(stderr, " %08x", u); }
+                            }
+                            std::fprintf(stderr, "\n");
+                        }
+                        if (draw->indexed && draw->index.va && vk.host_at) {
+                            const std::uint64_t isz = draw->index.format == 42 ? 4 : 2;
+                            const std::uint8_t* h = nullptr;
+                            const std::uint64_t at = std::uint64_t(draw->first) * isz;
+                            if (vk.host_at(draw->index.va, at + 32, h) == HostReadStatus::ok && h) {
+                                std::fprintf(stderr, "[tdiag]   indices @first:");
+                                for (int k = 0; k < int(32 / isz); ++k) {
+                                    std::uint32_t u = 0; std::memcpy(&u, h + at + k * isz, std::size_t(isz)); std::fprintf(stderr, " %u", u);
+                                }
+                                std::fprintf(stderr, "\n");
+                            }
+                        }
+                    }
+                    if (draw->views) {
+                        const auto& vb = draw->views->vertex_buffers[0];
+                        float v[24] = {};
+                        if (vb.va && detail::copy_title_bytes(vb.va, v, sizeof(v))) {
+                            std::fprintf(stderr, "[tdiag]   vb0 %llx stride %u size %u:", (unsigned long long)vb.va, vb.stride, vb.size);
+                            for (float f : v) std::fprintf(stderr, " %g", f);
+                            std::fprintf(stderr, "\n");
+                        }
+                    }
+                }
+            }
+            if (vk.clear_attachments && !d.colors.empty() && rtdiag::paint(d.colors[0].id)) {
+                // RTDIAG hack: paint the whole target an opaque colour, to test what reads it downstream.
+                VkClearAttachment c{VK_IMAGE_ASPECT_COLOR_BIT, 0, {}};
+                c.clearValue.color.float32[0] = 0.25f;
+                c.clearValue.color.float32[1] = 0.75f;
+                c.clearValue.color.float32[2] = 0.5f;
+                c.clearValue.color.float32[3] = 1.0f;
+                const VkClearRect all{{{0, 0}, d.area}, 0, 1};
+                vk.clear_attachments(command_buffer, 1, &c, 1, &all);
             }
             if (smoke && vk.clear_attachments) {
                 VkClearAttachment magenta{VK_IMAGE_ASPECT_COLOR_BIT, 0, {}};
