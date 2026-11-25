@@ -8,7 +8,8 @@ import spirv_asm
 
 class MeshAllocSingleWriterTests(unittest.TestCase):
     def test_ms_alloc_req_single_writer_guard(self):
-        """SHADER-766: s_sendmsg(MSG_GS_ALLOC_REQ) restricts OpStore %ms_counts to local_index == 0."""
+        """SHADER-766: s_sendmsg(MSG_GS_ALLOC_REQ) restricts OpStore %ms_counts to lane 0 of the sending wave
+        (local_index % wave size == 0), not invocation 0: the message may come from any one wave."""
         for mesh_compute in (False, True):
             orig_mc = rdna2spirv.MESH_COMPUTE
             try:
@@ -27,7 +28,7 @@ class MeshAllocSingleWriterTests(unittest.TestCase):
                 # 1. OpStore %ms_counts must be present
                 self.assertIn("OpStore %ms_counts", body_text)
 
-                # 2. Must load %local_index and compare to 0
+                # 2. Must load %local_index and compare its wave lane to 0
                 self.assertIn("= OpLoad %uint %local_index", body_text)
                 self.assertRegex(body_text, r"%(\w+) = OpIEqual %bool %(\w+) %c0")
 

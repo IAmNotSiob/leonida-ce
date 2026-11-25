@@ -86,7 +86,11 @@ def _translate_and_validate_cs(name: str, asm_lines: list[str], threads: int = 6
             gc.collect()
         spirv_as = shutil.which("spirv-as")
         spirv_val = shutil.which("spirv-val")
-        assert spirv_as and spirv_val, "spirv-as and spirv-val must be on PATH"
+        if not (spirv_as and spirv_val):
+            # As the other semantic tests do: skip without SPIRV-Tools, unless they are required.
+            if os.environ.get("LEONIDA_REQUIRE_SPIRV_TOOLS"):
+                raise AssertionError("spirv-as and spirv-val must be on PATH")
+            raise unittest.SkipTest("spirv-as / spirv-val not on PATH")
         spvasm = os.path.join(tmp, f"{name}.spvasm")
         spvbin = os.path.join(tmp, f"{name}.spv")
         with open(spvasm, "w", encoding="utf-8", newline="\n") as f:

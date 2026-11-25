@@ -51,6 +51,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>  // ce_data_path; not every includer (test/xs_proxy_mock_test.cpp) has it already
 
 namespace rt::d3d12_xs {
 

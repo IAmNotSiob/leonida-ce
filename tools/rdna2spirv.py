@@ -7321,13 +7321,16 @@ class Gen:
                 raise Unsupported("gs sendmsg " + t)
             return
         if op == "s_sendmsg" and a and "MSG_GS_ALLOC_REQ" in a[0].get("t", "") and self.stage == "ms":
-            # SHADER-766: only invocation 0 stores the workgroup counts to avoid SharedMemoryDataRace-RaceOnStore.
-            # The counts are uniform (from SGPR m0), and all invocations synchronize at the post-alloc barrier.
+            # SHADER-766: one invocation stores the workgroup counts, to avoid SharedMemoryDataRace-RaceOnStore. The
+            # counts are uniform (from SGPR m0), and all invocations synchronize at the post-alloc barrier.
+            # The writer is lane 0 of the wave that sends the message, not invocation 0 of the workgroup: any one wave
+            # may send it (ms_wave_info_s3 sends it from wave 1 only), and a scalar branch around the s_sendmsg is
+            # uniform across the wave, so its lane 0 always reaches the store. Hardware takes one request per group.
             m = self.tmp()
             self.emit(f"{m} = OpLoad %uint %m0")
-            li = self.local_index()
+            lane = self.wave_lane()
             is_lead = self.tmp()
-            self.emit(f"{is_lead} = OpIEqual %bool {li} {self.cu(0)}")
+            self.emit(f"{is_lead} = OpIEqual %bool {lane} {self.cu(0)}")
             do_lbl, end_lbl = self.tmp() + "_alloc_do", self.tmp() + "_alloc_end"
             self.emit(f"OpSelectionMerge {end_lbl} None")
             self.emit(f"OpBranchConditional {is_lead} {do_lbl} {end_lbl}")

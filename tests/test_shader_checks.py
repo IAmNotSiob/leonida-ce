@@ -35,8 +35,9 @@ TOTAL = (len(check.COMPUTE) + 7 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 15)  # three mesh fixtures, ps_tex, ps_imgatomic, six compute fixtures,
-         # ps_ssharp, vs_base_ids, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case) and cs_fmt_all
+         + len(check.TEXTURE_CONSTANTS) + 16)  # three mesh fixtures, ps_tex, ps_imgatomic, six compute fixtures,
+         # ps_ssharp, vs_base_ids, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case), cs_fmt_all
+         # and ps_table_fetch (#6833)
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 
@@ -183,6 +184,7 @@ class Wave64Checks(unittest.TestCase):
                   patch.object(check, "base_ids_test", return_value=""),
                   patch.object(check, "get_lod_test", return_value=""),
                   patch.object(check, "sampler_test", return_value=""),
+                  patch.object(check, "table_fetch_test", return_value=""),
                   contextlib.redirect_stdout(output)):
                 status = check.main()
         return status, output.getvalue()
@@ -258,6 +260,42 @@ class Wave64Checks(unittest.TestCase):
         status, out = self.run_checks(unsupported, unsupported, missing_ballot=True)
         self.assertEqual(status, 1, out)
         self.assertIn("missing cs_wave64_ballot.spv", out)
+
+
+class TableFetchChecks(unittest.TestCase):
+    """ps_table_fetch (#6833): vk_texture_test runs from the SPIR-V folder and must write each mode's readback."""
+
+    def run_modes(self, answer):
+        calls = []
+
+        def harness(tool, mode, raw, *, env=None, cwd=None):
+            calls.append((Path(tool).name, mode, cwd))
+            return answer(mode, raw)
+
+        with patch.object(check, "run", side_effect=harness):
+            return check.table_fetch_test("tools", "spirv"), calls
+
+    @staticmethod
+    def exact(mode, raw):
+        Path(raw).write_bytes(b"\0")
+        return 0, f"{mode}: 4096 exact pixels\n"
+
+    def test_every_mode_runs_in_the_spirv_folder(self):
+        problem, calls = self.run_modes(self.exact)
+        self.assertEqual(problem, "")
+        self.assertEqual(calls, [("vk_texture_test" + check.EXE, m, "spirv")
+                                 for m in ("fetch-sint", "fetch-uint", "fetch-miss")])
+
+    def test_a_missing_readback_or_wrong_pixels_fail(self):
+        problem, _ = self.run_modes(lambda mode, raw: (0, f"{mode}: 4096 exact pixels\n"))
+        self.assertIn("missing readback", problem)
+        problem, _ = self.run_modes(lambda mode, raw: (Path(raw).write_bytes(b"\0"), (0, f"{mode}: 4000 exact pixels\n"))[1])
+        self.assertTrue(problem)
+
+    def test_an_unsupported_device_skips(self):
+        problem, calls = self.run_modes(lambda mode, raw: (check.UNSUPPORTED, "no integer fetch\n"))
+        self.assertIsInstance(problem, check.Skip)
+        self.assertEqual(len(calls), 1)
 
 
 class FloatToIntSweep(unittest.TestCase):

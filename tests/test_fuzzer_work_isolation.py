@@ -22,7 +22,9 @@ class FuzzerWorkIsolation(unittest.TestCase):
         )
         for module, extra, program in cases:
             with self.subTest(fuzzer=module.__name__), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
+                # resolve(): the fuzzers print the resolved work folder, and Windows' %TEMP% is an 8.3 short
+                # name (C:\Users\RUNNER~1) that resolves to the long one.
+                root = Path(tmp).resolve()
                 sentinels = {}
                 for subdir in ("disasm", "fssm", "spirv"):
                     path = root / subdir / "keep.txt"
@@ -75,7 +77,7 @@ class FuzzerWorkIsolation(unittest.TestCase):
     def test_failed_translation_reports_retained_output_and_creates_parent(self):
         for module, extra in ((lds_fuzz, []), (valu_fuzz, ["--family", "f16"])):
             with self.subTest(fuzzer=module.__name__), tempfile.TemporaryDirectory() as tmp:
-                parent = Path(tmp) / "new" / "work"
+                parent = Path(tmp).resolve() / "new" / "work"  # resolved, as above
                 output = io.StringIO()
                 argv = [module.__name__ + ".py", "--programs", "1", "--wave", "32", "--work", str(parent), *extra]
                 with (patch.object(sys, "argv", argv),

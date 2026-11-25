@@ -524,8 +524,10 @@ class MainTest(unittest.TestCase):
         self.assertIn("[PASS] stdin", proc.stdout)
 
     def test_relative_root_launches_the_artifact_from_its_working_directory(self):
+        # Both sides resolved: on Windows %TEMP% is an 8.3 short name (RUNNER~1) that resolve() expands, so an
+        # unresolved cwd never equals a resolved path even in the same folder.
         (self.artifact / "check_cwd.py").write_text(
-            "from pathlib import Path\nassert Path.cwd() == Path(__file__).resolve().parent\n",
+            "from pathlib import Path\nassert Path.cwd().resolve() == Path(__file__).resolve().parent\n",
             encoding="utf-8", newline="\n")
         entry = ctest_entry("ok", self.command("check_cwd.py"))
         with contextlib.chdir(self.root):

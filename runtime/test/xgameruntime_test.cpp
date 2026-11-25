@@ -193,9 +193,11 @@ void check_measured_classes(QueryFn query, XSystemAnalyticsInfo (*named_analytic
             served = served && available(f, v);
         check(served, "slot 3 (XGameRuntimeIsFeatureAvailable): true for the features whose classes are served, "
                       "XPersistentLocalStorage among them");
-        check(!available(f, 4) && !available(f, 22) && !available(f, 0xFFFFFFFFu),
-              "slot 3: false for XDisplay (served, but documented for the consoles only) and values past the enum");
-        // Every feature but XDisplay follows whether QueryApiImpl serves its class, whichever file serves it.
+        // XDisplay is reported available (Leonida CE, after VIctory: the title asks before using the display class,
+        // which is served offline); values past the enum are not.
+        check(available(f, 4) && !available(f, 22) && !available(f, 0xFFFFFFFFu),
+              "slot 3: true for XDisplay (its class is served) and false for values past the enum");
+        // The other features follow whether QueryApiImpl serves their class, whichever file serves it.
         const struct {
             uint32_t feature;
             GUID cls;
@@ -677,9 +679,17 @@ void check_run_time_load() {
         check(reinterpret_cast<IdQuery>(slot(sy, 4))(sy, sizeof(buf), buf, &used) == S_OK &&
                   std::strcmp(buf, "RETAIL") == 0 && used == 7,
               "slot 4 (XSystemGetXboxLiveSandboxId): RETAIL");
-        check(reinterpret_cast<IdQuery>(slot(sy, 4))(sy, 15, buf, &used) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) &&
-                  reinterpret_cast<IdQuery>(slot(sy, 4))(sy, 16, buf, &used) == S_OK,
-              "slot 4 needs XSystemXboxLiveSandboxIdMaxBytes (16), not just the id's 7 bytes");
+        // Leonida CE follows VIctory's put_string here: only the id (7 bytes with its terminator) must fit, not
+        // XSystemXboxLiveSandboxIdMaxBytes (16), and the size needed is reported even when the buffer is short.
+        used = 0;
+        const HRESULT short_hr = reinterpret_cast<IdQuery>(slot(sy, 4))(sy, 6, buf, &used);
+        const size_t short_used = used;
+        std::memset(buf, 0, sizeof(buf));
+        check(short_hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) && short_used == 7 &&
+                  reinterpret_cast<IdQuery>(slot(sy, 4))(sy, 7, buf, &used) == S_OK && used == 7 &&
+                  std::strcmp(buf, "RETAIL") == 0 &&
+                  reinterpret_cast<IdQuery>(slot(sy, 4))(sy, 16, nullptr, &used) == E_INVALIDARG,
+              "slot 4 needs room for the id's 7 bytes, reports 7 when short, and refuses a null buffer");
         const GUID chain[] = {
             system_cls,
             {0x6fd71f09, 0x7513, 0x49f0, {0x89, 0xbc, 0xbf, 0xaf, 0x5d, 0xf6, 0xf8, 0x52}},

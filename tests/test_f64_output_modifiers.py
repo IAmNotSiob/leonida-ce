@@ -72,6 +72,9 @@ class F64OutputModifiersTest(unittest.TestCase):
         for index, register in ((0, "%c4"), (1, "%c5")):
             word = result(rf"OpCompositeExtract %uint {pair} {index}")
             dest = result(rf"OpAccessChain %_ptr_Function_uint %vgpr {register}")
+            # A program that never writes EXEC stores without the per-lane select (no-EXEC fast path, #4473).
+            if re.search(rf"(?m)^ *OpStore {re.escape(dest)} {re.escape(word)}$", spv):
+                continue
             old_word = result(rf"OpLoad %uint {dest}")
             masked_word = result(rf"OpSelect %uint %\w+ {word} {old_word}")
             self.assertRegex(spv, rf"(?m)^ *OpStore {dest} {masked_word}$")

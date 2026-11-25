@@ -241,7 +241,7 @@ int32_t run_request(const Req& r) {
     if (!ok) {
         if (fails++ < 12) {
             const bool have = src.size() == src_size;
-            std::fprintf(stderr, "[dstorage] request FAILED: comp=%u file=%ls off=0x%llx size=%u dst=%p/%u first=%02x %02x %02x %02x\n",
+            std::fprintf(stderr, "[dstorage] request failed: comp=%u file=%ls off=0x%llx size=%u dst=%p/%u first=%02x %02x %02x %02x\n",
                          comp, f ? f->path : L"?", (unsigned long long)off, src_size, (void*)dst, dst_size,
                          have && src_size > 0 ? src[0] : 0, have && src_size > 1 ? src[1] : 0,
                          have && src_size > 2 ? src[2] : 0, have && src_size > 3 ? src[3] : 0);

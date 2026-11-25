@@ -148,8 +148,13 @@ int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     try {
         ComPtr<ID3D12Device> device;
-        ok(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&device)),
-           "Leonida create_vulkan_device_standalone");
+        // No Vulkan device on this host (a CI runner without a GPU driver: vkCreateInstance fails): skip, as the
+        // other standalone-device tests do, rather than report a mapping failure that was never tested.
+        if (const HRESULT hr = rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&device)); FAILED(hr) || !device) {
+            std::printf("SKIP Leonida create_vulkan_device_standalone hr=0x%08lx (no Vulkan device)\n",
+                        static_cast<unsigned long>(hr));
+            return 77;
+        }
         if (!rt::d3d12::device_sparse_buffer_tiles(device.Get())) {
             std::puts("SKIP Leonida sparse_buffer_tiles not supported");
             return 77;
