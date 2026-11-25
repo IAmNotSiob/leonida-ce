@@ -974,3 +974,78 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
      (a race between the worker and the main thread, or a fence completing early: the vtbl+0x18 at obj+0x30 may be OUR
      fence/sync shim reporting complete too soon, or never resetting).
   3. LEONIDA_CE_SLOT_WATCH=1 is implemented but untested on Windows.
+
+## agA10 (sender gen 10, 2026-11-25)
+- The "deferred-release objects" (Definite, disassembly + runtime log): the title's DirectStorage streaming device
+  (vtable 0x1462fc550; 0x1478f5e78 = our DStorage factory probe) makes 17 batch contexts (0x80 bytes, tag "sdsm") at
+  boot via vtbl+0x210 = 0x1428c9460(dev, capacity 4096, want_vector, kind 2, prio). 16 come from game+0x28cb836 with a
+  release vector; the global one [0x1479f6d70] (lock 0x1479f6d80, from 0x145cd3f50) has none.
+  Layout: +0x10 dev, +0x18 OUR IDStorageQueue probe (factory slot 10), +0x20/+0x28 release vector (cap*4, push = *(+0x28)++),
+  +0x30 OUR IDStorageStatusArray probe (factory slot 5, capacity 1; vtbl+0x18 = IsComplete(0)), +0x38/+0x40/+0x48 page-
+  mapping list (flushed by 0x140f2c460), +0x60 capacity, +0x64 requests, +0x68 retain cap, +0x6c retain count,
+  +0x70 retain array, +0x78 state.
+  Methods: +0x218 destroy (0x1428c9610), +0x220/+0x228/+0x230 enqueue (0x1428c9680 / 0x1428c9730 / 0x1428c97c0; the
+  +0x70 push is 0x144ffd520, the +0x28 push is inline; NO capacity checks), +0x240 = 0x1400e88f0 (flush page mappings,
+  retain +0x70 handles, queue->EnqueueStatus(array,0) + Submit, state 1), +0x248 = 0x1400e8960 (sleep-wait IsComplete,
+  unretain, release vector, state 0), +0x260 = 0x144f65820 (try-drain). 0x144f657a0 = flush of the global ctx.
+- So the "+0x30 sync object" is our dstorage status array, not the D3D12 fence shim. Reading dstorage_x.cpp: an entry
+  only turns complete after every earlier request on its queue finished (flush_locked) - looks correct (Likely).
+- re17's int3 at f7c5c had rbx = 0xd81b1ef38 = ctx 0xD81B1EF00 + 0x38 (that ctx's page-mapping list).
+- Build 36 (dsctx_guard.h, vtable wrapper): broken (my g_orig table too small -> execute AV 0x44f65801 at t~10, re20/re21-b36).
+- Build 37 = fix. re20b (B, re19 env): Confirm t=151.3. 48 garbage retains at t~183 (0x55555556 x14, 0xaaaaaaac,
+  0x6496496c, 0x6d96d96d, 0xa8a8a8a8, ...), then a bad pool free list (cut/rebuild), then a host heap AV in ntdll at
+  t=325.5 (gta6rt+0xebefe), presents stop, exit 394 s. The +0x2593576 crash did not recur (nondeterministic victim).
+  NO context ever went over capacity (max retains/vector never >= 256 except the global ctx's requests 3677/4096 at
+  boot). => the capacity theory is wrong (Definite); the arrays are overwritten from OUTSIDE by pattern/texture-like
+  data (Very likely), the same writer that hits the pool links and other heap blocks.
+- Build 38: LEONIDA_CE_DSCTX_ISOLATE=1 moves each ctx's retain array / release vector to private VirtualAlloc pages at
+  creation (old title blocks stay allocated with a canary); =2 also makes the old blocks' interior pages read-only and
+  logs FOREIGN WRITEs (rip, regs, stack guesses). Diag always scans arrays for bad handles before map/drain.
+  Wine sj3: 17 ctx isolated, no writes, state 1.
+- re21 (build 37, DSCTX_CAP=0x4000, B, stopped early): still a bad handle 0x29280000 + pool list cut, AVs at
+  game+0x122310 (read -1) and +0x2591ee9 (worker family again). Capacity is irrelevant.
+- re22 (build 38, ISOLATE=2, B): ran 420 s with NO crash (presents to f4920+, ~13 fps), no bad handles in the (moved)
+  live arrays. 40 FOREIGN WRITEs at t~188.8 (~22 s after Confirm at 167.1): rip = VCRUNTIME140 memcpy store loop
+  (+0x123e3..0x1242e) on 4 threads = OUR dstorage workers; rcx (cursor) 0xd84adffc0, rax (memcpy's original dst) =
+  0xd849804a0/6a0/7a0/8a0 = entries of TABLE2, r8 = 0xa07e0..0x2a08e0 bytes left. All 31 abandoned-block canaries were
+  overwritten with exactly the garbage-handle patterns of re19/re20b/re21 (0x29280000, aaaaaaac, 55555556, ...).
+  Pool links still got corrupted (same writer: links 0xd84a79ab0.. lie between table2 and the ctx blocks).
+- ROOT CAUSE (Very likely): DStorage request option bit 21 (0x200000). 0x144ffd520 sets it when 0x144ffd8c0(dest)
+  finds the destination in the GPU texture pool window (and table1[slot] has bit 63): then +8 = &table2[slot]
+  (table2 = [0x1471bfb10]) and +0x10 = low 16 bits of the destination, instead of a memory pointer. (agA9 already saw
+  comp=14 requests 0x0020000e with "dst" in table2.) Our shim memcpy'd every such request's payload to +8 -> table2,
+  pool links and the heap behind them. This is the upstream cause of the re13-re22 slot/pool corruption, the garbage range
+  handles, the f7c5c/f2cc4b asserts and the varying worker crashes (+0x2593576, +0x2591ee9, ...).
+  NOT our fence/status shim (that part is correct).
+- Build 39 (THE FIX, runtime/shims/dstorage_x.cpp + xmem.cpp + page_alias.h, LEONIDA_CE_DS_DESC default 1): bit-21
+  requests write to gpu base [0x149e1dad0] + slot*64K + low16 via the physical pages mapped there (new
+  rt::xmem::write_phys_hook, writes through the section). Unmapped page -> nothing written, E_FAIL. Logs
+  "[dstorage] slot-descriptor request ... -> va ..: written|NOT WRITTEN". BCPack (comp=14) still E_NOTIMPL.
+  Wine sj4: OK (no such requests before state 1).
+- re23 (build 39, SLOT_GUARD=2 + ISOLATE=2 tripwires, B): Confirm t=122.9. CORRUPTION GONE (Very likely fixed): 0 foreign
+  writes, 0 canaries, 0 bad handles, 0 range skips, 0 pool-list cuts/rebuilds (SLOT_GUARD no longer has to skip anything).
+  32 slot-descriptor requests (opts 0x00200001, comp 1): 16 written (va 0xbdbc10000.. via the GPU-view pages), 16 NOT
+  WRITTEN (va 0xc31ae0000, 0xc31ce0000, 0xc320e0000..: no physical page in xmem's table) -> E_FAIL. comp=14 requests (opts
+  0x0020000e) still refused. New fatal at t~234-241: int3 +0x15e69a8 / +0x233804 (stack +0x22ca78, +0x50ed0bc ..
+  +0x221c29c), then the Quitf path int3 +0x2474606, then AVs (memcpy from game+0x52676e8 reading 0xd00000886,
+  exec 0, +0x25782ed). Presents stop at f2305, exit 334 s. Screens: navy + hint, then flat navy. Nothing new.
+  The fatal is probably the title reacting to the failed (E_FAIL / E_NOTIMPL) stream requests (Plausible).
+- Build 40: slot-descriptor writes fall back to the CPU pool view pages, then to committed writable memory at either VA;
+  log says which path; failures print the host state. re24 handed to B.
+- re24 (build 40, B): Confirm t=145.0. Still no corruption. Slot-descriptor requests: 16 "written via gpu pages", 16
+  NOT WRITTEN; the fallbacks (CPU view pages, committed memory) never helped: host state MEM_RESERVE / MEM_PRIVATE at
+  both VAs (e.g. va 0xdc8810000, 0xe38c40000, 0xe38c4d000 - note non-zero low16 = 4K sub-slot destinations, and several
+  requests share one descriptor). In this run the title heap/table2 sat at 0x784xxxxxx (descs 0x7849xxxxx), so the
+  layout moves between runs. Fatal at t~223: int3 +0x2474606 (Quitf), exec AV 0x10c94673a43, AVs +0x41ebcc7,
+  +0x5205230, +0x61af; presents stop f2399; exit 295 s. Screens unchanged (navy).
+- NEXT (agA11):
+  1. The unwritten slot-descriptor requests: find why their slot has no page at write time. Candidates: sub-slot (4K,
+     0xc0000-marker) destinations whose 64K page is mapped some other way; or the mapping (CopyPageMappings kind 1 via
+     ctx+0x38 flush in 0x140f2c460) only happens after our worker ran (check order: our queue auto-submits at
+     capacity/2 = 0x81f; a request could run before the 0x240 flush). Cheap test: when the page is not mapped, park the
+     request and retry at the next CopyPageMappingsBatchX / before completing its status; or log the slot's table1/table2
+     entries and whether the slot is in the ctx+0x38 list.
+  2. Find what fails at +0x2474606 (Quitf caller chain +0x4fb0c69, +0x4fb0ac4, +0x979620 ...): likely the failed reads
+     (E_FAIL) and the refused BCPack (comp=14, opts 0x0020000e, also slot-descriptor destinations) requests.
+  3. BCPack decode (comp=14) is still missing; the account-picker art and later textures depend on it.
+- Recommended env: re19.env (+ DS_DESC default on). SLOT_GUARD=2 and DSCTX_ISOLATE=2 are only tripwires now.

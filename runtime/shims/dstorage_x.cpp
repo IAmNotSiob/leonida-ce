@@ -31,6 +31,7 @@
 #include <cstring>
 
 #include "shims.h"
+#include "page_alias.h"
 #include "../src/shader_library.h"
 #include <vector>
 
@@ -71,6 +72,8 @@ bool sync_mode() {
 // A request as copied out of the title's 0x48-byte struct at EnqueueRequest.
 struct Req {
     uint32_t comp;
+    uint32_t opts = 0;    // the whole option dword (agA10)
+    uint64_t desc_va = 0;  // agA10: option bit 21 -> +8 is a pool slot descriptor; the guest address it stands for
     uint8_t* dst;
     uint32_t dst_size;
     Probe* f;
@@ -84,11 +87,28 @@ Req parse_request(const void* p) {
     const auto* rq = static_cast<const uint8_t*>(p);
     Req r{};
     r.comp = rq[0];
+    r.opts = *reinterpret_cast<const uint32_t*>(rq);
     r.dst = *reinterpret_cast<uint8_t* const*>(rq + 0x08);
     r.dst_size = *reinterpret_cast<const uint32_t*>(rq + 0x18);
     r.f = *reinterpret_cast<Probe* const*>(rq + 0x20);
     r.off = *reinterpret_cast<const uint64_t*>(rq + 0x28);
     r.src_size = *reinterpret_cast<const uint32_t*>(rq + 0x30);
+    // HACK (agA10): option bit 21 (0x200000, set by the title at 0x144ffd520 when 0x144ffd8c0 finds the destination in
+    // its GPU texture pool) means +8 is NOT memory but &table2[slot] (table2 = qword* 0x1471bfb10) and +0x10 holds the
+    // low 16 bits of the destination. Copying to +8 as if it were memory overwrote table2, the pool links and the heap
+    // behind them (re15-re22 corruption; re22 watch: VCRUNTIME memcpy from our workers, rax = 0xd849804a0 in table2).
+    // The destination is gpu base (qword 0x149e1dad0) + slot * 64 KiB + low16. LEONIDA_CE_DS_DESC=0: old behaviour.
+    static const bool desc_on = [] { const char* v = std::getenv("LEONIDA_CE_DS_DESC"); return !v || *v != '0'; }();
+    if (desc_on && (r.opts & 0x200000)) {
+        const uint64_t table2 = *reinterpret_cast<const volatile uint64_t*>(uintptr_t{0x1471bfb10});
+        const uint64_t gpu = *reinterpret_cast<const volatile uint64_t*>(uintptr_t{0x149e1dad0});
+        const uint64_t p = reinterpret_cast<uint64_t>(r.dst);
+        const uint16_t low = *reinterpret_cast<const uint16_t*>(rq + 0x10);
+        if (table2 && gpu && p >= table2 && ((p - table2) & 7) == 0)
+            r.desc_va = gpu + (((p - table2) >> 3) << 16) + low;
+        else
+            r.desc_va = ~uint64_t{0};  // unknown shape: never write it
+    }
     return r;
 }
 
@@ -194,6 +214,55 @@ void hexdump(const char* tag, const void* p, size_t n) {
     std::fprintf(stderr, "\n");
 }
 
+// agA10: writes a request's output: plain memory, or through the physical pages behind a pool slot descriptor.
+bool write_out(const Req& r, const void* data, size_t n, bool zero = false) {
+    if (!r.desc_va) {
+        if (zero) std::memset(r.dst, 0, n); else std::memcpy(r.dst, data, n);
+        return true;
+    }
+    static std::atomic<int> told{0};
+    const auto hook = rt::xmem::write_phys_hook().load(std::memory_order_acquire);
+    bool ok = false;
+    const char* how = "none";
+    if (r.desc_va != ~uint64_t{0}) {
+        std::vector<uint8_t> z;
+        if (zero) { z.assign(n, 0); data = z.data(); }
+        // 1) the physical pages mapped at the GPU-pool address; 2) the same offset in the CPU pool view (agA10 re23:
+        // some slots have no GPU-view mapping yet, e.g. 0xc31ae0000); 3) plain committed, writable memory there.
+        const uint64_t gpu = *reinterpret_cast<const volatile uint64_t*>(uintptr_t{0x149e1dad0});
+        const uint64_t cpu = *reinterpret_cast<const volatile uint64_t*>(uintptr_t{0x149e1dac0});
+        const uint64_t cva = cpu + (r.desc_va - gpu);
+        if (hook && hook(r.desc_va, data, n)) { ok = true; how = "gpu pages"; }
+        else if (hook && cpu && hook(cva, data, n)) { ok = true; how = "cpu pages"; }
+        else {
+            for (uint64_t va : {r.desc_va, cva}) {
+                MEMORY_BASIC_INFORMATION mi{};
+                if (!VirtualQuery(reinterpret_cast<void*>(va), &mi, sizeof mi) || mi.State != MEM_COMMIT) continue;
+                const DWORD pr = mi.Protect & 0xff;
+                if (pr != PAGE_READWRITE && pr != PAGE_EXECUTE_READWRITE && pr != PAGE_WRITECOPY) continue;
+                if (reinterpret_cast<uint64_t>(mi.BaseAddress) + mi.RegionSize < va + n) continue;
+                std::memcpy(reinterpret_cast<void*>(va), data, n);
+                ok = true;
+                how = va == r.desc_va ? "gpu committed" : "cpu committed";
+                break;
+            }
+        }
+    }
+    if (told++ < 16 || !ok) {
+        static std::atomic<int> bad{0};
+        if (ok || bad++ < 16) {
+            MEMORY_BASIC_INFORMATION mi{};
+            if (!ok) VirtualQuery(reinterpret_cast<void*>(r.desc_va), &mi, sizeof mi);
+            std::fprintf(stderr, "[dstorage] slot-descriptor request (opts 0x%08x, desc %p, comp %u, %zu bytes) -> va 0x%llx: %s%s [hack]",
+                         r.opts, (void*)r.dst, r.comp, n, (unsigned long long)r.desc_va, ok ? "written via " : "NOT WRITTEN (page not mapped)", ok ? how : "");
+            if (!ok) std::fprintf(stderr, " host state 0x%lx type 0x%lx protect 0x%lx base %p", mi.State, mi.Type, mi.Protect, mi.AllocationBase);
+            std::fprintf(stderr, "\n");
+            std::fflush(stderr);
+        }
+    }
+    return ok;
+}
+
 // Reads and inflates one request into its destination; returns S_OK or the failure. Thread-safe (positional reads).
 int32_t run_request(const Req& r) {
     const uint32_t comp = r.comp;
@@ -220,13 +289,13 @@ int32_t run_request(const Req& r) {
         const BOOL read_ok = ReadFile(f->file, src.data(), src_size, &got, &ov);
         if (read_ok && got == src_size) {
             if (comp == 0) {
-                std::memcpy(dst, src.data(), (std::min)(src_size, dst_size));
-                ok = true;
+                ok = write_out(r, src.data(), (std::min)(src_size, dst_size));
+                if (!ok) hr = E_FAIL;
             } else if (comp == 1) {
                 std::vector<uint8_t> out;
                 if (leonida::zlib_inflate(std::span<const uint8_t>(src.data(), src.size()), out, dst_size)) {
-                    std::memcpy(dst, out.data(), (std::min)(out.size(), static_cast<size_t>(dst_size)));
-                    ok = true;
+                    ok = write_out(r, out.data(), (std::min)(out.size(), static_cast<size_t>(dst_size)));
+                    if (!ok) hr = E_FAIL;
                 } else {
                     hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
                 }
@@ -235,7 +304,7 @@ int32_t run_request(const Req& r) {
                 // answers such requests with a zero-filled destination and success instead of E_NOTIMPL.
                 static const bool zero = [] { const char* e = std::getenv("LEONIDA_CE_DS_ZEROFILL"); return e && e[0] == '1'; }();
                 if (zero) {
-                    std::memset(dst, 0, dst_size);
+                    write_out(r, nullptr, dst_size, true);
                     static std::atomic<int> told{0};
                     if (told++ < 4) std::fprintf(stderr, "[dstorage] comp=%u zero-filled (%u bytes) [hack]\n", comp, dst_size);
                     ok = true;

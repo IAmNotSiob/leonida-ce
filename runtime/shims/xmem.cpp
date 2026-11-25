@@ -960,7 +960,28 @@ bool xmem_map_alias(uint64_t to, uint64_t from, uint64_t len) {
 
 // Hands xmem_map_alias to the queue proxy through page_alias.h (no link dependency between the two files). Set at
 // static initialization and again by XMemAllocatePhysicalPages, before which there is no pool to alias.
-void register_map_alias() { rt::xmem::map_alias_hook().store(&xmem_map_alias, std::memory_order_release); }
+bool xmem_write_phys(uint64_t va, const void* src, uint64_t n) {
+    const auto* from = static_cast<const uint8_t*>(src);
+    while (n) {
+        const uintptr_t page = static_cast<uintptr_t>(va & ~(kPhysicalPageSize - 1));
+        const uint64_t in = va - page, chunk = (std::min)(n, kPhysicalPageSize - in);
+        const std::lock_guard lock(g_phys_mutex);
+        const auto it = g_mapped.find(page);
+        if (it == g_mapped.end() || !it->second.section->scratch) return false;
+        auto* backing = static_cast<uint8_t*>(it->second.section->scratch) + it->second.offset;
+        if (!VirtualAlloc(backing, kPhysicalPageSize, MEM_COMMIT, PAGE_READWRITE)) return false;
+        std::memcpy(backing + in, from, static_cast<size_t>(chunk));
+        va += chunk;
+        from += chunk;
+        n -= chunk;
+    }
+    return true;
+}
+
+void register_map_alias() {
+    rt::xmem::map_alias_hook().store(&xmem_map_alias, std::memory_order_release);
+    rt::xmem::write_phys_hook().store(&xmem_write_phys, std::memory_order_release);
+}
 [[maybe_unused]] const bool g_map_alias_registered = (register_map_alias(), true);
 
 UINT WINAPI XMemGetWriteWatch(DWORD flags, void* base_address, SIZE_T region_size, void** addresses, ULONG_PTR* count,

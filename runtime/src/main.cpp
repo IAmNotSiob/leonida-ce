@@ -34,6 +34,7 @@
 #include "mods.h"
 #include "pe_loader.h"
 #include "slot_guard.h"
+#include "dsctx_guard.h"
 #include "../shims/d3d12_trace.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../shims/file_system.h"
@@ -193,6 +194,7 @@ int wmain(int argc, wchar_t** argv) {
         rt::Loader loader(game_dir);
         rt::Module& main_module = loader.load(image);  // maps, binds and installs TLS; runs no image code
         leonida::slot_guard::install(main_module.base);  // agA9 hack: LEONIDA_CE_SLOT_GUARD (0 off, 1, 2)
+        if (reinterpret_cast<uintptr_t>(main_module.base) == 0x140000000) leonida::dsctx_guard::install();  // agA10 hack
         // The mods' archetype swaps (docs/modding.md): hooked here, before any image code runs, when the lookup's RVA
         // for this executable is given. The count of redirected calls shows whether the RVA is the real lookup.
         if (view_mode_getter_rva) {

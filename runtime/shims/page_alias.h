@@ -19,4 +19,13 @@ inline std::atomic<MapAliasFn>& map_alias_hook() {
     return hook;
 }
 
+// agA10 hack: copies n bytes to the physical pages mapped at guest address `va` (through the section, so the view's
+// protection does not matter). False, with nothing written past the failing page, if a page there is not mapped.
+using WritePhysFn = bool (*)(std::uint64_t va, const void* src, std::uint64_t n);
+
+inline std::atomic<WritePhysFn>& write_phys_hook() {
+    static std::atomic<WritePhysFn> hook{nullptr};
+    return hook;
+}
+
 }  // namespace rt::xmem
