@@ -2301,6 +2301,14 @@ public:
                 mirrored_ = true;
                 std::memcpy(device.arena.mapped + arena_offset_, cpu_, std::size_t(bytes));
                 ce_heap_mirror_add(cpu_, device.arena.mapped + arena_offset_, std::size_t(bytes), mirror);
+                static const bool remap = [] { const char* e = std::getenv("LEONIDA_CE_MIRROR_REMAP"); return !e || e[0] != '0'; }();
+                if (remap && !leonida::ce::mirror_lo().load()) {  // agA20
+                    leonida::ce::mirror_title().store(reinterpret_cast<std::uint64_t>(cpu_));
+                    leonida::ce::mirror_hi().store(arena_offset_ + bytes);
+                    leonida::ce::mirror_lo().store(arena_offset_);
+                    std::fprintf(stderr, "[hack] MIRROR_REMAP: replay title reads in [0x%llx, 0x%llx) go to the title heap %p\n",
+                                 (unsigned long long)arena_offset_, (unsigned long long)(arena_offset_ + bytes), (void*)cpu_);
+                }
                 std::fprintf(stderr, "[hack] HEAP_MIRROR: console heap 0x%llx (%llu KiB) -> arena VA 0x%llx\n",
                              (unsigned long long)console_address_, (unsigned long long)(bytes / 1024),
                              (unsigned long long)arena_offset_);

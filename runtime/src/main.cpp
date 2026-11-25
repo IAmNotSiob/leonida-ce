@@ -87,6 +87,8 @@ LONG WINAPI ce_last_words(EXCEPTION_POINTERS* info) {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    // agA20: no modal crash / critical-error boxes (one kept a dead process up on the VM and blocked the next run).
+    SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     SetUnhandledExceptionFilter(&ce_last_words);
     std::filesystem::path image, game_dir, overlay_dir, mods_dir;
     uint32_t archetype_lookup_rva = 0;  // --archetype-lookup RVA[,ARG]: the game's archetype lookup by hash

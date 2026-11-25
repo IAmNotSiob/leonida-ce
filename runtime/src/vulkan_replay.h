@@ -1001,6 +1001,7 @@ inline bool cached_virtual_query(std::uint64_t at, MEMORY_BASIC_INFORMATION& out
 #endif
 inline bool copy_title_bytes(std::uint64_t va, void* dst, std::size_t n) {
 #ifdef _WIN32
+    va = ::leonida::ce::mirror_to_title(va);  // agA20 MIRROR_REMAP
     // Only memory this process has (committed, or a reserved view the XMem handler commits on touch): a garbage VA
     // (seen on Windows: 0xfffffffd1ab52500 from an unset vertex view) must not even be touched, the fault was fatal there.
     if (!n || va < 0x10000 || va >= 0x0000800000000000ull || va + n < va) return false;
@@ -1024,6 +1025,7 @@ inline bool copy_title_bytes(std::uint64_t va, void* dst, std::size_t n) {
 // Whether [va, va + size) is committed, readable memory of this process (title memory is CPU-addressed by its VA).
 inline bool title_readable(std::uint64_t va, std::uint64_t size) {
 #ifdef _WIN32
+    va = ::leonida::ce::mirror_to_title(va);  // agA20 MIRROR_REMAP
     MEMORY_BASIC_INFORMATION mbi{};
     std::uint64_t at = va;
     while (at < va + size) {
@@ -2380,7 +2382,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
                 (slot == 0 || w[3] == 0x30014facu)) {
                 bool ok = true;
                 __try {
-                    *reinterpret_cast<volatile std::uint32_t*>(std::uint64_t(root) + 4) = w[1] | (16u << 16);
+                    *reinterpret_cast<volatile std::uint32_t*>(::leonida::ce::mirror_to_title(std::uint64_t(root)) + 4) = w[1] | (16u << 16);
                 } __except (1) { ok = false; }
                 static std::atomic<int> told{0};
                 if (told++ < 4 || (slot && told < 40)) std::fprintf(stderr, "[hack] SF_STRIDE: root %x slot %u V# %08x %08x %08x %08x -> stride 16 (%d)\n", root0, slot, w[0], w[1], w[2], w[3], int(ok));
@@ -2394,7 +2396,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
             if (copy_title_bytes(root, w, sizeof(w)) && w[2] == 128 && (w[3] >> 30) == 0 && (w[3] & 0xFFF) &&
                 w[0] != root - 0x80 && (w[1] & 0xFFFF) == 0) {
                 __try {
-                    *reinterpret_cast<volatile std::uint32_t*>(std::uint64_t(root)) = root - 0x80;
+                    *reinterpret_cast<volatile std::uint32_t*>(::leonida::ce::mirror_to_title(std::uint64_t(root))) = root - 0x80;
                 } __except (1) {}
                 static std::atomic<int> told{0};
                 if (told++ < 4) std::fprintf(stderr, "[hack] CB fix: root %x V# base %x -> %x\n", root, w[0], root - 0x80);
@@ -2726,7 +2728,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
                     bool patched = false;
 #ifdef _WIN32
                     __try {
-                        auto* t = reinterpret_cast<volatile std::uint32_t*>(std::uint64_t(root));
+                        auto* t = reinterpret_cast<volatile std::uint32_t*>(::leonida::ce::mirror_to_title(std::uint64_t(root)));
                         t[0] = nw[0]; t[1] = nw[1]; t[2] = nw[2];
                         patched = true;
                     } __except (1) {}
@@ -3663,6 +3665,49 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!pipeline || !pipeline->pipeline) { static bool told_ = false; if (!told_) { told_ = true; std::fprintf(stderr, "[hack] replay: unresolved resource at vulkan_replay.h:%d (command %zu of %zu)\n", __LINE__, i, commands.size()); } return ReplayResult::unresolved_resource; }
                 if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
                 p.pipeline = *pipeline;
+            }
+            if (ind->kind == IndirectKind::dispatch && !ind->count_buffer && ind->max_count) {
+                // agA20 (LEONIDA_CE_INDIRECT_SRC, see the indirect draw): the dispatch arguments, from the stand-in,
+                // the title CPU memory and arena[title VA]. rk62 lost the device ~1 s after the first indirect
+                // dispatch with only instruction-pointer fault records (a runaway dispatch?).
+                static const int src_mode = [] { const char* e = std::getenv("LEONIDA_CE_INDIRECT_SRC"); return e ? std::atoi(e) : 0; }();
+                std::uint8_t* const A = ::leonida::ce::arena_host().load(std::memory_order_relaxed);
+                const std::uint64_t AS = ::leonida::ce::arena_bytes().load(std::memory_order_relaxed);
+                const std::uint64_t tva = ind->title_va;
+                const VkDeviceSize off = p.binding.buffer_offset + ind->argument_offset;
+                std::uint32_t s_[3] = {}, t_[3] = {}, g_[3] = {};
+                const bool s_ok = A && off + bytes <= AS && (std::memcpy(s_, A + off, 12), true);
+                const bool t_ok = tva && detail::copy_title_bytes(tva, t_, 12);
+                const bool g_ok = A && tva && tva + bytes <= AS && (std::memcpy(g_, A + tva, 12), true);
+                auto plausible = [](const std::uint32_t* v) { return v[0] <= 65535 && v[1] <= 65535 && v[2] <= 65535; };
+                int used = 0;
+                if (src_mode) {
+                    const bool want_t = src_mode == 2 || (src_mode >= 3 && t_ok && plausible(t_));
+                    const bool want_g = !want_t && (src_mode == 1 || (src_mode >= 3 && g_ok && plausible(g_)));
+                    if (want_t && A && tva && off + bytes <= AS && detail::copy_title_bytes(tva, A + off, std::size_t(bytes))) {
+                        used = 2;
+                    } else if (want_g && g_ok && vk.buffer_at) {
+                        std::uint64_t sz = bytes;
+                        VkBuffer gb = VK_NULL_HANDLE;
+                        VkDeviceSize go = 0;
+                        if (vk.buffer_at(tva, sz, gb, go) && gb && go >= ind->argument_offset) {
+                            p.binding.buffer = gb;
+                            p.binding.buffer_offset = go - ind->argument_offset;
+                            used = 1;
+                        }
+                    }
+                    if (!used && src_mode == 4 && s_ok && !plausible(s_) && A) {
+                        std::memset(A + off, 0, std::size_t(bytes));  // zero groups
+                        used = -1;
+                    }
+                }
+                static std::atomic<int> told_src{0};
+                if (told_src++ < 48)
+                    std::fprintf(stderr, "[hack] INDIRECT_SRC: dispatch %s max %u stand-in@0x%llx %s[%u %u %u] title@0x%llx %s[%u %u %u] "
+                                 "arena@title %s[%u %u %u] -> mode %d used %d\n",
+                                 ::leonida::ce::pipeline_name(ind->pipeline ? reinterpret_cast<std::uint64_t>(p.pipeline.pipeline) : 0).c_str(), ind->max_count, (unsigned long long)off,
+                                 s_ok ? "" : "(n/a)", s_[0], s_[1], s_[2], (unsigned long long)tva, t_ok ? "" : "(n/a)", t_[0], t_[1], t_[2],
+                                 g_ok ? "" : "(n/a)", g_[0], g_[1], g_[2], src_mode, used);
             }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             p.khr_instances = 0;

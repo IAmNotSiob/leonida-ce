@@ -53,6 +53,18 @@ inline std::atomic<std::uint64_t>& arena_bytes() {
     static std::atomic<std::uint64_t> n{0};
     return n;
 }
+// agA20 (LEONIDA_CE_MIRROR_REMAP, default on with HEAP_MIRROR): the console heap mirror [lo, hi) in arena VAs and the
+// title heap address it copies. Replay hacks read descriptor tables from TITLE memory at the table VA (RECTLIST
+// vertices at table+0x20, CB fix, VSHARP sync); with the mirror a table VA names the mirror, whose title-memory bytes
+// are unrelated (ri53+: presented surface all zero). They read the title heap instead.
+inline std::atomic<std::uint64_t>& mirror_lo() { static std::atomic<std::uint64_t> v{0}; return v; }
+inline std::atomic<std::uint64_t>& mirror_hi() { static std::atomic<std::uint64_t> v{0}; return v; }
+inline std::atomic<std::uint64_t>& mirror_title() { static std::atomic<std::uint64_t> v{0}; return v; }
+inline std::uint64_t mirror_to_title(std::uint64_t va) {
+    const std::uint64_t lo = mirror_lo().load(std::memory_order_relaxed);
+    if (!lo || va < lo || va >= mirror_hi().load(std::memory_order_relaxed)) return va;
+    return mirror_title().load(std::memory_order_relaxed) + (va - lo);
+}
 inline void checkpoint(VkCommandBuffer cb, std::uint64_t marker) {
     if (auto f = set_checkpoint_fn().load(std::memory_order_relaxed)) f(cb, reinterpret_cast<const void*>(marker));
 }

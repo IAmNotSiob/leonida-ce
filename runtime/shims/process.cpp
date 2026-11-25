@@ -419,6 +419,29 @@ int run_entry(void* entry, size_t stack_bytes) {
 }  // namespace rt::process
 
 namespace {
+// agA20: a crash after the title replaced our unhandled-exception filter showed a modal "Application Error" box on
+// the VM (game+0x43a6b7a) instead of our "[error] I have fallen" line, and kept the dead process up. The title
+// cannot replace the runtime filter (LEONIDA_CE_KEEP_UEF=0 lets it), and its SetErrorMode never clears the
+// no-dialog flags.
+constexpr UINT kNoDialogs = SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX;
+LPTOP_LEVEL_EXCEPTION_FILTER WINAPI game_set_unhandled_exception_filter(LPTOP_LEVEL_EXCEPTION_FILTER filter) {
+    static const bool keep = [] { const char* e = std::getenv("LEONIDA_CE_KEEP_UEF"); return !e || e[0] != '0'; }();
+    static std::atomic<int> told{0};
+    if (told++ < 4) {
+        std::fprintf(stderr, "[hack] title SetUnhandledExceptionFilter(%p)%s\n", reinterpret_cast<void*>(filter),
+                     keep ? ": ignored, the runtime filter stays" : "");
+        std::fflush(stderr);
+    }
+    if (!keep) return SetUnhandledExceptionFilter(filter);
+    static LPTOP_LEVEL_EXCEPTION_FILTER last = nullptr;
+    LPTOP_LEVEL_EXCEPTION_FILTER prev = last;
+    last = filter;
+    return prev;
+}
+UINT WINAPI game_set_error_mode(UINT mode) { return SetErrorMode(mode | kNoDialogs); }
+}  // namespace
+
+namespace {
 using namespace rt::process;
 #define UCRT(dll) \
     {dll, "exit", reinterpret_cast<void*>(&game_exit)}, {dll, "_exit", reinterpret_cast<void*>(&game_quick_exit)}, \
@@ -460,4 +483,14 @@ SHIM_TABLE(process,
     COMMAND_LINE("kernel32.dll"),
     COMMAND_LINE("kernelbase.dll"),
     COMMAND_LINE("api-ms-win-core-processenvironment-l1-1-0.dll"),
+    {"kernel32.dll", "SetUnhandledExceptionFilter", reinterpret_cast<void*>(&game_set_unhandled_exception_filter)},
+    {"kernelbase.dll", "SetUnhandledExceptionFilter", reinterpret_cast<void*>(&game_set_unhandled_exception_filter)},
+    {"api-ms-win-core-errorhandling-l1-1-0.dll", "SetUnhandledExceptionFilter", reinterpret_cast<void*>(&game_set_unhandled_exception_filter)},
+    {"api-ms-win-core-errorhandling-l1-1-1.dll", "SetUnhandledExceptionFilter", reinterpret_cast<void*>(&game_set_unhandled_exception_filter)},
+    {"api-ms-win-core-errorhandling-l1-1-2.dll", "SetUnhandledExceptionFilter", reinterpret_cast<void*>(&game_set_unhandled_exception_filter)},
+    {"kernel32.dll", "SetErrorMode", reinterpret_cast<void*>(&game_set_error_mode)},
+    {"kernelbase.dll", "SetErrorMode", reinterpret_cast<void*>(&game_set_error_mode)},
+    {"api-ms-win-core-errorhandling-l1-1-0.dll", "SetErrorMode", reinterpret_cast<void*>(&game_set_error_mode)},
+    {"api-ms-win-core-errorhandling-l1-1-1.dll", "SetErrorMode", reinterpret_cast<void*>(&game_set_error_mode)},
+    {"api-ms-win-core-errorhandling-l1-1-2.dll", "SetErrorMode", reinterpret_cast<void*>(&game_set_error_mode)},
 );
