@@ -1651,3 +1651,9 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   written ranges - upload ring, heap mirror - into a small host-visible region and keep the rest device-local, with staging copies
   for CPU writes), or measure per-submit GPU time with timestamp queries first.
 - Recommended env: build 72 (default switches = build 68 behaviour + diagnostics off) + /root/handoff/re74.env (= re69).
+- VM facts (receiver, read-only): GPU NVIDIA RTX 6000 Ada (48 GiB), driver 582.70, passthrough; BAR1 = 256 MiB (Resizable BAR NOT
+  active; 228 MiB already used after rl79); TdrDelay/TdrDdiDelay/TdrLevel unset (default 2 s). Every loss is nvlddmkm Event 153
+  (channel timeout/reset), never Event 13 MMU / 4101. => supports the slow-work TDR theory (Plausible -> Likely): the 4 GiB arena
+  cannot be DEVICE_LOCAL+HOST_VISIBLE without ReBAR, so it sits in system RAM, and a 48 GiB GPU runs every buffer access over PCIe.
+  NEXT (needs user approval for VM changes): enable ReBAR for the passthrough GPU or raise TdrDelay; code-side: a DEVICE_LOCAL arena
+  with host writes staged (largest job), or first time per-submit GPU work with timestamp queries to confirm >2 s submissions.
