@@ -1851,3 +1851,21 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
 - Env note: VA_GUARD_WINDOW=0x100000000 (rp1) redirects pool VAs in the 81 guarded shaders; with POOL_GPU use 0xd800e0000.
 - Handed rq1 = build 82 + rq1.env (rp1 + POOL_GPU=2 + VA_GUARD_WINDOW=0xd800e0000 + CB_PEEK on cs_edc5d4c7 CB+0/8/0x30/0x40,
   main-session request: that shader takes a V# embedded in its CB and a bindless index CB[0x40]) and rq2 = rq1 with POOL_GPU=1.
+- rq1 (build 82 + rq1.env, receiver B16): POOL_GPU never switched on ("POOL_GPU: OFF: vkCreateBuffer(sparse at heap_base + LO)
+  failed (wanted 0x4800f0000, got 0x0)"): the Windows driver refused the 48 GiB sparse buffer at that address (Linux places it).
+  Device still lost at Confirm+~150 s (FaultInfo -13, CP_FINE checkpoints as rp1/rp2/rp5). cs_edc5d4c7 was never dispatched
+  (no CB_PEEK/PTR_CHECK lines). So rq1 tested nothing new.
+- Build 83 (eb70d393a, md5 5f2aed66; never run): POOL_GPU=2 also re-copies a GPU page copy after dstorage writes the host page
+  (xmem_write_page / write_phys -> page_dirty_hook).
+- Build 84 (779e1be1a, md5 3b394faa): the window buffer is tried whole, then in 8 GiB / 4 GiB / 1 GiB / 256 MiB pieces
+  (LEONIDA_CE_POOL_GPU_PIECES), each failure logged with VkResult and address, plus an unplaced full-size sparse probe. Handed
+  rq2 = build 84 + rq2.env (= rq1.env, rtdump_rq2) to receiver B18 (af5ee748c55a71403).
+- Note on the rp6 "pool V#s": the 16-byte records are {u64 pool pointer, u64 HOST pointer 0x7ffc....} (e.g.
+  [c3960000 0000000b 8082285b 00007ffc]) - raw 64-bit pointers, not V#s. Anything that rewrites them must treat them as qwords.
+- Fallback if Windows refuses every placement (not built): put the window buffer wherever the driver wants (D, must be above
+  heap_base) and add D - heap_base - LO to pool-window qwords/V# bases in the heap-mirror copy (and CBV shadow copies). That cannot
+  reach raw pointers inside buffers.
+- Identity placement also works for IMPORTED HOST memory on Linux (/root/agA24/cr2.c: VkMemoryOpaqueCaptureAddressAllocateInfo on an
+  import + a plain buffer = device address exactly heap_base + title VA). Next step candidate: place every slot-133 title-placed
+  buffer (create_host_buffer, VAs 0xd9..-0xe3.. and 0x1000000000+) at heap_base + its title VA, which would end the
+  "two address schemes" problem (agA20) for them. Only if capture replay works on the VM driver (rq2 tells).
