@@ -11904,15 +11904,24 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                                 chosen_features.sparseResidencyAliased;
     auto picked = leonida::sparse_capable_queue_families(families, preferred, sparse_buffers);
     if (graphics_family_only(queue_test_settings)) picked = {info.queue_family, info.queue_family, info.queue_family};
-    // HACK (agA28): LEONIDA_CE_COPY_ON_DIRECT=1 puts D3D12 COPY queues on graphics-family VkQueues (no dedicated transfer
-    // family = no Copy Engine for title copies), to see whether the Aftermath Copy Engine write fault follows the copies.
+    // FIX (agA28): D3D12 COPY queues go to the graphics family when the picked copy family has no GRAPHICS bit.
+    // D3D12 copy queues copy depth/stencil textures; Vulkan forbids DEPTH/STENCIL aspects in buffer<->image copies on a
+    // family without GRAPHICS (VUID-vkCmdCopyBufferToImage-commandBuffer-07739 / ...ImageToBuffer-07746), and on NVIDIA
+    // the transfer family's Copy Engine wrote past the end of a D32 depth image's own VA mapping (rt3/rt4 Aftermath: CE
+    // write page fault exactly at the image end, device lost ~180-197 s after the landing). With the graphics family (rt5)
+    // the fault is gone. Default on; LEONIDA_CE_COPY_ON_DIRECT=0 keeps the dedicated transfer family (old behaviour).
     {
         char cv[8] = {};
         std::size_t cl = 0;
-        if (getenv_s(&cl, cv, "LEONIDA_CE_COPY_ON_DIRECT") == 0 && cl > 1 && cv[0] == 0x31) {
-            std::fprintf(stderr, "[hack] COPY_ON_DIRECT: COPY queues use the graphics family %u (was %u)\n", info.queue_family,
-                         picked.copy);
+        const bool off = getenv_s(&cl, cv, "LEONIDA_CE_COPY_ON_DIRECT") == 0 && cl > 1 && cv[0] == 0x30;
+        const bool copy_has_graphics =
+            picked.copy < family_count && (families[picked.copy].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0;
+        if (!off && !copy_has_graphics && picked.copy != info.queue_family) {
+            std::fprintf(stderr, "[hack] COPY_ON_DIRECT: COPY queues use the graphics family %u (was %u, no GRAPHICS bit: "
+                                 "depth/stencil copies are not allowed there)\n", info.queue_family, picked.copy);
             picked.copy = info.queue_family;
+        } else if (off) {
+            std::fprintf(stderr, "[hack] COPY_ON_DIRECT=0: COPY queues stay on family %u\n", picked.copy);
         }
     }
     std::uint32_t compute_count = 0, copy_count = 0;
