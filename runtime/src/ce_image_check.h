@@ -170,17 +170,39 @@ inline void report(const char* cmd, const char* side, VkImage image, const Img& 
 // Vulkan forbids DEPTH / STENCIL aspects in buffer<->image copies on a queue family without GRAPHICS
 // (VUID-vkCmdCopyBufferToImage-commandBuffer-07739 / CopyImageToBuffer-07746). rt3/rt4: the CE fault is at the end of a
 // D32 depth image's own VA mapping.
-inline void ds_check(const char* cmd, VkCommandBuffer cb, VkImage image, const Img& i, VkImageAspectFlags aspect) {
+inline void ds_check(const char* cmd, VkCommandBuffer cb, VkImage image, const Img& i, VkImageAspectFlags aspect,
+                     const std::string& region = std::string()) {
     if (!(aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))) return;
     std::uint32_t family = UINT32_MAX;
-    if (!on_transfer_only(cb, &family)) return;
-    const auto c = ++st().ds_transfer;
-    if (c > 64 && (c & (c - 1)) != 0) return;
+    const bool transfer = on_transfer_only(cb, &family);
+    if (transfer) ++st().ds_transfer;
+    // agA28 (build 100): rt9 had the CE write fault at a depth-image end with COPY queues on the graphics family, so EVERY
+    // copy / clear / resolve touching a depth or stencil aspect is logged (any family), up to 4096 lines.
+    static std::atomic<std::uint64_t> n{0};
+    const auto c = ++n;
+    if (c > 4096) return;
     const auto& ctx = copylog::tl_ctx;
-    std::fprintf(stderr, "[imgcheck] DS-ON-TRANSFER %s img 0x%llx %s aspect 0x%x family %u | site %s dst_res %llu caller 0x%llx (#%llu)\n", cmd,
-                 (unsigned long long)h(image), desc(i).c_str(), unsigned(aspect), family, ctx.site ? ctx.site : "?",
-                 (unsigned long long)ctx.dst_res, (unsigned long long)copylog::tl_title_ra, (unsigned long long)c);
+    std::fprintf(stderr, "[imgcheck] DS-COPY%s t=%.3f %s img 0x%llx %s aspect 0x%x family %u cb %p | %s | site %s dst_res %llu src_res %llu caller 0x%llx (#%llu)\n",
+                 transfer ? " ON-TRANSFER" : "", vareport::now_s(), cmd, (unsigned long long)h(image), desc(i).c_str(), unsigned(aspect), family,
+                 (void*)cb, region.c_str(), ctx.site ? ctx.site : "?", (unsigned long long)ctx.dst_res, (unsigned long long)ctx.src_res,
+                 (unsigned long long)copylog::tl_title_ra, (unsigned long long)c);
     std::fflush(stderr);
+}
+inline std::string bic_text(const VkBufferImageCopy& r) {
+    char b[200];
+    std::snprintf(b, sizeof b, "buf off 0x%llx row %u h %u mip %u layers %u+%u off (%d,%d,%d) ext (%u,%u,%u)", (unsigned long long)r.bufferOffset,
+                  r.bufferRowLength, r.bufferImageHeight, r.imageSubresource.mipLevel, r.imageSubresource.baseArrayLayer,
+                  r.imageSubresource.layerCount, r.imageOffset.x, r.imageOffset.y, r.imageOffset.z, r.imageExtent.width, r.imageExtent.height,
+                  r.imageExtent.depth);
+    return b;
+}
+inline std::string ic_text(const VkImageCopy& r) {
+    char b[200];
+    std::snprintf(b, sizeof b, "src mip %u layer %u off (%d,%d,%d) dst mip %u layer %u off (%d,%d,%d) ext (%u,%u,%u) aspects 0x%x->0x%x",
+                  r.srcSubresource.mipLevel, r.srcSubresource.baseArrayLayer, r.srcOffset.x, r.srcOffset.y, r.srcOffset.z, r.dstSubresource.mipLevel,
+                  r.dstSubresource.baseArrayLayer, r.dstOffset.x, r.dstOffset.y, r.dstOffset.z, r.extent.width, r.extent.height, r.extent.depth,
+                  unsigned(r.srcSubresource.aspectMask), unsigned(r.dstSubresource.aspectMask));
+    return b;
 }
 template <class F> inline void install(F& vk) {
     if (!level()) return;
@@ -322,7 +344,7 @@ template <class F> inline void install(F& vk) {
                 std::string why;
                 count_checked("copy");
                 const auto& sr = r[k].imageSubresource;
-                ds_check("buffer<->image", cb, i, img, sr.aspectMask);
+                ds_check("buffer<->image", cb, i, img, sr.aspectMask, bic_text(r[k]));
                 if (region_ok(img, sr.aspectMask, sr.mipLevel, sr.baseArrayLayer, sr.layerCount, r[k].imageOffset, r[k].imageExtent, &why)) {
                     keep.push_back(r[k]);
                 } else {
@@ -346,7 +368,7 @@ template <class F> inline void install(F& vk) {
                 std::string why;
                 count_checked("copy");
                 const auto& sr = r[k].imageSubresource;
-                ds_check("buffer<->image", cb, i, img, sr.aspectMask);
+                ds_check("buffer<->image", cb, i, img, sr.aspectMask, bic_text(r[k]));
                 if (region_ok(img, sr.aspectMask, sr.mipLevel, sr.baseArrayLayer, sr.layerCount, r[k].imageOffset, r[k].imageExtent, &why)) {
                     keep.push_back(r[k]);
                 } else {
@@ -369,8 +391,8 @@ template <class F> inline void install(F& vk) {
             for (std::uint32_t k = 0; k < n; ++k) {
                 std::string why;
                 count_checked("vkCmdCopyImage");
-                if (dk) ds_check("vkCmdCopyImage dst", cb, d, di, r[k].dstSubresource.aspectMask);
-                if (sk) ds_check("vkCmdCopyImage src", cb, s, si, r[k].srcSubresource.aspectMask);
+                if (dk) ds_check("vkCmdCopyImage dst", cb, d, di, r[k].dstSubresource.aspectMask, ic_text(r[k]));
+                if (sk) ds_check("vkCmdCopyImage src", cb, s, si, r[k].srcSubresource.aspectMask, ic_text(r[k]));
                 bool ok = true;
                 if (dk && !region_ok(di, r[k].dstSubresource.aspectMask, r[k].dstSubresource.mipLevel, r[k].dstSubresource.baseArrayLayer, r[k].dstSubresource.layerCount,
                                      r[k].dstOffset, r[k].extent, &why)) {
@@ -450,6 +472,7 @@ template <class F> inline void install(F& vk) {
             bool any_bad = false;
             for (std::uint32_t k = 0; k < n; ++k) {
                 std::string why;
+                ds_check("vkCmdClearDepthStencilImage", cb, i, img, r[k].aspectMask, "range");
                 if (range_ok(img, r[k], &why)) keep.push_back(r[k]);
                 else { any_bad = true; report("vkCmdClearDepthStencilImage", "dst", i, img, k, n, why, level() == 2); }
             }
