@@ -24,6 +24,7 @@
 #include "resource_tiling.h"
 #include "xdxr_build.h"
 #include "ce_copy_log.h"  // agA26
+#include "ce_no_free.h"  // main session: LEONIDA_CE_NO_FREE
 
 #include <algorithm>
 #include <atomic>
@@ -144,6 +145,7 @@ struct VulkanDeviceFunctions {
             }
         }
         ::leonida::ce::copylog::install(*this);  // agA26 LEONIDA_CE_COPY_LOG / COPY_GUARD (default off: no-op)
+        ::leonida::ce::nofree::install(*this);   // main session: LEONIDA_CE_NO_FREE (default off: no-op)
         return vkCreateCommandPool && vkDestroyCommandPool && vkAllocateCommandBuffers && vkResetCommandBuffer &&
                vkBeginCommandBuffer && vkEndCommandBuffer && vkQueueSubmit && vkQueueWaitIdle && vkCreateSemaphore &&
                vkDestroySemaphore && vkGetSemaphoreCounterValue && vkWaitSemaphores && vkSignalSemaphore &&
