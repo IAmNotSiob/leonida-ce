@@ -2138,3 +2138,18 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   exhaustion after the crawl (Plausible).
 - Build 110 (30a61a3d9): LEONIDA_CE_LOOP_CAP_GFX_INNER (graphics cap; else LOOP_CAP_INNER). rt23 = rt22 env +
   LOOP_CAP_GFX_INNER=512 + CBV_SHADOW_ROOT=4096 (two changes at once, on purpose).
+- rt23 (build 110 + LOOP_CAP_GFX_INNER=512 + CBV_SHADOW_ROOT=4096): *** FIRST POST-LANDING SCREEN *** No device loss in the
+  full 1800 s (~1650 s after the press at t=148.8); compiles avg 198 ms; pace ~12-16 s/60 frames after the press (4-5 fps).
+  LOOP_CAP_GFX capped 29 PS_MIRROR_PBR_MATERIAL_* variants (13-25 loops each). frame_004096 / frame_006000
+  (/root/rb/rt23_frames) = the title's "COULDN'T AUTOSAVE" dialog (blue, palm trees, RETRY (A) / GOT IT (B)); the scripted A
+  presses kept hitting RETRY. The title made one XGameSave submit (save_submit_async/_result once); its result was not logged.
+  The two rt23 changes are confounded (cap 512 vs the shadow root); CBV_SHADOW_ROOT logs nothing on success.
+- Build 111 (3e81da0eb): xgamesave submit logging. rt24 = rt23 env + PRESS A@s3+8/10x10,DOWN@s3+12/10x3,B@s3+200/15x40.
+- LEAD (Plausible, not tested): the PS_MIRROR_PBR "loops" are WATERFALL loops for non-uniform descriptor indexing
+  (v_readfirstlane s16, v104 / v_cmpx_eq_u32 s16, v104 / s_load_dwordx8 T# / image_sample_lz / s_andn2_wrexec / s_cbranch_execnz,
+  disasm lines 2136/2184/2560/2608). rdna2spirv.py translates readfirstlane in wave32 fragments with a ballot of the active
+  lanes; a HELPER lane that the driver leaves out of its subgroup ballot but that is still active in the emulated EXEC never
+  matches the broadcast value (an empty ballot reads lane 0 of the half), so it stays in EXEC and the loop never ends ->
+  pixel-shader TDR (rt21) or cap-bound crawl (rt22). Translator fix: when the ballot word is empty for an active lane (or
+  the lane itself is not in it), readfirstlane returns the lane's own value, so the waterfall retires it. Needs a SPIR-V
+  regeneration of the fragment shaders.
