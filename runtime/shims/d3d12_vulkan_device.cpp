@@ -5666,6 +5666,16 @@ public:
         recipe_.conservative = r.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
         recipe_.multisample = multisample;
         graphics_.samples = samples;
+        // agA37 LEONIDA_CE_SKIP_GFX=sub1,sub2 (default off): draws of a pipeline with a stage whose name contains one of
+        // the substrings are left out at replay ("[hack] SKIP_GFX" lines). rt36/rt39/rt42/rt43 hung with the direct
+        // queue's checkpoint inside VS/PS_DistantWindowEmissives(Deferred) (loop-free shaders; Plausible: garbage CB /
+        // instance data gives huge geometry). A bisect knob, like LEONIDA_CE_SKIP_CS for compute.
+        for (const Stage& stage : stages)
+            if (stage.entry && ce_name_list_match("LEONIDA_CE_SKIP_GFX", stage.entry->name)) {
+                graphics_.ce_skip = true;
+                std::fprintf(stderr, "[hack] SKIP_GFX: pipeline with %s: draws left out\n", stage.entry->name.c_str());
+                break;
+            }
         recipe_.sample_mask = sample_mask;
         recipe_.depth = depth;
         recipe_.blends = std::move(blends);
@@ -5828,29 +5838,37 @@ public:
         // translated loop (src/spirv_loop_cap.h), so a data-dependent endless loop ends instead of a TDR (re34:
         // fspx cs_f33ac9e9). LEONIDA_CE_LOOP_CAP_INNER / _OUTER = the caps (blocks per invocation / barrier rounds).
         {
-            static const std::vector<std::string> cap_cs = [] {
-                std::vector<std::string> v;
+            // agA37: an item may carry its own inner cap, "pattern:N" ("1:0x80000" = every compute program, 2^19
+            // iterations per loop and invocation). The first matching item wins, so list specific names first.
+            static const std::uint32_t inner_cap = [] { const char* v = std::getenv("LEONIDA_CE_LOOP_CAP_INNER"); return std::uint32_t(v ? std::strtoul(v, nullptr, 0) : (1u << 22)); }();
+            static const std::uint32_t outer_cap = [] { const char* v = std::getenv("LEONIDA_CE_LOOP_CAP_OUTER"); return std::uint32_t(v ? std::strtoul(v, nullptr, 0) : (1u << 18)); }();
+            static const std::vector<std::pair<std::string, std::uint32_t>> cap_cs = [] {
+                std::vector<std::pair<std::string, std::uint32_t>> v;
                 if (const char* e = std::getenv("LEONIDA_CE_LOOP_CAP")) {
                     std::string all(e);
                     for (std::size_t at = 0; at <= all.size();) {
                         const std::size_t comma = all.find(',', at);
-                        const std::string item = all.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
-                        if (!item.empty()) v.push_back(item == "1" ? std::string() : item);
+                        std::string item = all.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+                        std::uint32_t cap = inner_cap;
+                        if (const std::size_t colon = item.find(':'); colon != std::string::npos) {
+                            const std::uint32_t c = std::uint32_t(std::strtoul(item.c_str() + colon + 1, nullptr, 0));
+                            if (c) cap = c;
+                            item.resize(colon);
+                        }
+                        if (!item.empty()) v.emplace_back(item == "1" ? std::string() : item, cap);
                         if (comma == std::string::npos) break;
                         at = comma + 1;
                     }
                 }
                 return v;
             }();
-            static const std::uint32_t inner_cap = [] { const char* v = std::getenv("LEONIDA_CE_LOOP_CAP_INNER"); return std::uint32_t(v ? std::strtoul(v, nullptr, 0) : (1u << 22)); }();
-            static const std::uint32_t outer_cap = [] { const char* v = std::getenv("LEONIDA_CE_LOOP_CAP_OUTER"); return std::uint32_t(v ? std::strtoul(v, nullptr, 0) : (1u << 18)); }();
-            for (const std::string& pattern : cap_cs)
+            for (const auto& [pattern, cap] : cap_cs)
                 if (entry->name.find(pattern) != std::string::npos) {
-                    const int n = leonida::spirv_cap_loops(words, inner_cap, outer_cap);
+                    const int n = leonida::spirv_cap_loops(words, cap, outer_cap);
                     static std::atomic<int> told{0};
                     if (n && told++ < 64)
                         std::fprintf(stderr, "[hack] LOOP_CAP: %s: %d loop(s) capped (%u blocks / %u rounds)\n",
-                                     entry->name.c_str(), n, inner_cap, outer_cap);
+                                     entry->name.c_str(), n, cap, outer_cap);
                     break;
                 }
         }

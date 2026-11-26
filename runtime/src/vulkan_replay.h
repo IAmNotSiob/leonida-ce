@@ -840,6 +840,7 @@ struct GraphicsPipeline {
     // entries), for a draw whose bound target's texel size differs from the PSO's RTV format. Null: not available.
     std::function<VkPipeline(std::uint32_t unbound, const VkFormat* formats)> retarget;
     std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
+    bool ce_skip = false;       // agA37 LEONIDA_CE_SKIP_GFX: a stage name matched; every draw is left out
 };
 
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
@@ -2644,6 +2645,16 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     rtdiag::count_draw(p.colors, p.depth.id, 0, reinterpret_cast<std::uint64_t>(p.pipeline));
     draw_peek(draw, reinterpret_cast<std::uint64_t>(p.pipeline));  // agA32
     draw_srv(draw, reinterpret_cast<std::uint64_t>(p.pipeline));  // agA34
+    if (pipeline->ce_skip) {  // agA37 LEONIDA_CE_SKIP_GFX (after DRAW_PEEK / DRAW_SRV, so those still log)
+        static std::atomic<std::uint32_t> told_skip_gfx{0};
+        const std::uint32_t k = ++told_skip_gfx;
+        if (k <= 24 || (k & (k - 1)) == 0)
+            std::fprintf(stderr, "[hack] SKIP_GFX #%u: draw left out (%s count %u instances %u first %u first_instance %u indirect %s max %u)\n",
+                         k, draw.indexed ? "indexed" : "draw", draw.count, draw.instances, draw.first, draw.first_instance,
+                         draw.ind_buffer ? "yes" : "no", draw.ind_max);
+        p.skip = true;
+        return ReplayResult::success;
+    }
 
     // HACK (Leonida CE): the shaders read the title's per-draw data (root arguments point into its upload ring) at
     // heap_base + VA, but the title writes it in its own memory; copy a window around each such address into the arena.
