@@ -644,13 +644,40 @@ public:
     bool separate_depth_stencil_layouts() const { return separate_; }
 
     void track(ResourceId id, const ResourceBinding& resource, VkImageLayout layout) {
+        save_undo(id);
         Entry entry{resource.mip_levels, resource.array_layers, two_planes(resource) ? 2u : 1u,
                     separate_ && two_planes(resource), {}};
         entry.layouts.assign(std::size_t(entry.mips) * entry.layers * (entry.two_planes ? 2 : 1), layout);
         entries_[id] = std::move(entry);
     }
 
-    void forget(ResourceId id) { entries_.erase(id); }
+    void forget(ResourceId id) {
+        save_undo(id);
+        entries_.erase(id);
+    }
+
+    // HACK (agA31, LEONIDA_CE_TRACKER_UNDO): VulkanQueue::execute copied the whole tracker (every image, a vector of
+    // layouts each) on every submission so a failed submit could be dropped: O(images) allocations per
+    // ExecuteCommandLists (rt31 HANG_SAMPLE: LayoutTracker copies in ~12 of 98 busy stacks with 100k+ images).
+    // Instead the submission edits the tracker in place and keeps the first previous state of each entry it
+    // touches; rollback restores those. Same state as the copy, as nothing else changes the tracker meanwhile
+    // (tracker_mutex_ is held from the copy point to the commit).
+    void begin_undo() {
+        undo_.clear();
+        undo_on_ = true;
+    }
+    void commit_undo() {
+        undo_.clear();
+        undo_on_ = false;
+    }
+    void rollback_undo() {
+        for (auto& [id, old] : undo_) {
+            if (old.second) entries_[id] = std::move(old.first);
+            else entries_.erase(id);
+        }
+        undo_.clear();
+        undo_on_ = false;
+    }
     bool tracked(ResourceId id) const { return entries_.count(id) != 0; }
 
     // Current layout of one D3D12 subresource; UNDEFINED when the resource or index is unknown.
@@ -693,6 +720,7 @@ public:
     void set(ResourceId id, const VkImageSubresourceRange& range, VkImageLayout layout) {
         const auto it = entries_.find(id);
         if (it == entries_.end()) return;
+        if (undo_on_ && !undo_.count(id)) undo_.emplace(id, std::make_pair(it->second, true));
         Entry& e = it->second;
         visit(e, range, [&](std::size_t index, VkImageAspectFlags, std::uint32_t, std::uint32_t) {
             e.layouts[index] = layout;
@@ -727,8 +755,17 @@ private:
         }
     }
 
+    void save_undo(ResourceId id) {
+        if (!undo_on_ || undo_.count(id)) return;
+        const auto it = entries_.find(id);
+        if (it == entries_.end()) undo_.emplace(id, std::make_pair(Entry{}, false));
+        else undo_.emplace(id, std::make_pair(it->second, true));
+    }
+
     bool separate_;
     std::unordered_map<ResourceId, Entry> entries_;
+    bool undo_on_ = false;
+    std::unordered_map<ResourceId, std::pair<Entry, bool>> undo_;  // id -> (entry before the submission, existed)
 };
 
 // Each physical slot records one non-overlapping interval. Logical queries can share slots.

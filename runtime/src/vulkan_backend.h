@@ -40,6 +40,7 @@
 #include <set>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_set>
 #include <shared_mutex>
 #include <span>
@@ -2964,7 +2965,12 @@ private:
         }
         replay.bindless_set = context_.bindless_current_ ? context_.bindless_current_() : VK_NULL_HANDLE;
         const bool bindless_uploaded = std::exchange(context_.bindless_upload_pending_, false);
-        auto next_tracker = context_.tracker_;
+        // agA31 LEONIDA_CE_TRACKER_UNDO (default on, =0 old copy): edit the tracker in place with an undo log.
+        static const bool tracker_undo = [] { const char* e = std::getenv("LEONIDA_CE_TRACKER_UNDO"); return !(e && e[0] == '0'); }();
+        std::optional<LayoutTracker> tracker_copy;
+        if (tracker_undo) context_.tracker_.begin_undo();
+        else tracker_copy.emplace(context_.tracker_);
+        LayoutTracker& next_tracker = tracker_copy ? *tracker_copy : context_.tracker_;
         // Bindless images that may already be visible to shaders are initialized on a submission that runs shaders.
         // initialize() zeroes committed storage images and only transitions sparse images.
         bool runs_shaders = false;
@@ -3127,8 +3133,10 @@ private:
             gt_slots_[gt_slot].lists = std::uint32_t(lists.size());
             gt_slots_[gt_slot].seq = ++gt_seq_;
         }
+        if (!submitted && !tracker_copy) context_.tracker_.rollback_undo();  // agA31
         if (submitted) {
-            context_.tracker_ = std::move(next_tracker);
+            if (tracker_copy) context_.tracker_ = std::move(*tracker_copy);
+            else context_.tracker_.commit_undo();
             slot->predicate = std::move(batch);
             slot->predicated_copy = std::move(copy_batch);
             slot->counted_dispatch = std::move(counted_batch);
