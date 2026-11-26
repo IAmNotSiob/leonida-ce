@@ -779,12 +779,28 @@ void hang_heartbeat(std::uint64_t frame) {
     static std::once_flag once;
     std::call_once(once, [] {
         HANDLE h = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
-            std::uint64_t reported_for = 0;
-            int stage = 0;
+            std::uint64_t reported_for = 0, sampled_for = 0;
+            int stage = 0, samples = 0;
+            // agA30 LEONIDA_CE_HANG_SAMPLE_MS=N: a poor man's profiler for the post-press crawl (frames of 2-5 s): once the
+            // frame count reaches LEONIDA_CE_HANG_SAMPLE_FROM (default 1500), a frame that takes N ms or more gets one
+            // thread-stack dump (plus the queue / wait dumps), at most LEONIDA_CE_HANG_SAMPLE_MAX (default 120) in all.
+            static const std::uint64_t sample_ms = [] { const char* e = std::getenv("LEONIDA_CE_HANG_SAMPLE_MS"); return e ? std::strtoull(e, nullptr, 0) : 0ull; }();
+            static const std::uint64_t sample_from = [] { const char* e = std::getenv("LEONIDA_CE_HANG_SAMPLE_FROM"); return e ? std::strtoull(e, nullptr, 0) : 1500ull; }();
+            static const int sample_max = [] { const char* e = std::getenv("LEONIDA_CE_HANG_SAMPLE_MAX"); return e ? std::atoi(e) : 120; }();
             for (;;) {
-                Sleep(1000);
+                Sleep(sample_ms ? 250 : 1000);
                 const std::uint64_t last = g_hang_last_tick.load();
                 const std::uint64_t idle = GetTickCount64() - last;
+                if (sample_ms && idle >= sample_ms && idle < 15000 && last != sampled_for && samples < sample_max &&
+                    g_hang_last_frame.load() >= sample_from) {
+                    sampled_for = last;
+                    ++samples;
+                    char line[96];
+                    const int n = std::snprintf(line, sizeof line, "[hang] SAMPLE %d (frame %llu, %llu ms so far)\n", samples,
+                                                (unsigned long long)g_hang_last_frame.load(), (unsigned long long)idle);
+                    hang_write(line, n);
+                    hang_dump_threads(idle);
+                }
                 if (last != reported_for) { reported_for = last; stage = 0; }
                 static const std::uint64_t marks[] = {15000, 30000, 60000, 90000, 150000};
                 if (stage < 5 && idle >= marks[stage]) { ++stage; hang_dump_threads(idle); }
