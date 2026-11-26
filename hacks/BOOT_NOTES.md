@@ -2459,3 +2459,40 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   garbage -> wrong V# (table offset / root layout). (2) The scene term is ~0 (black) even where the noise is not: check
   the dumps' 2560x1440 targets. (3) Device hang in DistantWindowEmissives(Deferred) VS (rt36, rt39). (4) Glyphs: refresh
   glyph caches more often than every 30 presents (or fix the crawl).
+
+## agA33 (summary written by agA34; agA33 left no section)
+- Build 135 (c1e446dd4): LEONIDA_CE_CBV_PLACED=1, so a CBV inside a slot-133 placed BUFFER names that buffer's stand-in
+  instead of a shadow of the title bytes. LEONIDA_CE_CBV_PLACED_WATCH=1 copies changed title granules into the stand-in.
+  The premise came from rt40 DRAW_PEEK: the CB of PS_TAA2_SpatialUpscaleWithDithering (V# s9+0x20, 0xd0 bytes) is exactly
+  the placed buffer at title 0xde22af580, and its title bytes are garbage (dither gains cb+0xc0..0xc8 = int 8, 0, 11.95).
+- rt41 (build 135 + rt41.env): the noise is GONE, and the screen is PURE BLACK. All dumps (target0 2560x1440 RGBA16F,
+  frames 3750-5400) are zero. States 11->0 at t=276; pace 3.6-6.7 s/60 to frame 3120, then 16-57 s/60. No device loss
+  in 1500 s.
+
+## agA34 (sender gen 34, 2026-11-26 morning)
+- Receiver = the main session. Work files /root/a34 (edit scripts, commit messages).
+- rt41 READING (Definite for the bytes): CBV_PLACED retargeted 9.9M CBVs onto 23 placed buffers, and the watch wrote 0
+  granules. Every stand-in is all zero. The title bytes of the TAA CB never change: 150 DRAW_PEEK reads give identical
+  values at +0x0 (ed558ccd ff51afd7 40b5ac30 00000001 14ffedf0 000000a8 ...) and +0xb0. They look like CPU data (0x1_40b5ac30
+  is a game-image address, 0xa8_14ffedf0 a heap/stack pointer), not constants.
+  => Neither the title bytes (rt40: noise) nor the newest record's stand-in (rt41: zeros) hold the TAA constants.
+  CAUTION: the main session first read "title bytes change", but it was comparing the +0x0 line with the +0xb0 line.
+- THEORY (Plausible): ALIASING. The CB memory is covered by an older and/or bigger placed buffer record, and the real
+  constants reach that one: a GPU write, or an init-time copy into a record that existed then. Every record has its own
+  stand-in here, and xs_find_placed answers the NEWEST record, so we bind an empty one. The arena is 4 GiB, and
+  0xde22af580 is outside it and not pool memory, so a raw-VA GPU write cannot land in any copy we read.
+- Build 136 (c584ce050):
+  * CBV_PLACED alias diagnostics. "CBV_PLACED aliases of <va> +<size>: N overlapping record(s)" lists up to 12 overlapping
+    records with g_placed index, newest/owned/CONTAINS and GPU VA (first 48 buffers).
+  * The CBV refresh hashes every containing buffer's stand-in at that range, every 256 syncs. Changes are logged as
+    "CBV_PLACED probe #k (title ..) record i @va stand-in ... CHANGED" (400 lines max).
+  * LEONIDA_CE_CBV_PLACED_ALIAS=1 (default off): CBV_PLACED CBVs, and CBV_FIX root views in placed buffers, name the
+    OLDEST buffer record that contains them. Root lookups are cached per record (8192 scans max). Counts are in the
+    CBV_PLACED summary ("ALIAS n CBV + m root rebinds") and in the "CBV_PLACED_ALIAS:" lines.
+  * LEONIDA_CE_DRAW_SRV=name:lo-hi[,..]: scans a named draw's user-data tables (lo..hi, 16-byte steps) for T#s of known
+    images. Logs "DRAW_SRV ..." and probes / dumps them at every RTDIAG dump (tag srv_<name>_ud<k>_<off>, 32 max).
+  * LEONIDA_CE_RTDIAG_TOP=<n> (default 8, max 24): probe more of the busiest colour targets.
+  * Note: the probe writes a .ppm only when the target has non-zero bytes. "[rtdiag] probe ... N of M bytes non-zero" is
+    logged for every probed target either way, so a missing file means all zero (or a format that is not dumped).
+- rt42 = build 136 + rt42.env (rt41.env + CBV_PLACED_ALIAS=1, RTDIAG_TOP=24, DRAW_SRV on SpatialUpscaleWithDithering
+  0x0-0x2c0 / CompositeNMB / SSSResolve 0x0-0x100, dumps every 300 frames from 3600).
