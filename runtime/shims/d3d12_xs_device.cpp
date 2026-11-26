@@ -1441,13 +1441,11 @@ leonida::xg::Error xs_detile_seh(const leonida::xg::Layout& lay, const std::uint
         return leonida::xg::Error::TooSmall;
     }
 }
-bool xs_copy_title_seh(void* dst, std::uint64_t va, std::uint64_t len) {  // agA31 STANDIN_UPLOAD
-    __try {
-        std::memcpy(dst, reinterpret_cast<const void*>(va), len);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
+// agA31 STANDIN_UPLOAD: ReadProcessMemory, not __try + memcpy: clang compiled that to a 5-byte tail call into memcpy
+// (no SEH frame left; memcpy counts as nounwind), so rt32 died on a title page that vanished mid-copy.
+bool xs_copy_title_seh(void* dst, std::uint64_t va, std::uint64_t len) {
+    SIZE_T got = 0;
+    return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(va), dst, static_cast<SIZE_T>(len), &got) && got == len;
 }
 bool xs_hash_title_seh(std::uint64_t va, std::uint64_t len, std::uint64_t stride, std::uint64_t* hash, std::uint64_t* nonzero) {
     __try {
