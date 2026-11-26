@@ -1948,3 +1948,43 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
     vulkan_indirect_dispatch_count.h scratch (fn<> lookups), present blits. DirectStorage is a CPU memcpy (no GPU path).
     UpdateTileMappings / POOL binds are vkQueueBindSparse (no copy).
 - Build 90 = build 89 + the above. No shader change.
+
+## agA27 (bcpack-rs integration, 2026-11-26)
+- Upstream: https://github.com/Ahmet-Dedeler/bcpack-rs commit f5145dda7fa6d1a22b499d82f3e63029713b71b6 (v0.2.0), cloned to
+  /root/vendor/bcpack-rs on cs3, NOT vendored here. License check: Cargo.toml `license = "MIT OR Apache-2.0"`, LICENSE-MIT and
+  LICENSE-APACHE present; src/tables.rs + rans.rs port Microsoft silicon-rans (MIT, THIRD_PARTY_NOTICES.md). Both are
+  GPLv3-compatible (Definite). Credit bcpack-rs if any of its code is ever copied in (its headers ask for that).
+- Correction to the brief: shims/bcpack_decode is not "BC1 only"; it tries BC1/3/4/5/6H/7 in strict mode, but BC7 (and BC6H)
+  refuse any chunk that references the built-in endpoint history/dictionary, which our tables do not have. Every comp=14
+  chunk in rs1-rs11 was refused for that reason (mode 7 "unknown built-in endpoint history entry N" / "signature rank N is
+  inferred-only"). bcpack-rs ships the 255-entry BC7 dictionary and the 285 control codes, so it decodes them.
+- API mapping: a DirectStorage comp=14 request is one RDS5 chunk: file offset/size = the chunk's stored bytes minus the pad
+  (rs11's 8 logged requests: size = chunk file_len - pad exactly), dst_size = the chunk's virtual length (65536). No
+  format: opts 0x0020000e has no codec bits; the format lives in the store's chunk table ((a >> 24) & 0x3C) which the
+  request does not carry. bcpack-rs needs (chunk, mode, unpacked_len): bc1::decode(chunk, blocks=dst/8, window, quads),
+  bcn::decode(chunk, dst, tables[BC3/4/5]), bc7::decode(chunk, dst, tables). Every lane emits dst/8 symbols; a wrong mode
+  fails at the rANS layer (lane end states + exact byte consumption + zero pad), so auto detection works like ours.
+- Wrapper: /root/vendor/bcpack-ffi (cdylib, path dep, default-features off, static CRT). Exports
+  bcpack_decode(src, src_len, dst, dst_len, format_hint) -> mode (1,3,4,5,7) or <0 (-1 args, -2 no mode, -3 unsupported,
+  -4 panic caught, -5 ambiguous, -6 size), bcpack_decode_ex(..., BcpackInfo*) and bcpack_ffi_version() = 0x10000.
+  format_hint 0 = auto (order BC7, BC1, BC5, BC4, BC3), 0x100 = try all modes and refuse if >1 validates (tests).
+  BC6H: entropy layer only upstream, refused.
+- Runtime (dstorage_x.cpp): LEONIDA_CE_BCPACK_RS=1 (default 0): LoadLibraryExW(<exe dir>\bcpack_ffi.dll) once; a comp=14
+  chunk our decoder refuses goes to bcpack_decode_ex (auto); =2 skips our decoder (avoids its internal exceptions).
+  Logs: "[dstorage] bcpack-rs: loaded ..." / "LoadLibrary(...) failed", "comp=14 bcpack-rs decoded BC7 #k", "bcpack-rs
+  failed #k (rc ..)", and "comp=14 summary after N: ours decoded/refused | bcpack-rs decoded (per BC mode) failed (per
+  reason)" at 1, 2, 4, ... and every 256th comp=14 request. Failure still zero-fills as before.
+- Offline test on cs3 (bctest harness in /root/vendor/bcpack-ffi, game files read in place):
+  - rs11's 8 logged comp=14 requests: all 8 are BC7 chunks (store truth), bcpack-rs decodes 8/8 with the right mode,
+    unambiguous (only BC7 validates), 0 unknown controls; ours refuses 8/8.
+  - 7 stores (graphics full, 6 others every 15th chunk): mode detection right on 100% (BC1 1160, BC3 1, BC5 105, BC7 87
+    chunks), 0 wrong, 0 ambiguous. Ours: BC1 1157/1160, all BC3/BC5/BC7 refused.
+  - BC1 ours vs bcpack-rs: endpoints identical everywhere; 0.4% of blocks (93,903 / 23.9 M) differ in ONE index-word
+    quadrant, always a left/right mirror of a 2x2 quadrant code = the ~8 codebook entries bcpack-rs itself calls uncertain.
+    Which side is right: unknown (Trust me bro). BC1 stays on our decoder (RS=1 only gets what ours refuses).
+  - Windows DLL under Wine (dlltest.exe, CPU only): same output hash as the Linux build; null/garbage input -> -1/-2.
+  - Speed: BC7 64 KiB chunk ~10-20 ms in the check-all test mode, single core; fine for 4 workers.
+- Build 92 = 91b (1834dbd4f) + the above. Handed: gta6rt-92.exe + bcpack_ffi.dll + rs14.env (= rs11.env +
+  LEONIDA_CE_BCPACK_RS=1). Not booted here (no GPU runs on cs3; Wine has no comp=14 before state 1).
+- Caveat: decoded output is in stream (Gfx10 tiled) order, the same as our decoder's; whatever consumes the slot pool
+  expects what the console MDU writes (Likely the same order). Textures decoded at last, so watch for new GPU faults.

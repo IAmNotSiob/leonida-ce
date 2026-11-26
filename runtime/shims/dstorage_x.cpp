@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 
 #include "shims.h"
 #include "page_alias.h"
@@ -302,6 +303,76 @@ bool write_out(const Req& r, const void* data, size_t n, bool zero = false) {
     return ok;
 }
 
+// HACK (agA27): optional second BCPack decoder, bcpack-rs (github.com/Ahmet-Dedeler/bcpack-rs, MIT OR Apache-2.0) behind
+// a small C-ABI wrapper DLL (bcpack_ffi.dll next to the exe, built from /root/vendor/bcpack-ffi; not in this repo).
+// LEONIDA_CE_BCPACK_RS=1: comp=14 chunks our decoder (shims/bcpack_decode) refuses go to bcpack-rs (BC1/3/4/5/7, auto
+// mode detection: the first mode whose rANS layer validates). =2: bcpack-rs only (skips our decoder). Default 0 = off.
+struct BcpackRsInfo {  // = bcpack-ffi BcpackInfo (repr C)
+    uint32_t mode, valid_mask;
+    uint64_t blocks, unfitted_blocks, unknown_controls, dictionary_refs;
+    char why[192];
+};
+using BcpackRsDecode = int32_t (*)(const uint8_t*, size_t, uint8_t*, size_t, uint32_t, BcpackRsInfo*);
+
+int bcpack_rs_level() {
+    static const int v = [] { const char* e = std::getenv("LEONIDA_CE_BCPACK_RS"); return e ? std::atoi(e) : 0; }();
+    return v;
+}
+
+BcpackRsDecode bcpack_rs_fn() {
+    static const BcpackRsDecode fn = []() -> BcpackRsDecode {
+        if (bcpack_rs_level() <= 0) return nullptr;
+        wchar_t path[MAX_PATH] = {};
+        const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+        wchar_t* slash = n ? std::wcsrchr(path, L'\\') : nullptr;
+        if (!slash || (slash - path) + 16 >= MAX_PATH) {
+            std::fprintf(stderr, "[dstorage] bcpack-rs: cannot find the exe folder [hack]\n");
+            return nullptr;
+        }
+        std::wcscpy(slash + 1, L"bcpack_ffi.dll");
+        HMODULE m = LoadLibraryExW(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (!m) {
+            std::fprintf(stderr, "[dstorage] bcpack-rs: LoadLibrary(%ls) failed (error %lu); comp=14 stays on our decoder [hack]\n", path, GetLastError());
+            std::fflush(stderr);
+            return nullptr;
+        }
+        auto ver = reinterpret_cast<uint32_t (*)()>(GetProcAddress(m, "bcpack_ffi_version"));
+        auto f = reinterpret_cast<BcpackRsDecode>(GetProcAddress(m, "bcpack_decode_ex"));
+        if (!ver || !f || (ver() >> 16) != 1) {
+            std::fprintf(stderr, "[dstorage] bcpack-rs: %ls has no usable bcpack_decode_ex (version 0x%x) [hack]\n", path, ver ? ver() : 0u);
+            std::fflush(stderr);
+            return nullptr;
+        }
+        std::fprintf(stderr, "[dstorage] bcpack-rs: loaded %ls (ffi 0x%x), level %d (%s) [hack]\n", path, ver(), bcpack_rs_level(),
+                     bcpack_rs_level() >= 2 ? "bcpack-rs only" : "after our decoder refuses");
+        std::fflush(stderr);
+        return f;
+    }();
+    return fn;
+}
+
+struct BcpackCounts {
+    std::atomic<int> cpp_ok{0}, cpp_refused{0}, rs_unknown_ctl{0}, rs_unfitted{0}, total{0};
+    std::atomic<int> rs_ok[8]{}, rs_fail[8]{};  // rs_ok by mode (1,3,4,5,7); rs_fail by -rc (1 args, 2 no mode, 3 unsupported, 4 panic, 5 ambiguous, 6 size)
+};
+BcpackCounts g_bc;
+
+// One summary line at comp=14 request 1, 2, 4, 8, ... and every 256th.
+void bcpack_summary() {
+    const int t = g_bc.total.load();
+    if (t <= 0 || !((t & (t - 1)) == 0 || (t % 256) == 0)) return;
+    const int ok = g_bc.rs_ok[1] + g_bc.rs_ok[3] + g_bc.rs_ok[4] + g_bc.rs_ok[5] + g_bc.rs_ok[7];
+    int fail = 0;
+    for (int i = 1; i < 8; i++) fail += g_bc.rs_fail[i];
+    std::fprintf(stderr,
+                 "[dstorage] comp=14 summary after %d: ours decoded %d refused %d | bcpack-rs decoded %d (BC1 %d BC3 %d BC4 %d BC5 %d BC7 %d; "
+                 "%d with unknown BC7 controls, %d with unfitted blocks) failed %d (no mode %d, args %d, panic %d, ambiguous %d, size/other %d) [hack]\n",
+                 t, g_bc.cpp_ok.load(), g_bc.cpp_refused.load(), ok, g_bc.rs_ok[1].load(), g_bc.rs_ok[3].load(), g_bc.rs_ok[4].load(),
+                 g_bc.rs_ok[5].load(), g_bc.rs_ok[7].load(), g_bc.rs_unknown_ctl.load(), g_bc.rs_unfitted.load(), fail, g_bc.rs_fail[2].load(),
+                 g_bc.rs_fail[1].load(), g_bc.rs_fail[4].load(), g_bc.rs_fail[5].load(), g_bc.rs_fail[3] + g_bc.rs_fail[6] + g_bc.rs_fail[7]);
+    std::fflush(stderr);
+}
+
 // Reads and inflates one request into its destination; returns S_OK or the failure. Thread-safe (positional reads).
 int32_t run_request(const Req& r) {
     const uint32_t comp = r.comp;
@@ -349,7 +420,8 @@ int32_t run_request(const Req& r) {
                 std::vector<uint8_t> bc_out;
                 std::string bc_why;
                 int bc_mode = 0;
-                if (comp == 14 && use_bcpack) {
+                const int rs_level = comp == 14 ? bcpack_rs_level() : 0;
+                if (comp == 14 && use_bcpack && rs_level < 2) {
                     bc_out.resize(dst_size);
                     if (bcpack::decode(src.data(), src.size(), bcpack::kAuto, bc_out.data(), bc_out.size(), &bc_why, &bc_mode)) {
                         ok = write_out(r, bc_out.data(), bc_out.size());
@@ -360,8 +432,39 @@ int32_t run_request(const Req& r) {
                     } else {
                         const int k = bc_bad++;
                         if (k < 8 || (k & (k - 1)) == 0)
-                            std::fprintf(stderr, "[dstorage] comp=14 BCPack refused #%d (%s; %u -> %u bytes), zero fill [hack]\n", k + 1, bc_why.c_str(), src_size, dst_size);
+                            std::fprintf(stderr, "[dstorage] comp=14 BCPack refused #%d (%s; %u -> %u bytes)%s [hack]\n", k + 1, bc_why.c_str(), src_size, dst_size,
+                                         rs_level > 0 ? ", trying bcpack-rs" : ", zero fill");
                     }
+                    (ok ? g_bc.cpp_ok : g_bc.cpp_refused)++;
+                }
+                // HACK (agA27): bcpack-rs for what our decoder refused (or for everything at level 2), see bcpack_rs_fn.
+                if (comp == 14 && rs_level > 0 && !ok && hr != E_FAIL) {
+                    if (BcpackRsDecode rs = bcpack_rs_fn()) {
+                        bc_out.resize(dst_size);
+                        BcpackRsInfo info{};
+                        const int32_t rc = rs(src.data(), src.size(), bc_out.data(), bc_out.size(), 0, &info);
+                        if (rc > 0) {
+                            ok = write_out(r, bc_out.data(), bc_out.size());
+                            if (!ok) hr = E_FAIL;
+                            const int k = g_bc.rs_ok[rc & 7]++;
+                            if (info.unknown_controls) g_bc.rs_unknown_ctl++;
+                            if (info.unfitted_blocks) g_bc.rs_unfitted++;
+                            if (k < 4 || (k & (k - 1)) == 0)
+                                std::fprintf(stderr, "[dstorage] comp=14 bcpack-rs decoded BC%d #%d (%u -> %u bytes, %llu blocks, unfitted %llu, unknown ctl %llu) [hack]\n",
+                                             rc, k + 1, src_size, dst_size, (unsigned long long)info.blocks, (unsigned long long)info.unfitted_blocks,
+                                             (unsigned long long)info.unknown_controls);
+                        } else {
+                            const int e = (rc <= -1 && rc >= -6) ? -rc : 7;
+                            const int k = g_bc.rs_fail[e]++;
+                            info.why[sizeof(info.why) - 1] = 0;
+                            if (k < 8 || (k & (k - 1)) == 0)
+                                std::fprintf(stderr, "[dstorage] comp=14 bcpack-rs failed #%d (rc %d: %s; %u -> %u bytes), zero fill [hack]\n", k + 1, rc, info.why, src_size, dst_size);
+                        }
+                    }
+                }
+                if (comp == 14) {
+                    g_bc.total++;
+                    bcpack_summary();
                 }
                 if (ok || hr == E_FAIL) {
                 } else if (zero) {
