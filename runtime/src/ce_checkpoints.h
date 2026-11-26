@@ -104,7 +104,10 @@ inline void mirror_poke32(std::uint64_t va, std::uint32_t v) {
     if (!on || !lo || !a || va < lo || va + 4 > mirror_hi().load(std::memory_order_relaxed)) return;
     *reinterpret_cast<volatile std::uint32_t*>(a + va) = v;
 }
+// agA30 (LEONIDA_CE_LIST_TIME): while a list is emitted, the draw/dispatch markers it sets are collected here.
+inline thread_local std::vector<std::uint64_t>* t_list_marks = nullptr;
 inline void checkpoint(VkCommandBuffer cb, std::uint64_t marker) {
+    if (auto* m = t_list_marks; m && (marker >> 56) != 0xCE && m->size() < 8192) m->push_back(marker);
     if (auto f = set_checkpoint_fn().load(std::memory_order_relaxed)) f(cb, reinterpret_cast<const void*>(marker));
 }
 struct QueueSet {

@@ -2067,6 +2067,7 @@ public:
     ~VulkanQueue() {
         auto& vk = context_.vk;
         if (gt_pool_ && vk.vkDestroyQueryPool) vk.vkDestroyQueryPool(context_.device(), gt_pool_, nullptr);  // agA21
+        if (lt_pool_ && vk.vkDestroyQueryPool) vk.vkDestroyQueryPool(context_.device(), lt_pool_, nullptr);  // agA30
         ce_sync::remove_queue(this);  // agA22
         context_.holds().detach(this);  // no thread releases into this queue from here on
         report_held_at_teardown();
@@ -2243,6 +2244,80 @@ public:
             }
         }
     }
+    // agA30 LEONIDA_CE_LIST_TIME=1: a timestamp pair around every replayed command list (needs LEONIDA_CE_CHECKPOINTS=1
+    // for the pipeline names). A list whose GPU time reaches LEONIDA_CE_LIST_TIME_MS (default 50) is logged with its
+    // pipelines; every 1024 timed lists per queue, the pipelines with the most GPU time (a list's time split over its
+    // draws/dispatches by count) are printed. Results are read without waiting, like GPU_TIME.
+    static constexpr std::uint32_t kLtSlots = 512;
+    struct LtSlot { bool armed = false, pending = false; std::uint64_t seq = 0; std::uint32_t index = 0, count = 0;
+                    std::vector<std::uint64_t> marks; };
+    bool lt_on() {
+        static const bool on = [] { const char* e = std::getenv("LEONIDA_CE_LIST_TIME"); return e && e[0] == '1'; }();
+        if (!on || lt_failed_ || kind_ == QueueKind::copy) return false;
+        if (lt_pool_) return true;
+        const auto& vk = context_.vk;
+        if (!vk.vkCreateQueryPool || !vk.vkGetQueryPoolResults || !vk.vkCmdWriteTimestamp || !vk.vkCmdResetQueryPool ||
+            context_.timestamp_period() <= 0) { lt_failed_ = true; return false; }
+        VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        info.queryCount = kLtSlots * 2;
+        if (vk.vkCreateQueryPool(context_.device(), &info, nullptr, &lt_pool_) != VK_SUCCESS) { lt_pool_ = VK_NULL_HANDLE; lt_failed_ = true; return false; }
+        lt_slots_.resize(kLtSlots);
+        return true;
+    }
+    void lt_poll() {
+        static const double limit_ms = [] { const char* e = std::getenv("LEONIDA_CE_LIST_TIME_MS"); return e ? std::atof(e) : 50.0; }();
+        static std::atomic<int> slow_lines{0};
+        const auto& vk = context_.vk;
+        const char* kind = kind_ == QueueKind::direct ? "direct" : kind_ == QueueKind::compute ? "compute" : "copy";
+        for (std::uint32_t i = 0; i < kLtSlots; ++i) {
+            LtSlot& g = lt_slots_[i];
+            if (!g.pending) continue;
+            std::uint64_t t[2] = {};
+            if (vk.vkGetQueryPoolResults(context_.device(), lt_pool_, i * 2, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+                continue;
+            g.pending = false;
+            const double ms = t[1] >= t[0] ? double(t[1] - t[0]) * context_.timestamp_period() / 1e6 : 0.0;
+            std::map<std::uint64_t, std::uint32_t> per;
+            for (const std::uint64_t m : g.marks) ++per[m];
+            const double share = g.marks.empty() ? 0.0 : ms / double(g.marks.size());
+            for (const auto& [m, n] : per) lt_total_[m] += share * n;
+            lt_list_ms_ += ms;
+            if (ms >= limit_ms && slow_lines.fetch_add(1) < 3000) {
+                std::vector<std::pair<std::uint32_t, std::uint64_t>> top;
+                for (const auto& [m, n] : per) top.emplace_back(n, m);
+                std::sort(top.rbegin(), top.rend());
+                std::string names;
+                for (std::size_t k = 0; k < top.size() && k < 6; ++k)
+                    names += " " + ::leonida::ce::pipeline_name(top[k].second) + " x" + std::to_string(top[k].first);
+                std::fprintf(stderr, "[hack] LIST_TIME: %s submission #%llu list %u/%u: %.1f ms, %zu draws/dispatches, %zu pipelines:%s\n",
+                             kind, (unsigned long long)g.seq, g.index, g.count, ms, g.marks.size(), per.size(), names.c_str());
+                std::fflush(stderr);
+            }
+            g.marks.clear();
+            if ((++lt_done_ & 1023) == 0) {
+                std::vector<std::pair<double, std::uint64_t>> top;
+                for (const auto& [m, v] : lt_total_) top.emplace_back(v, m);
+                std::sort(top.rbegin(), top.rend());
+                std::fprintf(stderr, "[hack] LIST_TIME: %s queue %p: %llu lists timed, %.0f ms GPU in the last 1024; top:", kind,
+                             (void*)queue_, (unsigned long long)lt_done_, lt_list_ms_);
+                for (std::size_t k = 0; k < top.size() && k < 12; ++k)
+                    std::fprintf(stderr, " %s %.0f;", ::leonida::ce::pipeline_name(top[k].second).c_str(), top[k].first);
+                std::fprintf(stderr, "\n");
+                std::fflush(stderr);
+                lt_total_.clear();
+                lt_list_ms_ = 0;
+            }
+        }
+    }
+    VkQueryPool lt_pool_ = VK_NULL_HANDLE;
+    bool lt_failed_ = false;
+    std::vector<LtSlot> lt_slots_;
+    std::uint32_t lt_next_ = 0;
+    std::uint64_t lt_seq_ = 0, lt_done_ = 0;
+    double lt_list_ms_ = 0;
+    std::map<std::uint64_t, double> lt_total_;
+
     VkQueryPool gt_pool_ = VK_NULL_HANDLE;
     bool gt_failed_ = false;
     GtSlot gt_slots_[kGtSlots];
@@ -2940,9 +3015,35 @@ private:
         bool wrote_readback = false;
         VkPipelineStageFlags2 readback_stages = 0;
         std::uint32_t open_labels = 0;  // events may span the lists of one ExecuteCommandLists
+        // agA30 LEONIDA_CE_LIST_TIME: arm one timestamp pair per list (reset here, outside any render pass).
+        std::vector<std::int32_t> lt_idx(lists.size(), -1);
+        if (lt_on()) {
+            lt_poll();
+            for (std::size_t i = 0; i < lists.size(); ++i) {
+                const std::uint32_t at = lt_next_ % kLtSlots;
+                LtSlot& g = lt_slots_[at];
+                if (g.pending || g.armed) break;
+                ++lt_next_;
+                g.armed = true;
+                g.marks.clear();
+                g.index = std::uint32_t(i);
+                g.count = std::uint32_t(lists.size());
+                lt_idx[i] = std::int32_t(at);
+                context_.vk.vkCmdResetQueryPool(command_buffer, lt_pool_, at * 2, 2);
+            }
+        }
         for (std::size_t i = 0; i < lists.size(); ++i) {
             const auto& list = prepared[i];
+            const std::int32_t lt = lt_idx[i];
+            if (lt >= 0) {
+                context_.vk.vkCmdWriteTimestamp(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, lt_pool_, std::uint32_t(lt) * 2);
+                ::leonida::ce::t_list_marks = &lt_slots_[lt].marks;
+            }
             emit(list, command_buffer, replay, &next_tracker, &open_labels);
+            if (lt >= 0) {
+                ::leonida::ce::t_list_marks = nullptr;
+                context_.vk.vkCmdWriteTimestamp(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, lt_pool_, std::uint32_t(lt) * 2 + 1);
+            }
             wrote_readback |= list.wrote_readback;
             readback_stages |= list.readback_src_stages;
         }
@@ -3010,6 +3111,16 @@ private:
         if (wait_previous && !submitted && !waits_.empty()) {  // a failed submit keeps the waits for the next one
             waits_.pop_back();
             wait_values_.pop_back();
+        }
+        if (lt_pool_) {  // agA30: armed list slots become pending once submitted
+            const std::uint64_t seq = ++lt_seq_;
+            for (const std::int32_t lt : lt_idx) {
+                if (lt < 0) continue;
+                lt_slots_[lt].armed = false;
+                lt_slots_[lt].pending = submitted;
+                lt_slots_[lt].seq = seq;
+                if (!submitted) lt_slots_[lt].marks.clear();
+            }
         }
         if (submitted && gt_slot >= 0) {  // agA21
             gt_slots_[gt_slot].pending = true;
