@@ -1310,6 +1310,45 @@ bool xs_safe_get_desc(ID3D12Resource* t, D3D12_RESOURCE_DESC* out) {  // HACK (a
     }
 }
 
+// HACK (agA28): the title can decommit / remap a placed texture's pages between xs_readable() and the read (rt6/rt8/rs15:
+// AV in a CRT memcpy "read of 0xbf461f000" right after a [refresh] re-upload, ~25 s after the landing). These __try frames
+// (no C++ objects in them) turn such a fault into a skipped texture instead of a dead process.
+std::atomic<std::uint64_t> g_title_read_faults{0};
+void xs_note_title_read_fault(const void* where) {
+    const auto k = ++g_title_read_faults;
+    if (k <= 8 || (k & (k - 1)) == 0) {
+        std::fprintf(stderr, "[hack] TITLE_READ_FAULT: title memory near %p vanished while read (refresh / placed upload), skipped (%llu so far)\n",
+                     where, (unsigned long long)k);
+        std::fflush(stderr);
+    }
+}
+leonida::xg::Error xs_detile_seh(const leonida::xg::Layout& lay, const std::uint8_t* src, std::size_t src_bytes, std::uint32_t m,
+                                 std::uint32_t s, std::uint8_t* dst, std::size_t room, std::size_t row_pitch, std::size_t depth_pitch,
+                                 bool* faulted) {
+    __try {
+        return lay.detile(src, src_bytes, m, s, dst, room, row_pitch, depth_pitch);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *faulted = true;
+        return leonida::xg::Error::TooSmall;
+    }
+}
+bool xs_hash_title_seh(std::uint64_t va, std::uint64_t len, std::uint64_t stride, std::uint64_t* hash, std::uint64_t* nonzero) {
+    __try {
+        std::uint64_t h = *hash, nz = *nonzero;
+        for (std::uint64_t o = 0; o + 8 <= len; o += stride) {
+            std::uint64_t w = 0;
+            std::memcpy(&w, reinterpret_cast<const void*>(va + o), 8);
+            h = (h ^ w) * 1099511628211ull;
+            nz |= w;
+        }
+        *hash = h;
+        *nonzero = nz;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 void xs_upload_placed_texture(ID3D12Device* dev, const D3D12_RESOURCE_DESC& console_desc, ID3D12Resource* tex,
                               std::uint64_t va, bool force = false) {
     ID3D12CommandQueue* queue = g_upload_queue.load();
@@ -1394,8 +1433,10 @@ void xs_upload_placed_texture(ID3D12Device* dev, const D3D12_RESOURCE_DESC& cons
                 const std::size_t row_pitch = fp.Footprint.RowPitch;
                 const std::size_t depth_pitch = row_pitch * rows[sub];
                 const std::size_t room = static_cast<std::size_t>(total - fp.Offset);
-                if (lay.detile(src, src_bytes, m, s, dst_base + fp.Offset, room, row_pitch, depth_pitch) !=
+                bool read_fault = false;  // agA28: title pages may vanish under the read
+                if (xs_detile_seh(lay, src, src_bytes, m, s, dst_base + fp.Offset, room, row_pitch, depth_pitch, &read_fault) !=
                     leonida::xg::Error::Ok) {
+                    if (read_fault) xs_note_title_read_fault(src);
                     ++failed;
                     continue;
                 }
@@ -2000,11 +2041,9 @@ void xs_refresh_placed_textures(ID3D12Device* dev) {
         const bool glyphish = ff == DXGI_FORMAT_A8_UNORM || ff == DXGI_FORMAT_R8_UNORM || ff == DXGI_FORMAT_R8_TYPELESS ||
                               static_cast<int>(ff) == 65 || static_cast<int>(ff) == 61;
         const std::uint64_t stride = glyphish && len <= full_bytes ? 8 : 4096;
-        for (std::uint64_t o = 0; o + 8 <= len; o += stride) {
-            std::uint64_t w = 0;
-            std::memcpy(&w, reinterpret_cast<const void*>(t.va + o), 8);
-            h = (h ^ w) * 1099511628211ull;
-            nonzero |= w;
+        if (!xs_hash_title_seh(t.va, len, stride, &h, &nonzero)) {  // agA28: pages vanished under the read
+            xs_note_title_read_fault(reinterpret_cast<const void*>(t.va));
+            continue;
         }
         bool changed = false;
         {
