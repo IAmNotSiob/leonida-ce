@@ -2121,3 +2121,20 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   buffer_load_format already split into an aligned dword + byte shift. PTR_ALIGN rounds such addresses down (it stops the
   trap but returns the aligned dword, not the unaligned one RDNA's unaligned mode would give). The exact fix is in the
   translator (two aligned loads + funnel shift for b3 != 0; read-modify-write for stores), which means regenerating SPIR-V.
+- rt20 (build 108, cold compute once more: avg 19.4 s, 13->0 t=831): VIEW_FMT_GUARD 53 refusals (BC<->uncompressed and
+  BC1<->BC3/BC7 pairs = texture-pool images whose VkImage format is not the T#'s). Loss "Hung" ~490 s after the press, tiny dump
+  (no warps). The first no-present had every queue completed (CPU-side wait; a title thread in game+0x23cf735).
+- rt21 (build 108, warm): GUARD_SLOT_HASH WORKS - compiles avg 176 ms, 1->3 t=78.6, 3->13 t=88.4, 13->0 t=140 (fastest).
+  Hung ~110 s after the press; checkpoints direct: VS fullScreen + PS_MIRROR_PBR_MATERIAL_CLEARCOAT_5f34c83e (top) /
+  _STANDARD_5f34c83e (bottom): 2 MB pixel shaders with 17 / 13 loops; graphics stages had no loop cap and no alignment.
+- Build 109 (a98cae57f): LEONIDA_CE_LOOP_CAP_GFX=<substrings|1>, LEONIDA_CE_PTR_ALIGN_GFX takes a substring list. rt22 =
+  rt21 env + both on PS_MIRROR_PBR.
+- rt21 frame_002048 (~105 s after the press) = flat navy.
+- rt22 (build 109, LOOP_CAP_GFX/PTR_ALIGN_GFX=PS_MIRROR_PBR: CLEARCOAT 17, STANDARD/EMISSIVE/ANISOTROPY 13 loops capped):
+  NO DEVICE LOSS in 1139 s (boot 13->0 t=166.9, compiles avg 171 ms). But after the press the pace crawled (11.4 s/60, then
+  ~5 s per frame): the capped mirror PS run to the 16384-block cap every frame => their loop bounds/inputs are garbage
+  (Plausible: a root CBV passed raw, like the agA22 blur CB). Then a CPU AV at game+0x5290e15 (read 0) on 2 threads:
+  FUN_145290d80 = lock-free pool allocator (traps at 0x1fffe = full), called from FUN_1423d0ea0 (object factory) - pool
+  exhaustion after the crawl (Plausible).
+- Build 110 (30a61a3d9): LEONIDA_CE_LOOP_CAP_GFX_INNER (graphics cap; else LOOP_CAP_INNER). rt23 = rt22 env +
+  LOOP_CAP_GFX_INNER=512 + CBV_SHADOW_ROOT=4096 (two changes at once, on purpose).
