@@ -11,10 +11,16 @@
 #include <vulkan/vulkan.h>
 
 namespace leonida::ce::nofree {
-inline bool on() {
-    static const bool v = [] { const char* e = std::getenv("LEONIDA_CE_NO_FREE"); return e && e[0] == '1'; }();
+// 1 = skip vkFreeMemory, vkDestroyBuffer and vkDestroyImage; 2 = skip only vkFreeMemory (objects are destroyed, their
+// memory and its GPU mapping stay; rs15 showed that skipping image destroys trips the driver).
+inline int level() {
+    static const int v = [] {
+        const char* e = std::getenv("LEONIDA_CE_NO_FREE");
+        return e && (e[0] == '1' || e[0] == '2') ? e[0] - '0' : 0;
+    }();
     return v;
 }
+inline bool on() { return level() != 0; }
 inline void tell(const char* what, std::atomic<std::uint64_t>& n) {
     const auto k = ++n;
     if ((k & (k - 1)) == 0) {
@@ -35,11 +41,13 @@ template <class F> inline void install(F& vk) {
         if (i) tell("vkDestroyImage", n_img);
     };
     if (vk.vkFreeMemory) vk.vkFreeMemory = fm;
-    if (vk.vkDestroyBuffer) vk.vkDestroyBuffer = db;
-    if (vk.vkDestroyImage) vk.vkDestroyImage = di;
+    if (level() == 1) {
+        if (vk.vkDestroyBuffer) vk.vkDestroyBuffer = db;
+        if (vk.vkDestroyImage) vk.vkDestroyImage = di;
+    }
     static std::atomic<bool> said{false};
     if (!said.exchange(true)) {
-        std::fprintf(stderr, "[hack] NO_FREE: on (vkFreeMemory / vkDestroyBuffer / vkDestroyImage are no-ops)\n");
+        std::fprintf(stderr, "[hack] NO_FREE=%d: on (%s)\n", level(), level() == 1 ? "vkFreeMemory / vkDestroyBuffer / vkDestroyImage are no-ops" : "vkFreeMemory is a no-op");
         std::fflush(stderr);
     }
 }
