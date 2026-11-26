@@ -3840,7 +3840,11 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                 if (leonida::rtdiag::on())  // agD: LEONIDA_CE_RTDIAG (at_present picks the frames; agA5)
                     leonida::rtdiag::at_present(static_cast<ID3D12CommandQueue*>(static_cast<IUnknown*>(self->real)),
                                                 count && res ? static_cast<ID3D12Resource*>(res[0]) : nullptr, f);
-                if ((pow2 || f % 2000 == 0) && count && res && res[0])
+                // agA30 LEONIDA_CE_CAPTURE_EVERY=N: also every N-th frame from LEONIDA_CE_CAPTURE_FROM (default 2000) on.
+                static const std::uint64_t cap_every = [] { const char* e = std::getenv("LEONIDA_CE_CAPTURE_EVERY"); return e ? std::strtoull(e, nullptr, 0) : 0ull; }();
+                static const std::uint64_t cap_from = [] { const char* e = std::getenv("LEONIDA_CE_CAPTURE_FROM"); return e ? std::strtoull(e, nullptr, 0) : 2000ull; }();
+                const bool every = cap_every && f >= cap_from && f % cap_every == 0;
+                if ((pow2 || f % 2000 == 0 || every) && count && res && res[0])
                     xs_capture_frame(static_cast<ID3D12CommandQueue*>(static_cast<IUnknown*>(self->real)),
                                      static_cast<ID3D12Resource*>(res[0]), f);
                 static const unsigned preview_every = [] {
