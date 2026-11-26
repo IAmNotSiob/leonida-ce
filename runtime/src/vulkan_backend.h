@@ -35,6 +35,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <unordered_set>
@@ -924,7 +925,36 @@ struct SparseResource {
     std::uint64_t tile_count = 0;
     std::uint32_t memory_types = 0;
     std::map<std::uint64_t, TileMapping> mapped;
+    bool ce_null_init = false;  // HACK (main session, LEONIDA_CE_NULL_TILE): unmapped tiles bound to a dummy page
 };
+
+// HACK (main session, LEONIDA_CE_NULL_TILE=1, default off): on the console a write to an unmapped tile of a
+// reserved resource is dropped and a read returns zero; on NVIDIA the copy engine page-faults there (Aftermath
+// rs8-rs10: Copy Engine WRITE, "Failed to translate the virtual address", device lost after the landing A).
+// With the switch, every tile without a mapping is bound to one shared 64 KiB dummy page per memory type
+// (sparse aliasing), so stray writes land there instead of faulting.
+inline bool ce_null_tile_on() {
+    static const bool on = [] { const char* e = std::getenv("LEONIDA_CE_NULL_TILE"); return e && *e == '1'; }();
+    return on;
+}
+inline VkDeviceMemory ce_null_tile_memory(const SparseResource& r) {
+    static std::mutex mu;
+    static VkDeviceMemory per_type[32] = {};
+    std::lock_guard lock(mu);
+    for (std::uint32_t t = 0; t < 32; ++t) {
+        if (!(r.memory_types & (1u << t))) continue;
+        if (per_type[t]) return per_type[t];
+        VkMemoryAllocateInfo a{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        a.allocationSize = tile_size_in_bytes;
+        a.memoryTypeIndex = t;
+        if (r.vk.vkAllocateMemory(r.device, &a, nullptr, &per_type[t]) == VK_SUCCESS) {
+            std::fprintf(stderr, "[hack] NULL_TILE: dummy page allocated for memory type %u\n", t);
+            return per_type[t];
+        }
+        per_type[t] = VK_NULL_HANDLE;
+    }
+    return VK_NULL_HANDLE;
+}
 
 struct TileRegion {
     std::uint64_t first = 0;
@@ -3260,16 +3290,37 @@ private:
         PendingBindings pending{0, {}, resource};
         std::vector<VkSparseMemoryBind> binds;
         std::vector<VkSparseImageMemoryBind> image_binds;
-        for (const auto& [index, page] : changes) {
+        const VkDeviceMemory ce_null = ce_null_tile_on() ? ce_null_tile_memory(*resource) : VK_NULL_HANDLE;
+        std::set<std::uint64_t> ce_seed;  // tiles never mapped: bound to the dummy page on the first call
+        if (ce_null && !resource->ce_null_init) {
+            resource->ce_null_init = true;
+            std::uint64_t tiles = resource->tile_count;
+            if (resource->image) {
+                constexpr auto shape = element_tile_shape(false, 4);
+                const auto e = resource->image_extent;
+                tiles = std::uint64_t(1 + (e.width - 1) / shape.width) * (1 + (e.height - 1) / shape.height);
+            }
+            for (std::uint64_t i = 0; i < tiles; ++i)
+                if (!resource->mapped.count(i) && !changes.count(i)) ce_seed.insert(i);
+            static std::atomic<std::uint64_t> told{0};
+            const auto k = ++told;
+            if ((k & (k - 1)) == 0)
+                std::fprintf(stderr, "[hack] NULL_TILE: resource #%llu seeded %zu of %llu tiles with the dummy page (%s)\n",
+                             (unsigned long long)k, ce_seed.size(), (unsigned long long)tiles, resource->image ? "image" : "buffer");
+        }
+        std::map<std::uint64_t, TileMapping> ce_all = changes;
+        for (const auto i : ce_seed) ce_all.emplace(i, TileMapping{});
+        for (const auto& [index, page] : ce_all) {
+            const bool ce_seeded = ce_seed.count(index) != 0;
             const auto old = resource->mapped.find(index);
             if (old != resource->mapped.end()) {
                 if (old->second == page) continue;
                 pending.old_heaps.push_back(old->second.heap);
-            } else if (!page.heap) {
+            } else if (!page.heap && !ce_seeded && !ce_null) {
                 continue;
             }
             if (page.heap && !(resource->memory_types & (1u << page.heap->memory_type))) return false;
-            const VkDeviceMemory memory = page.heap ? page.heap->memory : VK_NULL_HANDLE;
+            const VkDeviceMemory memory = page.heap ? page.heap->memory : ce_null;
             if (resource->image) {
                 constexpr auto shape = element_tile_shape(false, 4);
                 const auto extent = resource->image_extent;
@@ -3279,19 +3330,19 @@ private:
                 image_binds.push_back({
                     {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0}, {std::int32_t(x), std::int32_t(y), 0},
                     {std::min(shape.width, extent.width - x), std::min(shape.height, extent.height - y), 1},
-                    memory, page.offset, 0});
+                    memory, page.heap ? page.offset : 0, 0});
                 continue;
             }
             const VkDeviceSize resource_offset = index * tile_size_in_bytes;
             if (!binds.empty()) {
                 auto& previous = binds.back();
                 if (previous.resourceOffset + previous.size == resource_offset && previous.memory == memory &&
-                    (!memory || previous.memoryOffset + previous.size == page.offset)) {
+                    (!memory || (page.heap && previous.memoryOffset + previous.size == page.offset))) {
                     previous.size += tile_size_in_bytes;
                     continue;
                 }
             }
-            binds.push_back({resource_offset, tile_size_in_bytes, memory, page.offset, 0});
+            binds.push_back({resource_offset, tile_size_in_bytes, memory, page.heap ? page.offset : 0, 0});
         }
         if (binds.empty() && image_binds.empty()) return true;
         if (!image_binds.empty() && !initialize_sparse_image_layout(id)) return false;
