@@ -18,6 +18,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <string>
 #include <vector>
 #include <vulkan/vulkan.h>
 
@@ -81,6 +82,13 @@ inline VKAPI_ATTR VkBool32 VKAPI_CALL callback(VkDebugUtilsMessageSeverityFlagBi
         std::fflush(stderr);
     }
     return VK_FALSE;
+}
+// agA28 (IMG_CHECK): an extra line in the VA file (image descriptions), so obj=10 handles there can be named offline.
+inline void note(const std::string& line) {
+    if (!on()) return;
+    auto& s = state();
+    std::lock_guard lock(s.m);
+    if (s.file) std::fprintf(s.file, "t=%.3f %s\n", now_s(), line.c_str());
 }
 // The device feature struct to chain into vkCreateDevice (nullptr when off or unsupported) and the extension name.
 inline VkPhysicalDeviceAddressBindingReportFeaturesEXT& features() {

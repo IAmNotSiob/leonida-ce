@@ -1988,3 +1988,24 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   LEONIDA_CE_BCPACK_RS=1). Not booted here (no GPU runs on cs3; Wine has no comp=14 before state 1).
 - Caveat: decoded output is in stream (Gfx10 tiled) order, the same as our decoder's; whatever consumes the slot pool
   expects what the console MDU writes (Likely the same order). Textures decoded at last, so watch for new GPU faults.
+
+## agA28 (sender gen 28, 2026-11-26 overnight)
+- Receiver B20 (a4598b35c771d8b72), runs rtN. Builds 94+.
+- Fault VA pattern (Aftermath, all Copy Engine WRITE "failed to translate"): rs8 0x56EC2E000 (no POOL_GPU), rs10 0x12B69B0000 /
+  rs13 0x12A6D00000 (POOL_GPU=2: +~0xCC0000000 = the pool sparse buffer size, which sits right after the arena at 0x3ffe10000),
+  rs17 0x142BB20000 (NO_FREE=2: leaked memory pushes it higher). So the faulting VA tracks the frontier of driver VA handed out
+  at runtime: something allocated late and then gone (Likely), not a fixed title address.
+- rs17 (build 93, NO_FREE=2 = never vkFreeMemory): still a CE write fault ~178 s after 13->0 => freed VkDeviceMemory is not the
+  cause (Likely).
+- Build 94 (018f71249): LEONIDA_CE_VA_REPORT=<file> (src/ce_va_report.h; VK_EXT_device_address_binding_report through a
+  debug-utils messenger: every GPU VA bind/unbind incl. driver-internal, WATCH range to stderr, lookups at device loss) and
+  LEONIDA_CE_COPY_ON_DIRECT=1 (COPY queues on graphics-family VkQueues: no Copy Engine for title copies). Both default off.
+  /root/a28/valookup.py <va.txt> <hex va>.. does the lookup offline.
+- Build 95 (cb0a3b50e): FENCE LIFETIME BUG. VulkanQueue::signal pinned the D3D12 fence only when the Signal was held; an unheld
+  Signal was submitted with nothing keeping the fence alive (waits were pinned to their ticket; signals were not). A fence
+  released right after queue->Signal destroyed its VkSemaphore under a pending GPU signal (VUID-vkDestroySemaphore-semaphore-
+  05149); on a COPY queue the Copy Engine writes the payload into freed driver memory = a CE write to an untranslatable VA in
+  freshly allocated driver VA space (fits every rs8-rs17 observation, NO_FREE included; Plausible until a run says).
+  Fix: the unheld path retires the pin with the submission ticket. Default ON (LEONIDA_CE_FENCE_PIN=0 = old). Logs FENCE_PIN
+  (a pin dropped the last reference of a fence = the title released it with work in flight) and FENCE_EARLY (destroyed with a
+  queued signal still pending).

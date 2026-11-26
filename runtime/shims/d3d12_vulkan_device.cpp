@@ -11908,7 +11908,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     {
         char cv[8] = {};
         std::size_t cl = 0;
-        if (getenv_s(&cl, cv, "LEONIDA_CE_COPY_ON_DIRECT") == 0 && cl > 1 && cv[0] == 1) {
+        if (getenv_s(&cl, cv, "LEONIDA_CE_COPY_ON_DIRECT") == 0 && cl > 1 && cv[0] == 0x31) {
             std::fprintf(stderr, "[hack] COPY_ON_DIRECT: COPY queues use the graphics family %u (was %u)\n", info.queue_family,
                          picked.copy);
             picked.copy = info.queue_family;

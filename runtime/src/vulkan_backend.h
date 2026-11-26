@@ -24,6 +24,7 @@
 #include "resource_tiling.h"
 #include "xdxr_build.h"
 #include "ce_copy_log.h"  // agA26
+#include "ce_image_check.h"  // agA28: LEONIDA_CE_IMG_CHECK
 #include "ce_no_free.h"  // main session: LEONIDA_CE_NO_FREE
 
 #include <algorithm>
@@ -146,6 +147,7 @@ struct VulkanDeviceFunctions {
         }
         ::leonida::ce::copylog::install(*this);  // agA26 LEONIDA_CE_COPY_LOG / COPY_GUARD (default off: no-op)
         ::leonida::ce::nofree::install(*this);   // main session: LEONIDA_CE_NO_FREE (default off: no-op)
+        ::leonida::ce::imgcheck::install(*this);  // agA28: LEONIDA_CE_IMG_CHECK (default off: no-op)
         return vkCreateCommandPool && vkDestroyCommandPool && vkAllocateCommandBuffers && vkResetCommandBuffer &&
                vkBeginCommandBuffer && vkEndCommandBuffer && vkQueueSubmit && vkQueueWaitIdle && vkCreateSemaphore &&
                vkDestroySemaphore && vkGetSemaphoreCounterValue && vkWaitSemaphores && vkSignalSemaphore &&
@@ -2422,7 +2424,7 @@ public:
                 // payload into freed driver memory (the Aftermath "Copy Engine write, failed to translate" loss).
                 static const bool fence_pin_on = [] {
                     const char* e = std::getenv("LEONIDA_CE_FENCE_PIN");
-                    return !e || e[0] != 0;
+                    return !e || e[0] != 0x30;
                 }();
                 if (ok && pin && fence_pin_on) pin_queue_.push_back({submitted_, pin()});
             }
