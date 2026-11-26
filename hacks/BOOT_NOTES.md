@@ -2174,7 +2174,8 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   tr1.sh OUT NAME.. = translate single shaders from work/shaders/dxbc/disasm into OUT/spirv).
 - AUTOSAVE ROOT CAUSE (Likely): the title's save code is FUN_1428d1480 (list saves), FUN_1428d1ea0 (autosave: create
   update, write "Save Game Header" 0x128 bytes + "Save Game Data", SubmitUpdateAsync), FUN_1428d2170 (submit result: state
-  5 ok / 1 fail). The listing enumerates containers named "PARC*" or "GA*" (FUN_1428d1340), enumerates blobs by name
+  5 ok / 1 fail). The listing enumerates containers (FUN_1428d1340: mode 0 skips names starting "PARC"/"GA", mode 1 keeps only PARC,
+  mode 2 only GA; the VM's containers are "Player" and "SettingsProfileSettings", listed in mode 0), enumerates blobs by name
   "Save Game Header" and sizes its sync XGameSaveReadBlobData buffer itself as strlen(name) + 0x19 + size
   (FUN_1428d1830) = sizeof(XGameSaveBlob) + name + NUL + bytes, no padding. Our HLE 8-aligned the bytes and the name:
   344 needed vs 337 given -> E_GS_PROVIDED_BUFFER_TOO_SMALL on every listing read -> the list's state = 1 (error) even
@@ -2191,3 +2192,20 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
 - Build 113 (592c8c173): LEONIDA_CE_SPIRV_OVERRIDE=<folder> (index.json + .spv translated alone; entries replace the
   main ones by (stage, fssm_sha256)). /root/handoff/ovr113.tar = the 30 mirror PS. The deployed corpus is from Nov 23,
   so the override modules also carry every translator change since then (index metadata identical). rt27 tests it.
+- rt25 (build 111, 2400 s): "xgamesave: submit 2 op(s), 2 write(s), 2308 bytes ... -> 0x00000000" = the submit SUCCEEDS
+  (fits the read-size diagnosis: the failure was the listing). Pace 8.7 -> 293 s/60 frames from ~frame 1920 (crawl), then the
+  title pool AV game+0x5290e15 (read 0) on 2 threads, exit 936 s. frame_002000 = real 3D geometry (pink/purple, broken).
+- rt27 (build 113 + ovr113): SPIRV_OVERRIDE 30 replaced, 0 pipeline errors. SAVE READ FIX CONFIRMED: "read "Player" 1
+  blob(s), buffer 337, need 337 -> ok" and the same for "SettingsProfileSettings" (Definite for the read; the dialog itself
+  not re-tested: no submit before the loss). Pace after the press 7.8-15.8 s/60 frames to frame 2040 (rt25 11.6-21),
+  then the crawl again at ~2160 (128-237 s/60) and device loss ~775 s after the press (Aftermath Hung, compute checkpoints
+  cs_51ddc6bd / cs_344692c2 / cs_c5b1005e). cs_c5b1005e (43 lines) and cs_344692c2 (66) are loop-free: bystanders (Likely).
+  cs_51ddc6bd has one strided loop (v0 += 32 while v0 < CB count s19): long only for a garbage count.
+- The crawl onset in both runs is where the 3D scene starts: RT_FMT_GUARD retargets, INDIRECT_SRC/INDIRECT_DRAW and RECTLIST
+  lines appear for the first time. Arena: still 0 buffer releases; the growth is proxy_slot<70> (placed SRV stand-ins at
+  fresh VAs, owned) and proxy_slot<133>; PLACED_EVICT/CAP (agA13) stop it but were dropped for descriptor-lifetime risk.
+- Build 114 (2609aea47): LEONIDA_CE_LIST_TIME=1 (+ _MS, default 50): timestamp pair per replayed list, list markers from
+  ce::checkpoint (CHECKPOINTS=1), slow lists logged with their pipelines, top-12 pipelines by GPU time every 1024 lists.
+  rt28 = rt27 env + LIST_TIME=1, LIST_TIME_MS=100.
+- /root/handoff/ovr114.tar (1.9 GB): all 1445 PS with waterfalls (129 wave32 + 1316 wave64) retranslated with the fix,
+  1445/1445 spirv-val, index metadata identical. Not run yet (cold compile of 1445 PS pipelines).
