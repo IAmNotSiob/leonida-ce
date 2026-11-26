@@ -1133,8 +1133,10 @@ static void ce_guard_all(std::vector<std::uint32_t>& words, const char* name, bo
     // agA29 (LEONIDA_CE_PTR_ALIGN=1, default off; compute modules only so graphics pipelines keep their cache entries):
     // guarded pointers are rounded down to their pointee's scalar size (spirv_guard_ptr_all `align`).
     static const bool align_on = [] { const char* e = std::getenv("LEONIDA_CE_PTR_ALIGN"); return e && e[0] == 0x31; }();
+    // agA29 (LEONIDA_CE_PTR_ALIGN_GFX=1, default off): graphics modules too (every graphics pipeline recompiles once).
+    static const bool align_gfx = [] { const char* e = std::getenv("LEONIDA_CE_PTR_ALIGN_GFX"); return e && e[0] == 0x31; }();
     int aligned = 0;
-    const int n = leonida::spirv_guard_ptr_all(words, limit, mapped ? kGuardSink : 0, hits, align_on && compute, &aligned);
+    const int n = leonida::spirv_guard_ptr_all(words, limit, mapped ? kGuardSink : 0, hits, align_on && (compute || align_gfx), &aligned);
     static std::atomic<std::uint64_t> modules{0}, pointers{0}, untouched{0}, aligned_all{0};
     if (!n) ++untouched; else { ++modules; pointers += std::uint64_t(n); }
     aligned_all += std::uint64_t(aligned);
