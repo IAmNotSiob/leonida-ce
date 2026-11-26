@@ -2304,6 +2304,14 @@ inline bool rt_retarget_on() {
     static const bool on = [] { const char* e = std::getenv("LEONIDA_CE_RT_RETARGET"); return !e || e[0] != 0x30; }();
     return on;
 }
+// agA31: LEONIDA_CE_RT_RETARGET=2 also retargets across numeric classes (rt29: ~15k intro draws into 2560x1440
+// R32G32_UINT / R32G32B32A32_UINT / R16_UINT targets left out for a PSO RTV format of R8G8B8A8_UNORM; such a target
+// is never written and reads back uninitialised). The translated fragment outputs are float vec4 for every target
+// already (uint PSO targets included), so the variant is no less defined than an ordinary uint PSO.
+inline bool rt_retarget_any_class() {
+    static const bool on = [] { const char* e = std::getenv("LEONIDA_CE_RT_RETARGET"); return e && e[0] == '2'; }();
+    return on;
+}
 template<typename Resolve>
 ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunctions& vk, PreparedDraw& p) {
     if (!vk.graphics_pipeline || !vk.buffer_at || !vk.image_view || !vk.begin_rendering || !vk.end_rendering ||
@@ -2355,7 +2363,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED) viewed.format = pipeline->color_formats[slot];
         if (rt_format_mismatch(a.binding.format, viewed.format, VK_IMAGE_ASPECT_COLOR_BIT, slot, a.binding)) {
             const bool can = rt_retarget_on() && pipeline->retarget && !a.binding.typeless &&
-                             rt_numeric_class(a.binding.format) == rt_numeric_class(viewed.format) &&
+                             (rt_numeric_class(a.binding.format) == rt_numeric_class(viewed.format) || rt_retarget_any_class()) &&
                              block_format(a.binding.format, VK_IMAGE_ASPECT_COLOR_BIT).bytes != 0;
             rt_format_log(true, slot, a.binding.format, viewed.format, a.binding, can ? "retargeted to the image format" : "draw left out",
                           pipeline);
@@ -3240,6 +3248,12 @@ inline bool on() {
     static const bool v = [] { const char* e = std::getenv("LEONIDA_CE_SKIP_BAD"); return e && e[0] == '1'; }();
     return v;
 }
+// agA31: LEONIDA_CE_SKIP_BAD also leaves out a texture copy refused as invalid (rt29: 14 whole submissions dropped,
+// "[copy] rejected at line 1906" = a buffer<->image copy whose buffer has no VkBuffer). LEONIDA_CE_SKIP_BAD_COPY=0 = old.
+inline bool copies() {
+    static const bool v = [] { const char* e = std::getenv("LEONIDA_CE_SKIP_BAD_COPY"); return on() && !(e && e[0] == '0'); }();
+    return v;
+}
 inline void note(std::size_t index, std::size_t count, std::size_t kind, int line) {
     static std::atomic<int> told{0};
     if (told++ < 24) {
@@ -3594,6 +3608,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 p.image_copies.clear();
             }
             if (result == ReplayResult::invalid_subresource) CE_BAD_SUBRESOURCE()
+            if (result == ReplayResult::invalid_copy && ::leonida::ce_skip::copies()) CE_BAD_SUBRESOURCE()  // agA31
             if (result != ReplayResult::success) return result;
             if (p.binding.host_readable) {
                 out.wrote_readback = true;
