@@ -39,6 +39,7 @@
 #include "vulkan_predicate.h"
 #include "vulkan_predicated_copy.h"
 #include "vulkan_indirect_dispatch_count.h"
+#include "ce_copy_log.h"  // agA26 COPY_LOG
 
 #include <algorithm>
 #include <atomic>
@@ -4528,6 +4529,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         } else if (std::holds_alternative<CopyBuffer>(command) || std::holds_alternative<CopyTexture>(command) ||
                    std::holds_alternative<CopyResource>(command)) {
             const auto [dst_id, src_id] = copy_ids(command);
+            ::leonida::ce::copylog::Scope ce_copy_scope(std::holds_alternative<CopyBuffer>(command) ? "replay.CopyBuffer"
+                                                        : std::holds_alternative<CopyTexture>(command) ? "replay.CopyTexture"
+                                                                                                       : "replay.CopyResource",
+                                                        std::uint64_t(dst_id), std::uint64_t(src_id));  // agA26
             if (!p.predicated_copy.empty()) {
                 end_statistics();
                 vk.emit_predicated_copy(command_buffer, p.predicated_copy);
@@ -4771,6 +4776,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                               any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
             }
         } else if (const auto* write = std::get_if<WriteImmediate>(&command)) {
+            ::leonida::ce::copylog::Scope ce_copy_scope("replay.WriteImmediate", 0, 0);  // agA26
             // vkCmdUpdateBuffer runs in the transfer stage. MARKER_OUT waits for every earlier command to finish
             // and sees its writes. MARKER_IN only needs them started, which Vulkan cannot express (TOP_OF_PIPE in a
             // first scope is no stage at all), so it waits for them to finish too, without their writes. DEFAULT is
@@ -4788,6 +4794,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.update_buffer(command_buffer, p.write_buffer, p.write_offset, 4, &write->value);
             if (predicate.buffer) vk.begin_conditional_rendering(command_buffer, &predicate);
         } else if (std::holds_alternative<AtomicCopyBuffer>(command)) {
+            ::leonida::ce::copylog::Scope ce_copy_scope("replay.AtomicCopyBuffer", 0, 0);  // agA26
             // Every earlier write, to the dependent resources among others, finishes and is visible before the copy.
             // Vulkan promises no atomicity for a transfer; that a naturally aligned 4- or 8-byte copy is one write
             // is an assumption about the hardware (docs/d3d12_vulkan.md, section 4.2).
@@ -4870,7 +4877,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                    xdxr_build && vk.xdxr_record) {
             vk.xdxr_record(command_buffer, *xdxr_build);
         } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {
-            vk.xdxr_copy(command_buffer, copy->src_va, copy->dst_va, p.xdxr_bytes);
+            // agA26 COPY_LOG / COPY_GUARD: a title-VA addressed copy (compute, XDXR).
+            if (!::leonida::ce::copylog::log_on() ||
+                !::leonida::ce::copylog::va_check("xdxr_copy", copy->src_va, copy->dst_va, p.xdxr_bytes))
+                vk.xdxr_copy(command_buffer, copy->src_va, copy->dst_va, p.xdxr_bytes);
         } else if (const auto* postbuild = std::get_if<AccelerationStructurePostbuild>(&command);
                    postbuild && !p.skip) {
             for (std::size_t s = 0; s < postbuild->sources.size(); ++s)

@@ -36,6 +36,7 @@
 #include "d3d12_trace.h"
 #include "page_alias.h"
 #include "../src/shader_library.h"
+#include "../src/ce_copy_log.h"  // agA26
 #include "../src/resource_detile.h"  // leonida::fspx_payload_from_parts for slot 67
 #include "../src/xg_texture.h"
 #include "rtdiag_probe.h"  // agD hack
@@ -3151,6 +3152,9 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                                                reinterpret_cast<void**>(a2)));
     } else {
         note_list_slot(Slot, a1, a2, a3, a4);
+        // agA26 COPY_LOG: the title caller of this list call, for the record-level copy checks (d3d12_com.cpp).
+        if (::leonida::ce::copylog::log_on())
+            ::leonida::ce::copylog::tl_title_ra = reinterpret_cast<std::uint64_t>(_ReturnAddress());
         if constexpr (Slot == 14 || Slot == 80 || Slot == 61) {
             // agA21 LEONIDA_CE_SKIP_BVH=1 (a bisect, not a fix): drop the dispatches XboxBvhBuilder.dll records
             // (its image at 0x180000000 + 0xde000): its shaders read geometry through raw title VAs it got as data.

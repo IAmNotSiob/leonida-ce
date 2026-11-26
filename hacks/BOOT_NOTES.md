@@ -1926,3 +1926,25 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   - Offline: 123 modules (62 cs, 60 gfx, edc5d4c7), 6650/6650 pointers, spirv-val vulkan1.3 clean. Wine 300 s (local GPU):
     ~16k modules / 86k pointers guarded, no pipeline failures, state 3 + presses, 0 warnings.
   - Cost: every module changes -> driver pipeline cache misses on the first run with the switch.
+
+## agA26 (sender gen 26, 2026-11-26)
+- Aftermath rs8/rs9: the device loss ~130-200 s after A is a COPY ENGINE write page fault (rs8 heap_base + 0x26EC1E000, pool
+  window unmapped; rs9 with POOL_GPU=2 heap_base + 0xFB6A00000, outside every reservation). Build 90 adds copy logging.
+- LEONIDA_CE_COPY_LOG=1 (default off; src/ce_copy_log.h): `[copylog]` lines. VK-FIRST / REC-FIRST once per (kind, site,
+  title caller); VK-OUTSIDE / REC-OUTSIDE / VA-OUTSIDE for every copy outside its VkBuffer (size from a wrapped
+  vkCreateBuffer), D3D12 buffer resource (GetDesc().Width), or past LEONIDA_CE_COPY_VA_LIMIT (default 0xE52E00000).
+  LEONIDA_CE_COPY_GUARD=1 (implies the log) skips a copy whose DESTINATION is outside (VK-SKIP / REC-SKIP / VA-SKIP).
+- Copy sites covered:
+  - Vulkan level (wrapped in Functions::load, so every user of ctx->vk): vkCmdCopyBuffer, CopyBufferToImage
+    (source offset only), CopyImageToBuffer (destination offset), CopyImage (first-seen only), FillBuffer, UpdateBuffer,
+    CopyQueryPoolResults. The replay sets a site (replay.CopyBuffer / CopyTexture / CopyResource / WriteImmediate /
+    AtomicCopyBuffer), POOL_GPU sets pool.flush; anything else logs site=?. Each line has the queue family and the
+    D3D12 resource ids.
+  - Record level (d3d12_com.cpp): CopyBufferRegion, CopyTextureRegion (footprint side), CopyResource, CopyTiles (linear
+    side). The title caller comes from the console list proxy (list_slot, _ReturnAddress()) through a thread-local. The
+    replay looks up the last caller that copied that resource id.
+  - xdxr_copy (CopyRaytracingAccelerationStructure, title VA, compute not CE): VA check.
+  - NOT covered: vulkan_bindless.h table updates (own function table; runtime-owned buffers), vulkan_predicate.h /
+    vulkan_indirect_dispatch_count.h scratch (fn<> lookups), present blits. DirectStorage is a CPU memcpy (no GPU path).
+    UpdateTileMappings / POOL binds are vkQueueBindSparse (no copy).
+- Build 90 = build 89 + the above. No shader change.

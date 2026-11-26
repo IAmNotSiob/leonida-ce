@@ -643,6 +643,7 @@ static void ce_pool_sync() {
                     std::size_t j = i;
                     std::vector<VkBufferCopy> regions;
                     while (j < pcopies.size() && pcopies[j].first == pcopies[i].first) regions.push_back(pcopies[j++].second);
+                    ::leonida::ce::copylog::Scope ce_copy_scope("pool.flush", 0, 0);  // agA26 COPY_LOG
                     vk.vkCmdCopyBuffer(g_pool.cmd, pcopies[i].first.first, pcopies[i].first.second, std::uint32_t(regions.size()), regions.data());
                     i = j;
                 }

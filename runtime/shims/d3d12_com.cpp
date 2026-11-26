@@ -8,6 +8,7 @@
 #include "d3d12_xs_device.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/ce_checkpoints.h"  // agA17
+#include "../src/ce_copy_log.h"  // agA26
 #include <map>
 
 #include <algorithm>
@@ -71,6 +72,24 @@ void stub(const char* method) {
     static std::set<std::string> seen;
     std::lock_guard lock(mutex);
     if (seen.insert(method).second) std::fprintf(stderr, "[rt] d3d12: unimplemented %s\n", method);
+}
+
+
+// agA26 LEONIDA_CE_COPY_LOG / COPY_GUARD: size and GPU VA of a buffer resource, for the record-level copy checks.
+static void ce_copy_res(ID3D12Resource* r, std::uint64_t& size, std::uint64_t& va) {
+    size = 0; va = 0;
+    if (!r) return;
+    const D3D12_RESOURCE_DESC d = r->GetDesc();
+    if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) { size = d.Width; va = r->GetGPUVirtualAddress(); }
+}
+static bool ce_copy_record(const char* kind, ID3D12Resource* dst, std::uint64_t dst_off, ID3D12Resource* src,
+                           std::uint64_t src_off, std::uint64_t bytes) {
+    if (!::leonida::ce::copylog::log_on()) return false;
+    std::uint64_t ds, dv, ss, sv;
+    ce_copy_res(dst, ds, dv);
+    ce_copy_res(src, ss, sv);
+    return ::leonida::ce::copylog::record(kind, reinterpret_cast<std::uintptr_t>(dst), dst_off, ds, dv,
+                                          reinterpret_cast<std::uintptr_t>(src), src_off, ss, sv, bytes);
 }
 
 namespace {
@@ -562,6 +581,7 @@ public:
                                             UINT64 src_offset, UINT64 bytes) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::CopyBufferRegion");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (ce_copy_record("CopyBufferRegion", dst, dst_offset, src, src_offset, bytes)) return;  // agA26 COPY_GUARD
         check(list_.copy_buffer({resource_id(dst), dst_offset, resource_id(src), src_offset, bytes}));
     }
 
@@ -569,6 +589,12 @@ public:
                                      const D3D12_TILE_REGION_SIZE* size, ID3D12Resource* linear,
                                      UINT64 linear_offset, D3D12_TILE_COPY_FLAGS flags) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::CopyTiles");
+        if (::leonida::ce::copylog::log_on() && size) {  // agA26 COPY_LOG / COPY_GUARD (the linear side)
+            const std::uint64_t n = size->UseBox ? std::uint64_t(size->Width) * size->Height * size->Depth : size->NumTiles;
+            const bool to_lin = (flags & ~D3D12_TILE_COPY_FLAG_NO_HAZARD) == D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER;
+            if (to_lin ? ce_copy_record("CopyTiles->linear", linear, linear_offset, tiled, 0, n * 65536)
+                       : ce_copy_record("CopyTiles<-linear", tiled, 0, linear, linear_offset, n * 65536)) return;
+        }
         const auto direction = flags & ~D3D12_TILE_COPY_FLAG_NO_HAZARD;
         const bool to_linear = direction == D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER;
         const auto grid = tile_grid(tiled);
@@ -618,6 +644,21 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList::CopyTextureRegion");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!dst || !src) return check(false);
+        if (::leonida::ce::copylog::log_on()) {  // agA26 COPY_LOG / COPY_GUARD: footprint sides (offset + rows)
+            const auto span = [](const D3D12_TEXTURE_COPY_LOCATION& l) -> std::uint64_t {
+                if (l.Type != D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) return 0;
+                const auto& f = l.PlacedFootprint.Footprint;
+                return std::uint64_t(f.RowPitch) * (f.Height ? f.Height : 1) * (f.Depth ? f.Depth : 1);
+            };
+            const bool dfp = dst->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            const bool sfp = src->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            const char* kind = dfp ? (sfp ? "CopyTextureRegion fp->fp" : "CopyTextureRegion tex->fp")
+                                   : (sfp ? "CopyTextureRegion fp->tex" : "CopyTextureRegion tex->tex");
+            // Only a footprint (buffer) side has a byte range; the destination's when it is one, else the source's.
+            if (ce_copy_record(kind, dst->pResource, dfp ? dst->PlacedFootprint.Offset : 0, src->pResource,
+                               sfp ? src->PlacedFootprint.Offset : 0, dfp ? span(*dst) : (sfp ? span(*src) : 0)) && dfp)
+                return;
+        }
         leonida::CopyTexture copy{location(*dst), x, y, z, location(*src), box != nullptr, {}};
         if (box) copy.box = {box->left, box->top, box->front, box->right, box->bottom, box->back};
         check(list_.copy_texture(copy));
@@ -626,6 +667,7 @@ public:
     void STDMETHODCALLTYPE CopyResource(ID3D12Resource* dst, ID3D12Resource* src) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::CopyResource");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (ce_copy_record("CopyResource", dst, 0, src, 0, 0)) return;  // agA26 COPY_LOG (once per caller)
         if (dst && dst == src) {
             // A self-copy on a DEFAULT heap is a no-op, but an UPLOAD/READBACK resource still cannot
             // be both source and destination: native D3D12 rejects it at Close. Check this before

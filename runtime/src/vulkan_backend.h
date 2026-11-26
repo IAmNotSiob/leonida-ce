@@ -23,6 +23,7 @@
 #include "queue_families.h"
 #include "resource_tiling.h"
 #include "xdxr_build.h"
+#include "ce_copy_log.h"  // agA26
 
 #include <algorithm>
 #include <atomic>
@@ -141,6 +142,7 @@ struct VulkanDeviceFunctions {
                 std::fprintf(stderr, "[hack] QUERY_NOWAIT: query result copies run without WAIT_BIT\n");
             }
         }
+        ::leonida::ce::copylog::install(*this);  // agA26 LEONIDA_CE_COPY_LOG / COPY_GUARD (default off: no-op)
         return vkCreateCommandPool && vkDestroyCommandPool && vkAllocateCommandBuffers && vkResetCommandBuffer &&
                vkBeginCommandBuffer && vkEndCommandBuffer && vkQueueSubmit && vkQueueWaitIdle && vkCreateSemaphore &&
                vkDestroySemaphore && vkGetSemaphoreCounterValue && vkWaitSemaphores && vkSignalSemaphore &&
