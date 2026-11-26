@@ -18,6 +18,7 @@
 #include "dxgi_com.h"
 #include "../src/ce_checkpoints.h"
 #include "../src/ce_va_report.h"  // agA28: LEONIDA_CE_VA_REPORT
+#include "../src/ce_image_check.h"  // agA28: LEONIDA_CE_IMG_CHECK
 #include "../src/arena_size.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/depth24_fragment.h"
@@ -7003,7 +7004,7 @@ public:
                 std::vector<VkQueueFamilyProperties> queues(count);
                 families(info.physical, &count, queues.data());
                 if (info.copy_family < count && !(queues[info.copy_family].queueFlags & VK_QUEUE_COMPUTE_BIT))
-                    state_.context->set_transfer_only_family(info.copy_family);
+                    { state_.context->set_transfer_only_family(info.copy_family); leonida::ce::imgcheck::set_no_graphics_family(info.copy_family); }  // agA28
                 if (info.queue_family < count && (queues[info.queue_family].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
                     state_.context->configure_predication(get_device, state_.memory, limits.limits.maxStorageBufferRange, info.queue_family);
                     if (info.storage_buffer_8bit) state_.context->configure_predicated_copy(get_device, limits.limits);
