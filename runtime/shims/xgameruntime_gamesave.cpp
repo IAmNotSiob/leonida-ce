@@ -459,8 +459,23 @@ HRESULT delete_container(XGameSaveProviderHandle p, const char* name) {
 
 HRESULT submit_update(XGameSaveUpdateHandle u) {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
-    if (!live(g_updates, u) || !live_as(g_containers, u->container, u->container_serial)) return E_GS_HANDLE_EXPIRED;
-    return commit(u);
+    if (!live(g_updates, u) || !live_as(g_containers, u->container, u->container_serial)) {
+        std::fprintf(stderr, "[rt] xgamesave: submit: handle expired (update %p)\n", static_cast<void*>(u));
+        std::fflush(stderr);
+        return E_GS_HANDLE_EXPIRED;
+    }
+    // agA29: rt23's first post-landing screen was "COULDN'T AUTOSAVE"; log every submit's outcome.
+    const HRESULT hr = commit(u);
+    uint64_t bytes = 0;
+    size_t writes = 0;
+    for (const auto& [name, op] : u->ops)
+        if (op.write) { ++writes; bytes += op.data.size(); }
+    std::fprintf(stderr, "[rt] xgamesave: submit %zu op(s), %zu write(s), %llu bytes, used %llu of %llu -> 0x%08lx\n",
+                 u->ops.size(), writes, static_cast<unsigned long long>(bytes),
+                 static_cast<unsigned long long>(used_bytes(u->container->user_dir)),
+                 static_cast<unsigned long long>(kQuotaBytes), static_cast<unsigned long>(hr));
+    std::fflush(stderr);
+    return hr;
 }
 
 // ---- Async: each *Async slot runs its work on the title's queue ----
