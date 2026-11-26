@@ -2530,3 +2530,16 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   (2) If the dsts never touch the CBs, look at the other dropped list slots (74, 101, 126, 129, 131, 132, 142, 28-30, 70, 75),
       and at slots 71/72 (write32/64, applied only after the fence).
   (3) If the srcs are GPU-written, do the copy on the GPU in list order.
+- rt43 RESULT (main session): only ONE slot-62 copy in the whole run (dst 0xdaa41b9e0 <- src 0xbdbc10000, 0x4000), none onto a
+  CBV_PLACED buffer; non-zero CBV_PLACED stand-ins 0 of 23. => slot 62 is NOT the CB writer (Very likely). DEVICE LOST at
+  558 s (rt42 also lost at 713 s; rt41 without ALIAS ran 1500 s clean); no dumps (died before frame 3600).
+- Build 138 (7d545ad09): LEONIDA_CE_WATCH_RANGE=lo-hi. "[watch] <kind> #k: title va +bytes | rec -> stand-in | extra" for
+  device CBV (17, final BufferLocation), buffer SRV/UAV (18/19), placed SRV/UAV (70/71, bound record, owned), root
+  CBV/SRV/UAV (final translation), list CopyBufferRegion / CopyResource / CopyResourceX (dst + src), list write32/64
+  (71/72), slot-133 placements. 600 lines max. Off = no lookups. NOT covered: raw V#s written straight into descriptor
+  heaps, WriteBufferImmediate.
+- rt44 = build 138 + rt44.env (rt42.env - CBV_PLACED_ALIAS, DUMP_FROM 3300, + WATCH_RANGE=0xde22a0000-0xde22b0000).
+- NEXT (agA36): read rt44 [watch] lines: a UAV / copy / write32 / root UAV onto 0xde22af580..650, and the stand-in it
+  resolves to vs the CB's (0xffdd4c00). If something writes a DIFFERENT stand-in, bind CBV_PLACED to it (or alias the two
+  arena ranges). If nothing shows, the writer is a raw V# in a descriptor heap (compute) - hook the V# translation
+  (VSHARP_GUARD path) for bases in the range.
