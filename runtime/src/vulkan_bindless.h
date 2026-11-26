@@ -247,7 +247,9 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
     // 1024 / 256). rt36: "a bindless image array is full; dimension 1" (2D-array) - every later 2D-array view fell back
     // to index 0. A different set layout changes every pipeline layout: one cold pipeline compile.
     for (const auto& [name, dimension] : {std::pair<const char*, ImageDimension>{"LEONIDA_CE_BINDLESS_2DA", ImageDimension::dim_2d_array},
-                                          std::pair<const char*, ImageDimension>{"LEONIDA_CE_BINDLESS_3D", ImageDimension::dim_3d}}) {
+                                          std::pair<const char*, ImageDimension>{"LEONIDA_CE_BINDLESS_3D", ImageDimension::dim_3d},
+                                          // agA32: rt36-rt38 filled the 256-entry 1D table ("dimension 3").
+                                          std::pair<const char*, ImageDimension>{"LEONIDA_CE_BINDLESS_1D", ImageDimension::dim_1d}}) {
         if (const char* e = std::getenv(name)) {
             const unsigned long v = std::strtoul(e, nullptr, 0);
             if (v >= 16 && v <= 65536) counts[sampled_binding(dimension)] = std::uint32_t(v);

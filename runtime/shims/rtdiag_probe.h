@@ -8,6 +8,8 @@
 #include <windows.h>
 #include <d3d12.h>
 
+#include <cmath>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -85,7 +87,24 @@ inline void probe_resource(ID3D12Device* dev, ID3D12CommandQueue* queue, ID3D12R
                          tag, (unsigned long long)frame, static_cast<void*>(texture), (unsigned long long)rd.Width,
                          rd.Height, int(rd.Format), unsigned(rd.Flags), (unsigned long long)nz, (unsigned long long)n,
                          first_nz, mid[0], mid[1], mid[2], mid[3]);
-            if (nz && row_bytes == rd.Width * 4) {
+            // agA32: 8-byte texels (R16G16B16A16_FLOAT, DXGI 10) are dumped too, as clamp(half, 0, 1) * 255.
+            const bool half4 = rd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT && row_bytes == rd.Width * 8;
+            if (half4) {
+                std::uint64_t nan = 0, big = 0, neg = 0;
+                for (UINT y = 0; y < rows; y += 4) {
+                    const auto* px = reinterpret_cast<const std::uint16_t*>(base + std::size_t(y) * fp.Footprint.RowPitch);
+                    for (UINT64 x = 0; x < rd.Width * 4; x += 4)
+                        for (int c = 0; c < 3; ++c) {
+                            const std::uint16_t h = px[x + c];
+                            if ((h & 0x7c00) == 0x7c00) ++nan;
+                            else if (h & 0x8000) neg += (h & 0x7fff) != 0;
+                            else if (h >= 0x3c00) ++big;
+                        }
+                }
+                std::fprintf(stderr, "[rtdiag] probe %s rgba16f (every 4th row, rgb): nan/inf %llu, >=1 %llu, <0 %llu\n", tag,
+                             (unsigned long long)nan, (unsigned long long)big, (unsigned long long)neg);
+            }
+            if (nz && (row_bytes == rd.Width * 4 || half4)) {
                 char dir[200] = "Z:\\root\\agD-dump";
                 GetEnvironmentVariableA("LEONIDA_CE_RTDIAG_DIR", dir, sizeof(dir));
                 CreateDirectoryA(dir, nullptr);
@@ -102,7 +121,18 @@ inline void probe_resource(ID3D12Device* dev, ID3D12CommandQueue* queue, ID3D12R
                     for (UINT y = 0; y < rows; ++y) {
                         const auto* px = base + std::size_t(y) * fp.Footprint.RowPitch;
                         for (UINT64 x = 0; x < rd.Width; ++x)
-                            for (int c = 0; c < 3; ++c) line[x * 3 + c] = px[x * 4 + c];
+                            for (int c = 0; c < 3; ++c) {
+                                if (!half4) { line[x * 3 + c] = px[x * 4 + c]; continue; }
+                                std::uint16_t h;
+                                std::memcpy(&h, px + x * 8 + c * 2, 2);
+                                // half -> [0,1]: negative/NaN 0, >= 1 255, else mantissa-exact enough for a picture
+                                float v = 0.0f;
+                                if (!(h & 0x8000) && (h & 0x7c00) != 0x7c00) {
+                                    const int e = (h >> 10) & 31, m = h & 1023;
+                                    v = e ? std::ldexp(1.0f + m / 1024.0f, e - 15) : std::ldexp(m / 1024.0f, -14);
+                                }
+                                line[x * 3 + c] = std::uint8_t(v >= 1.0f ? 255 : v * 255.0f + 0.5f);
+                            }
                         WriteFile(h, line.data(), static_cast<DWORD>(line.size()), &wr, nullptr);
                     }
                     CloseHandle(h);
@@ -131,7 +161,11 @@ inline void at_present(ID3D12CommandQueue* queue, ID3D12Resource* presented, std
         char v[8] = {};
         return GetEnvironmentVariableA("LEONIDA_CE_RTDIAG_DUMP", v, sizeof(v)) > 0 && v[0] == '1';
     }();
-    if (!deep || f % (every ? every : 600) != 0) return;
+    static const std::uint64_t dump_from = [] {  // agA32: LEONIDA_CE_RTDIAG_DUMP_FROM = first frame dumped
+        char v[16] = {};
+        return GetEnvironmentVariableA("LEONIDA_CE_RTDIAG_DUMP_FROM", v, sizeof(v)) > 0 ? std::strtoull(v, nullptr, 10) : 0ull;
+    }();
+    if (!deep || f < dump_from || f % (every ? every : 600) != 0) return;
     ID3D12Device* dev = nullptr;
     if (FAILED(queue->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&dev))) || !dev) return;
     if (ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(dev)) {

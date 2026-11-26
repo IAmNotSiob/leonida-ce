@@ -2459,7 +2459,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
             return ReplayResult::success;
         }
     }
-    rtdiag::count_draw(p.colors, p.depth.id, 0);
+    rtdiag::count_draw(p.colors, p.depth.id, 0, reinterpret_cast<std::uint64_t>(p.pipeline));
 
     // HACK (Leonida CE): the shaders read the title's per-draw data (root arguments point into its upload ring) at
     // heap_base + VA, but the title writes it in its own memory; copy a window around each such address into the arena.

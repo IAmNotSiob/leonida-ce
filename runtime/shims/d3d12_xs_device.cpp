@@ -3872,6 +3872,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             // accept the frame and count it. Plane: Token @0, ResourceCount @8, ppResources @0x10 (xbox_present.h).
             static std::atomic<std::uint64_t> frames{0};
             const std::uint64_t f = frames++;
+            leonida::ce::present_frame().store(f + 1, std::memory_order_relaxed);  // agA32 FRAME_TRACE
             if (f < 5 || (f & (f - 1)) == 0) {
                 const auto* plane = reinterpret_cast<const std::uint8_t*>(a2);
                 const std::uint64_t token = plane ? *reinterpret_cast<const std::uint64_t*>(plane) : 0;

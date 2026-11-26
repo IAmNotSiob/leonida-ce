@@ -11,6 +11,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "ce_checkpoints.h"  // agA32 pipeline names per target
+
 namespace leonida::rtdiag {
 inline bool on() {
     static const bool v = [] {
@@ -26,6 +28,7 @@ struct ImageInfo {
 struct State {
     std::mutex m;
     std::unordered_map<std::uintptr_t, std::uint64_t> target_draws, depth_draws;
+    std::unordered_map<std::uintptr_t, std::unordered_map<std::uint64_t, std::uint64_t>> target_pipes;  // agA32
     std::unordered_map<std::uintptr_t, ImageInfo> images;
     std::unordered_map<std::uint64_t, std::uintptr_t> by_address;
     std::uint64_t draws = 0, pending = 0, variant = 0, no_target = 0, lists_ok = 0, lists_failed = 0, dispatches = 0;
@@ -119,10 +122,22 @@ inline std::vector<std::uintptr_t> dump(std::uintptr_t presented, std::uint64_t 
                          pass ? "depth " : "target", (unsigned long long)v[i].second, (unsigned long long)v[i].first,
                          (unsigned long long)ii.address, ii.w, ii.h, ii.fmt, ii.flags,
                          v[i].second == presented ? " PRESENTED" : "");
-            if (!pass) top.push_back(v[i].second);
+            if (!pass) {
+                top.push_back(v[i].second);
+                // agA32: the pipelines that drew into this target (most draws first).
+                if (const auto pt = s.target_pipes.find(v[i].second); pt != s.target_pipes.end()) {
+                    std::vector<std::pair<std::uint64_t, std::uint64_t>> pv;
+                    for (const auto& [pipe, n] : pt->second) pv.push_back({n, pipe});
+                    std::sort(pv.rbegin(), pv.rend());
+                    for (std::size_t k = 0; k < pv.size() && k < 6; ++k)
+                        std::fprintf(stderr, "[rtdiag]     pipe x%llu %s\n", (unsigned long long)pv[k].first,
+                                     ::leonida::ce::pipeline_name(pv[k].second).c_str());
+                }
+            }
         }
     }
     s.target_draws.clear();
+    s.target_pipes.clear();
     s.depth_draws.clear();
     s.draws = s.pending = s.variant = s.no_target = s.lists_ok = s.lists_failed = 0;
     std::fill(std::begin(s.fail), std::end(s.fail), 0);
@@ -131,7 +146,7 @@ inline std::vector<std::uintptr_t> dump(std::uintptr_t presented, std::uint64_t 
 }
 // how: 0 drawn, 1 pipeline pending, 2 variant pending
 template<typename Colors>
-inline void count_draw(const Colors& colors, std::uintptr_t depth, int how) {
+inline void count_draw(const Colors& colors, std::uintptr_t depth, int how, std::uint64_t pipe = 0) {
     if (!on()) return;
     auto& s = state();
     std::lock_guard l(s.m);
@@ -140,7 +155,7 @@ inline void count_draw(const Colors& colors, std::uintptr_t depth, int how) {
     ++s.draws;
     bool any = false;
     for (const auto& a : colors)
-        if (a.id) { ++s.target_draws[a.id]; any = true; }
+        if (a.id) { ++s.target_draws[a.id]; any = true; if (pipe) ++s.target_pipes[a.id][pipe]; }
     if (depth) ++s.depth_draws[depth];
     if (!any) ++s.no_target;
 }

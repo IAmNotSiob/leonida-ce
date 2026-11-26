@@ -2316,6 +2316,7 @@ public:
     std::vector<LtSlot> lt_slots_;
     std::uint32_t lt_next_ = 0;
     std::uint64_t lt_seq_ = 0, lt_done_ = 0;
+    std::uint64_t ft_seq_ = 0;  // agA32 FRAME_TRACE submissions
     double lt_list_ms_ = 0;
     std::map<std::uint64_t, double> lt_total_;
 
@@ -3038,14 +3039,27 @@ private:
                 context_.vk.vkCmdResetQueryPool(command_buffer, lt_pool_, at * 2, 2);
             }
         }
+        // agA32 LEONIDA_CE_FRAME_TRACE: log the lists of the traced frames in order (pipeline per draw/dispatch).
+        const std::uint64_t ft_frame = ::leonida::ce::present_frame().load(std::memory_order_relaxed);
+        const bool ft = ::leonida::ce::frame_traced(ft_frame);
+        const std::uint64_t ft_seq = ft ? ++ft_seq_ : 0;
+        std::vector<std::uint64_t> ft_marks;
         for (std::size_t i = 0; i < lists.size(); ++i) {
             const auto& list = prepared[i];
             const std::int32_t lt = lt_idx[i];
             if (lt >= 0) {
                 context_.vk.vkCmdWriteTimestamp(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, lt_pool_, std::uint32_t(lt) * 2);
                 ::leonida::ce::t_list_marks = &lt_slots_[lt].marks;
+            } else if (ft) {
+                ft_marks.clear();
+                ::leonida::ce::t_list_marks = &ft_marks;
             }
             emit(list, command_buffer, replay, &next_tracker, &open_labels);
+            if (ft) {
+                ::leonida::ce::trace_list(kind_ == QueueKind::direct ? "direct" : kind_ == QueueKind::compute ? "compute" : "copy",
+                                          ft_frame, ft_seq, i, lists.size(), lt >= 0 ? lt_slots_[lt].marks : ft_marks);
+                if (lt < 0) ::leonida::ce::t_list_marks = nullptr;
+            }
             if (lt >= 0) {
                 ::leonida::ce::t_list_marks = nullptr;
                 context_.vk.vkCmdWriteTimestamp(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, lt_pool_, std::uint32_t(lt) * 2 + 1);

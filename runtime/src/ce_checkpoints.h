@@ -2,6 +2,7 @@
 // VK_NV_device_diagnostic_checkpoints; the replay sets a checkpoint before every draw/dispatch (marker = the VkPipeline)
 // and the device-lost hook prints the last checkpoints each queue reached, with the pipeline's shader names.
 #pragma once
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -106,6 +107,50 @@ inline void mirror_poke32(std::uint64_t va, std::uint32_t v) {
 }
 // agA30 (LEONIDA_CE_LIST_TIME): while a list is emitted, the draw/dispatch markers it sets are collected here.
 inline thread_local std::vector<std::uint64_t>* t_list_marks = nullptr;
+// agA32: number of the frame being built (PresentX stores its frame + 1). Not thread_local.
+inline std::atomic<std::uint64_t>& present_frame() { static std::atomic<std::uint64_t> f{0}; return f; }
+// agA32 LEONIDA_CE_FRAME_TRACE=<f>[,<f2>|<a>-<b>...]: every list replayed while one of these frames is built is logged
+// with its draws/dispatches in order (pipeline names, consecutive repeats folded; needs LEONIDA_CE_CHECKPOINTS=1).
+inline bool frame_traced(std::uint64_t f) {
+    static const std::vector<std::pair<std::uint64_t, std::uint64_t>> v = [] {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> r;
+        const char* p = std::getenv("LEONIDA_CE_FRAME_TRACE");
+        while (p && *p) {
+            char* end = nullptr;
+            const std::uint64_t a = std::strtoull(p, &end, 10);
+            if (end == p) break;
+            std::uint64_t b = a;
+            p = end;
+            if (*p == 0x2d) { b = std::strtoull(p + 1, &end, 10); p = end; }
+            r.emplace_back(a, b);
+            while (*p == ',' || *p == ' ') ++p;
+        }
+        return r;
+    }();
+    for (const auto& [a, b] : v)
+        if (f >= a && f <= b) return true;
+    return false;
+}
+inline void trace_list(const char* kind, std::uint64_t frame, std::uint64_t seq, std::size_t i, std::size_t n,
+                       const std::vector<std::uint64_t>& marks) {
+    std::string s;
+    std::uint64_t prev = 0;
+    unsigned run = 0;
+    const auto flush = [&] {
+        if (!run) return;
+        s += " | " + pipeline_name(prev);
+        if (run > 1) s += " x" + std::to_string(run);
+    };
+    for (const std::uint64_t m : marks) {
+        if (run && m == prev) { ++run; continue; }
+        flush();
+        prev = m;
+        run = 1;
+    }
+    flush();
+    std::fprintf(stderr, "[hack] FRAME_TRACE f%llu %s #%llu list %zu/%zu: %zu marks%s\n", (unsigned long long)frame, kind,
+                 (unsigned long long)seq, i, n, marks.size(), s.c_str());
+}
 inline void checkpoint(VkCommandBuffer cb, std::uint64_t marker) {
     if (auto* m = t_list_marks; m && (marker >> 56) != 0xCE && m->size() < 8192) m->push_back(marker);
     if (auto f = set_checkpoint_fn().load(std::memory_order_relaxed)) f(cb, reinterpret_cast<const void*>(marker));
