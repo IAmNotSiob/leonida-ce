@@ -53,6 +53,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1885,6 +1886,69 @@ void xs_lc62_apply(UINT count, const std::uint64_t* lists) {
                      (unsigned long long)g_lc62_standin.load(), (unsigned long long)g_lc62_fail.load(), nonzero, total);
         std::fflush(stderr);
     }
+}
+// agA35 LEONIDA_CE_WATCH_RANGE=lo-hi (title VAs, e.g. 0xde22a0000-0xde22b0000; default off): logs every runtime path that
+// names title memory in [lo, hi) - device views (CBV slot 17, SRV/UAV slots 18/19 of buffers, placed SRV/UAV slots 70/71),
+// root CBV/SRV/UAV addresses, list CopyBufferRegion / CopyResource(X) destinations and sources, list write32/64 (slots
+// 71/72) and slot-133 placements - with what it resolves to (record, stand-in GPU VA), to find who writes the TAA CB
+// 0xde22af580 (stand-in 0xffdd4c00 in rt42) on the console. "[watch] ..." lines, 600 max (+ every 2^k-th per kind).
+bool xs_watch_range(std::uint64_t& lo, std::uint64_t& hi) {
+    static std::uint64_t l = 0, h = 0;
+    static const bool on = [] {
+        const char* e = std::getenv("LEONIDA_CE_WATCH_RANGE");
+        if (!e || !*e) return false;
+        char* end = nullptr;
+        l = std::strtoull(e, &end, 0);
+        if (end && *end == '-') h = std::strtoull(end + 1, nullptr, 0);
+        return l && h > l;
+    }();
+    lo = l; hi = h;
+    return on;
+}
+bool xs_watch_hit(std::uint64_t va, std::uint64_t bytes) {
+    std::uint64_t lo, hi;
+    if (!xs_watch_range(lo, hi) || !va) return false;
+    const std::uint64_t end = va + (bytes ? bytes : 1);
+    return va < hi && end > lo;
+}
+void xs_watch_log(const char* kind, std::uint64_t va, std::uint64_t bytes, const char* fmt, ...) {
+    if (!xs_watch_hit(va, bytes)) return;
+    static std::mutex mu;
+    static std::map<std::string, std::uint64_t> per;
+    static int total = 0;
+    std::uint64_t k;
+    {
+        std::lock_guard l(mu);
+        k = ++per[kind];
+        if (!(total < 600 || (k & (k - 1)) == 0)) return;
+        ++total;
+    }
+    char extra[400] = {};
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(extra, sizeof extra, fmt, ap);
+    va_end(ap);
+    const XsPlaced* p = xs_find_placed(va);
+    char rec[220] = "no record";
+    if (p) {
+        const std::uint64_t g = p->resource && p->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? p->resource->GetGPUVirtualAddress() : 0;
+        std::snprintf(rec, sizeof rec, "rec @0x%llx +0x%llx dim %d %llux%u fmt %d flags 0x%x%s -> stand-in 0x%llx", (unsigned long long)p->va,
+                      (unsigned long long)p->size, int(p->desc.Dimension), (unsigned long long)p->desc.Width, p->desc.Height,
+                      int(p->desc.Format), unsigned(p->desc.Flags), p->owned ? " owned" : "",
+                      (unsigned long long)(g ? g + (va - p->va) : 0));
+    }
+    std::fprintf(stderr, "[watch] %s #%llu: title 0x%llx +0x%llx | %s | %s\n", kind, (unsigned long long)k, (unsigned long long)va,
+                 (unsigned long long)bytes, rec, extra);
+    std::fflush(stderr);
+}
+// Title VA (+offset) of a resource the title passes (placed record), 0 if none.
+std::uint64_t xs_watch_res_va(std::uint64_t res, std::uint64_t off, std::uint64_t* rec_size = nullptr) {
+    std::uint64_t lo, hi;
+    if (!res || !xs_watch_range(lo, hi)) return 0;  // off: no lookups
+    XsPlaced pr{};
+    if (!xs_placed_by_resource(reinterpret_cast<const void*>(res), pr)) return 0;
+    if (rec_size) *rec_size = pr.size;
+    return pr.va + off;
 }
 void xs_cbv_fix_note(const char* what, std::uint64_t from, std::uint64_t to) {
     static std::atomic<int> told{0};
@@ -3906,6 +3970,8 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
             return hr_to_u64(self->real->Reset(reinterpret_cast<ID3D12CommandAllocator*>(a1),
                                                reinterpret_cast<ID3D12PipelineState*>(a2)));
         } else if constexpr (Slot == 71 || Slot == 72) {  // write32/write64(address, value, flush, flags)
+            xs_watch_log(Slot == 71 ? "list write32" : "list write64", a1, Slot == 71 ? 4 : 8, "value 0x%llx flags 0x%llx/0x%llx from %p",
+                         (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)a4, _ReturnAddress());  // agA35
             if (a1) {
                 const unsigned what = (Slot == 72 && (a4 == 1 || a4 == 2)) ? static_cast<unsigned>(a4) : 0u;
                 std::lock_guard lock(g_list_extras_mu);
@@ -3929,6 +3995,12 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
             g_list_extras[self].uploads.push_back(std::move(block));
             return at;
         } else if constexpr (Slot == 86) {  // CopyResourceX(dst, src, flags)
+            {   // agA35 WATCH_RANGE
+                std::uint64_t ds = 0, ss = 0;
+                const std::uint64_t dv = xs_watch_res_va(unwrap_object(a1), 0, &ds), sv = xs_watch_res_va(unwrap_object(a2), 0, &ss);
+                xs_watch_log("list CopyResourceX dst", dv, ds, "src title 0x%llx +0x%llx from %p", (unsigned long long)sv, (unsigned long long)ss, _ReturnAddress());
+                xs_watch_log("list CopyResourceX src", sv, ss, "dst title 0x%llx +0x%llx from %p", (unsigned long long)dv, (unsigned long long)ds, _ReturnAddress());
+            }
             self->real->CopyResource(reinterpret_cast<ID3D12Resource*>(unwrap_object(a1)),
                                      reinterpret_cast<ID3D12Resource*>(unwrap_object(a2)));
             return 0;
@@ -3967,6 +4039,18 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                     self->real->Dispatch(static_cast<UINT>(g[0]), static_cast<UINT>(g[1]), static_cast<UINT>(g[2]));
                 return 0;
             }
+        }
+        if constexpr (Slot == 15 || Slot == 17) {  // agA35 WATCH_RANGE: CopyBufferRegion(dst, doff, src, soff, n) / CopyResource(dst, src)
+            std::uint64_t ds = 0, ss = 0;
+            const std::uint64_t dv = xs_watch_res_va(unwrap_object(a1), Slot == 15 ? a2 : 0, &ds);
+            const std::uint64_t sv = xs_watch_res_va(unwrap_object(Slot == 15 ? a3 : a2), Slot == 15 ? a4 : 0, &ss);
+            const std::uint64_t n = Slot == 15 ? a5 : ds;
+            xs_watch_log(Slot == 15 ? "list CopyBufferRegion dst" : "list CopyResource dst", dv, n,
+                         "src title 0x%llx (res %llx) bytes 0x%llx from %p", (unsigned long long)sv, (unsigned long long)(Slot == 15 ? a3 : a2),
+                         (unsigned long long)n, _ReturnAddress());
+            xs_watch_log(Slot == 15 ? "list CopyBufferRegion src" : "list CopyResource src", sv, n,
+                         "dst title 0x%llx (res %llx) bytes 0x%llx from %p", (unsigned long long)dv, (unsigned long long)a1,
+                         (unsigned long long)n, _ReturnAddress());
         }
         constexpr unsigned pc = console_to_pc_list_slot(Slot);
         if constexpr (pc == kListNotForwarded) {
@@ -4042,6 +4126,11 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
             if constexpr (pc >= 37 && pc <= 42) {
                 const std::uint64_t raw = a2;
                 a2 = xs_va_from_cpu(a2);  // HACK: root CBV/SRV/UAV addresses
+                struct WatchRoot {  // agA35 WATCH_RANGE: logs the final translation at scope exit
+                    std::uint64_t raw; std::uint64_t* to; unsigned pc, param;
+                    ~WatchRoot() { xs_watch_log("root view", raw, 0, "pc slot %u (%s) param %u -> 0x%llx", pc,
+                                                pc == 37 || pc == 38 ? "CBV" : pc == 39 || pc == 40 ? "SRV" : "UAV", param, (unsigned long long)*to); }
+                } watch_root{raw, &a2, pc, static_cast<unsigned>(a1)};
                 if (xs_cbv_fix_on() && a2 == raw && raw >= g_arena_size) {  // agA13: past the arena: a title pointer
                     if (const std::uint64_t to = xs_placed_buffer_va(raw, 0)) {
                         a2 = to;
@@ -5489,6 +5578,10 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         if constexpr (Slot == 17) {  // CBV: the console passes a CPU pointer as BufferLocation
             if (a1) {
                 cbv = *reinterpret_cast<const D3D12_CONSTANT_BUFFER_VIEW_DESC*>(a1);
+                const std::uint64_t watch_title = cbv.BufferLocation;  // agA35
+                struct WatchCbv { std::uint64_t t; std::uint32_t n; D3D12_CONSTANT_BUFFER_VIEW_DESC* c; std::uint64_t h;
+                    ~WatchCbv() { xs_watch_log("device CBV", t, n, "-> 0x%llx (handle 0x%llx)", (unsigned long long)c->BufferLocation, (unsigned long long)h); }
+                } watch_cbv{watch_title, cbv.SizeInBytes, &cbv, a2};
                 {   static std::atomic<int> n{0};  // HACK diagnostic
                     if (n++ < 4) { std::fprintf(stderr, "[hack] CBV location %llx size %u (arena %p+%llx)\n", (unsigned long long)cbv.BufferLocation, cbv.SizeInBytes, (void*)g_arena_mapped, (unsigned long long)g_arena_size); std::fflush(stderr); } }
                 const std::uint64_t translated = xs_va_from_cpu(cbv.BufferLocation);
@@ -5588,6 +5681,24 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                     if (told++ < 12)
                         std::fprintf(stderr, "[hack] A8 SRV: res %p mapping %x -> %x\n", (void*)a1, m, sd->Shader4ComponentMapping);
                 }
+            }
+        }
+        if constexpr (Slot == 18 || Slot == 19) {  // agA35 WATCH_RANGE: buffer SRV/UAV of a placed resource
+            std::uint64_t rs = 0;
+            if (const std::uint64_t rv = xs_watch_res_va(a1, 0, &rs)) {
+                std::uint64_t first = 0, n = 0, stride = 0;
+                if (a2 && Slot == 18) {
+                    const auto* v = reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(a2);
+                    if (v->ViewDimension == D3D12_SRV_DIMENSION_BUFFER) { first = v->Buffer.FirstElement; n = v->Buffer.NumElements; stride = v->Buffer.StructureByteStride; }
+                } else if (a3) {  // UAV: (resource, counter, desc, handle)
+                    const auto* v = reinterpret_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(a3);
+                    if (v->ViewDimension == D3D12_UAV_DIMENSION_BUFFER) { first = v->Buffer.FirstElement; n = v->Buffer.NumElements; stride = v->Buffer.StructureByteStride; }
+                }
+                const std::uint64_t es = stride ? stride : 4;
+                xs_watch_log(Slot == 18 ? "device SRV" : "device UAV", rv + first * es, n ? n * es : rs,
+                             "resource title 0x%llx +0x%llx first %llu n %llu stride %llu (counter res %llx)", (unsigned long long)rv,
+                             (unsigned long long)rs, (unsigned long long)first, (unsigned long long)n, (unsigned long long)stride,
+                             (unsigned long long)(Slot == 19 ? a2 : 0));
             }
         }
         const std::uint64_t r = reinterpret_cast<ForwardFn>(self->real_vtable[Slot])(self->real, a1, a2, a3, a4, a5, a6);
@@ -5983,6 +6094,12 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             }
         }
         if (!placed) placed = restand_from;  // agA31
+        if (va && xs_watch_hit(va, rdesc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? rdesc->Width : 1))  // agA35
+            xs_watch_log(Slot == 70 ? "placed SRV (70)" : "placed UAV (71)", va,
+                         rdesc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? rdesc->Width : 1,
+                         "request dim %d %llux%u fmt %d flags 0x%x; bound record @0x%llx%s handle 0x%llx", int(rdesc->Dimension),
+                         (unsigned long long)rdesc->Width, rdesc->Height, int(rdesc->Format), unsigned(rdesc->Flags),
+                         (unsigned long long)(placed ? placed->va : 0), placed && placed->owned ? " owned" : "", (unsigned long long)handle);
         // HACK (agA31, LEONIDA_CE_STANDIN_UPLOAD=1, default off): a BUFFER stand-in this slot made (fresh VA, CreateCommitted-
         // Resource) never got the title's bytes: nothing copies them (BUFFER_SYNC is off, the ring sync writes arena[title
         // VA], not the stand-in). Each view made over such a stand-in copies the title bytes of the whole stand-in into
@@ -6098,6 +6215,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                 ? desc_in->Width : self->real->GetResourceAllocationInfo(0, 1, &d).SizeInBytes;
             xs_record_placed(a1, bytes, static_cast<ID3D12Resource*>(*out), desc_in);
             xs_console_texture_address(self->real, *out, *desc_in, a1);
+            xs_watch_log("slot 133 placed", a1, bytes, "dim %d %llux%u fmt %d xbox flags 0x%x", int(desc_in->Dimension),
+                         (unsigned long long)desc_in->Width, desc_in->Height, int(desc_in->Format), unsigned(desc_in->Flags));  // agA35
         }
         std::fprintf(stderr, "[hack] slot 133 CreatePlacedResourceX(va=%llx, dim=%d, width=%llu, flags=0x%x) -> 0x%08lx\n",
                      (unsigned long long)a1, (int)desc_in->Dimension, (unsigned long long)desc_in->Width,
