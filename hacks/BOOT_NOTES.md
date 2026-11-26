@@ -2563,3 +2563,21 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   If other CBs / vertex data come through the same ring by CopyBufferRegion with sources > 1 MiB, raise the cap.
   The general form of this bug: any title placed buffer that the CPU writes and the GPU reads through a copy or a view needs
   a sync. BUFFER_SYNC hashes everything, which is too slow; syncing per use, as here, is the cheap form.
+
+## Checkpoint 2026-11-26 08:50 PST (main session) - paused by the user
+
+Where it stands:
+- Boot -> intro -> gameplay (control prompt) works. The 3D view is black (was dither noise before build 135).
+- Cause, found in rt44 with build 138 WATCH_RANGE (Definite): the TAA upscaler CB (placed buffer title 0xde22af580,
+  208 bytes; also 0xde22ad930, 0xde22affc0) is filled every frame by a list CopyBufferRegion from a placed buffer over
+  the title's CPU-written upload ring (0x2.../0x3a..-0x3c...). The copy is forwarded to D3D12, but nothing syncs the
+  title ring bytes into the source stand-in, so the GPU copies zeros (black). Before build 135 we bound stale title bytes
+  (noise).
+- Build 139 (agA35) COPY_SRC_SYNC=1 syncs the source stand-ins at ExecuteCommandLists: 1700+ copies done, but rt46 still
+  shows only 1 of 23 CBV_PLACED stand-ins non-zero and the TAA CB zero at frame 3729. Open question: why the synced
+  GPU copy does not land in the CB stand-in (ordering vs the DRAW_PEEK read, or the src/dst GPU VA).
+- Build 140 (main) fixes an AV in xs_hash_title_seh (rt45): __try didn't catch a vanished title page; now ReadProcessMemory.
+- Not finished: rt47 = build 140 + rt47.env (COPY_SRC_SYNC=2, CPU writes the dst stand-in directly) was stopped at
+  start. That is the next cheap check: if the screen stops being black, the data is right and only the GPU copy path is wrong.
+- Device losses are back: rt42 (713 s), rt43 (558 s), rt46 (446 s); rt41 and rt44 were clean. Unexplained.
+- Runs/logs: /root/rb/rt41..rt46.err.log; envs /root/handoff/rt41..rt47.env; builds /root/handoff/gta6rt-135..140.exe.
