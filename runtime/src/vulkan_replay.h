@@ -3446,8 +3446,33 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             } else {
                 result = detail::prepare_resource_copy(p);
             }
+            // FIX (agA28, LEONIDA_CE_DS_XFMT_STAGE, default on; =0 = old): Vulkan copies depth/stencil between images
+            // only of the SAME format (VUID-vkCmdCopyImage-srcImage-01548). The title copies the depth aspect of a
+            // D32_SFLOAT_S8_UINT 2560x1440 target into a D32_SFLOAT one; NVIDIA lays the two out differently and the Copy
+            // Engine wrote past the end of the D32 image's VA mapping (rt10: the last copy 60 ms before the Aftermath CE
+            // write fault at that image's end; rt3/rt4/rt9 the same address pattern). Such copies are staged too.
+            static const bool ds_xfmt_stage = [] {
+                const char* e = std::getenv("LEONIDA_CE_DS_XFMT_STAGE");
+                return !e || e[0] != 0x30;
+            }();
+            constexpr VkImageAspectFlags ds_aspects = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+            const bool ds_cross_format = ds_xfmt_stage && result == ReplayResult::success && !p.image_copies.empty() &&
+                                         (p.image_copies[0].srcSubresource.aspectMask & ds_aspects) &&
+                                         (p.image_copies[0].dstSubresource.aspectMask & ds_aspects) &&
+                                         p.source.format != p.binding.format;
+            if (ds_cross_format) {
+                static std::atomic<std::uint64_t> staged_ds{0};
+                const auto k = ++staged_ds;
+                if (k <= 4 || (k & (k - 1)) == 0) {
+                    std::fprintf(stderr, "[hack] DS_XFMT_STAGE: depth/stencil copy fmt %d -> fmt %d (%ux%u, aspect 0x%x) staged through a buffer (%llu so far)\n",
+                                 int(p.source.format), int(p.binding.format), p.image_copies[0].extent.width, p.image_copies[0].extent.height,
+                                 unsigned(p.image_copies[0].srcSubresource.aspectMask), (unsigned long long)k);
+                    std::fflush(stderr);
+                }
+            }
             if (result == ReplayResult::success && !p.image_copies.empty() &&
-                p.image_copies[0].srcSubresource.aspectMask != p.image_copies[0].dstSubresource.aspectMask) {
+                (ds_cross_format ||
+                 p.image_copies[0].srcSubresource.aspectMask != p.image_copies[0].dstSubresource.aspectMask)) {
                 // Depth <-> colour: vkCmdCopyImage cannot mix aspects, so each region goes image -> scratch -> image,
                 // tightly packed. Depth aspects want 4-byte buffer offsets; 16 covers every texel size here.
                 const std::uint32_t texel =
