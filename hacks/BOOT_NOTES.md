@@ -2153,3 +2153,18 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   pixel-shader TDR (rt21) or cap-bound crawl (rt22). Translator fix: when the ballot word is empty for an active lane (or
   the lane itself is not in it), readfirstlane returns the lane's own value, so the waterfall retires it. Needs a SPIR-V
   regeneration of the fragment shaders.
+- rt24 (build 111, B presses from s3+200): no "xgamesave: submit" line - the run never reached the save point. Pace decayed
+  2 -> 12.5 s/60 frames; hang at frame 3341, DEVICE LOST ~840 s after the press (direct queue stalled inside a cmdbuf at a
+  list begin; compute checkpoints cs_56009f29 / cs_f5e0d89c / cs_c5b1005e; no Aftermath collected). Frames only up to 2048.
+  VM save dir: rt23's autosave DID write saves\local-user\Player (Save%20Game%20Data 2012 bytes, header 296, .display 6 at
+  00:24:15) yet the title said "COULDN'T AUTOSAVE" => the submit result or a later step (quota / used-space / read-back) is
+  what the title rejects (Plausible). Build 111's submit log will show the HRESULT once a run reaches the dialog again.
+- SUMMARY agA29 / NEXT:
+  1. Hang/loss still comes ~110-860 s after the press with high variance (rt21 PS waterfall, rt24 compute list begin). Run
+     with af-get each time; try LOOP_CAP_GFX on more loop-heavy PS families, or fix the waterfall readfirstlane lead (above)
+     in the translator.
+  2. Autosave failure: read the "xgamesave: submit" HRESULT; check what the title calls after submit (quota, enumerate).
+  3. Arena leak (0 releases; ~1 GiB per 10 min of gameplay) will end longer runs.
+  4. Recommended env: build 111 + /root/handoff/rt24.env (= rt23 env + B presses). Keep LEONIDA_CE_PTR_ALIGN=1,
+     LOOP_CAP_GFX=PS_MIRROR_PBR + LOOP_CAP_GFX_INNER=512 + PTR_ALIGN_GFX=PS_MIRROR_PBR; VIEW_FMT_GUARD / RT_RETARGET /
+     GUARD_SLOT_HASH are default on. Cache is warm for this set (compiles ~0.2 s).
