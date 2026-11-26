@@ -2635,3 +2635,17 @@ Where it stands:
   DRAW_PEEK=DistantWindowEmissives:0x140:0x160:0x40,DistantWindowEmissives:0x120:0x58:0x10 (VS camera matrix / counts).
   If cs_22383ee2 stops hanging, find its CB (table+0x40, +0x4): probably a per-frame count written through the same
   upload ring -> CopyBufferRegion path as the TAA CB (the agA36 COPY_SRC work).
+- rt51 (main session: gta6rt-143 = same md5 as 141 + rt48.env + agA37 LOOP_CAP 1:0x80000, PLACED_BUF_OVER_TEX dropped; cold
+  compile, gameplay copies from frame 7967):
+  THE TAA CB IS FIXED by COPY_SRC_SYNC=1 (Definite). CSS_TRACE: 28 rec, 28 apply, 28 gpu, 0 skipped, 0 unapplied; gpu: 19 LANDED,
+  0 ZERO, 9 DIFFERENT (the DIFFERENT ones = 0xde22ad930, which gets TWO copies per list, so the later one is what shows - expected).
+  DRAW_PEEK SpatialUpscaleWithDithering frame 7973, CB stand-in 0xffdd4c00: cb+0x0 = 2560, 1440, 1/2560, 1/1440, 3840, 2160,
+  1/3840, 1/2160; cb+0xb0 = 1, 1, 0, 0x1f27, then dither gains cb+0xc0..0xcc = 1/255 each (rt40 had 8, 0, 11.95 = noise).
+  So the forwarded GPU copy always worked. rt46/rt47 just never got far enough into gameplay to show it.
+  NOT SEEN: whether the world shows. DEVICE LOST ~7 frames after the CBs filled (frame ~7973; last RTDIAG dump 7800 was
+  before the copies, so all zero as expected). Then AV at game+0x55d5d2d.
+  ("CBV_PLACED stand-ins non-zero: N of 23" is printed only at 2^k / every 1024 submits: stale, don't use it.)
+- NEXT: keep COPY_SRC_SYNC=1 in the base env (COPY_SRC_TRACE is optional). The device loss (agA37's area) has to be fixed first;
+  then a run that lives >= 300 frames past gameplay with RTDIAG dumps decides whether the scene shows. If still black: the
+  next suspects are other CPU-written placed buffers read through copies > 1 MiB (raise the cap) or through views (needs
+  per-use syncing like this one), and the TAA input colour (DRAW_SRV s9+0x0 2560x1440 fmt 19 images).
