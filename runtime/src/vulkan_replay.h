@@ -798,6 +798,9 @@ struct GraphicsPipeline {
     // and stencil. Null when it cannot be built.
     static constexpr std::uint32_t unbound_depth = 1u << 8;
     std::function<VkPipeline(std::uint32_t unbound)> variant;
+    // agA29 (LEONIDA_CE_RT_RETARGET): the same pipeline with colour slot formats replaced (formats[i] != UNDEFINED; 8
+    // entries), for a draw whose bound target's texel size differs from the PSO's RTV format. Null: not available.
+    std::function<VkPipeline(std::uint32_t unbound, const VkFormat* formats)> retarget;
     std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
 };
 
@@ -2258,16 +2261,48 @@ inline bool rt_format_mismatch(VkFormat image_format, VkFormat view_format, VkIm
         bad = aspects_of(image_format) != aspects_of(view_format) ||
               block_format(image_format, VK_IMAGE_ASPECT_DEPTH_BIT).bytes != block_format(view_format, VK_IMAGE_ASPECT_DEPTH_BIT).bytes;
     }
-    if (!bad) return false;
-    static std::atomic<std::uint64_t> n{0};
+    (void)slot; (void)b;
+    return bad;
+}
+// agA29: one line per distinct (slot kind, image fmt, PSO fmt, extent, action) the first time, then a count every
+// power of two of all mismatches.
+inline void rt_format_log(bool colour, std::size_t slot, VkFormat image_format, VkFormat view_format, const ResourceBinding& b,
+                          const char* action, const GraphicsPipeline* pipeline) {
+    static std::mutex mu;
+    static std::set<std::uint64_t> seen;
+    static std::uint64_t n = 0;
+    std::lock_guard l(mu);
     const auto k = ++n;
-    if (k <= 8 || (k & (k - 1)) == 0) {
-        std::fprintf(stderr, "[hack] RT_FMT_GUARD: %s slot %zu image fmt %d (%ux%u) viewed as PSO fmt %d: draw left out (%llu so far)\n",
-                     aspect == VK_IMAGE_ASPECT_COLOR_BIT ? "colour" : "depth", slot, int(image_format), b.width, b.height,
-                     int(view_format), (unsigned long long)k);
+    const std::uint64_t key = (std::uint64_t(colour) << 63) ^ (std::uint64_t(image_format) << 40) ^ (std::uint64_t(view_format) << 20) ^
+                              (std::uint64_t(b.width) << 4) ^ std::uint64_t(b.height) ^ (std::uint64_t(action[0]) << 56) ^
+                              std::uint64_t(std::uintptr_t(pipeline)) * 0x9E3779B97F4A7C15ull;
+    const bool first = seen.insert(key).second && seen.size() <= 256;
+    if (first || (k & (k - 1)) == 0) {
+        std::fprintf(stderr, "[hack] RT_FMT_GUARD: %s slot %zu image fmt %d (%ux%u, %u mips) viewed as PSO fmt %d: %s (pso %p, %llu so far)\n",
+                     colour ? "colour" : "depth", slot, int(image_format), b.width, b.height, b.mip_levels, int(view_format), action,
+                     static_cast<const void*>(pipeline), (unsigned long long)k);
         std::fflush(stderr);
     }
-    return true;
+}
+// agA29 (LEONIDA_CE_RT_RETARGET, default on; =0 = build 104's skip): a colour target whose texel size differs from the
+// PSO's RTV format is rendered in the IMAGE's format, with a pipeline variant whose attachment format is the image's.
+// The console's colour block takes its format from the RTV (the resource), and the PSO only sets the export format,
+// so this is the console's behaviour (Plausible); the view then fits the image and the ROP stays inside it. Only
+// formats of the same numeric class (float/norm, uint, sint) are retargeted: the shader's output type must match.
+inline int rt_numeric_class(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R8_UINT: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_A2B10G10R10_UINT_PACK32:
+    case VK_FORMAT_R16_UINT: case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R32_UINT:
+    case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32B32A32_UINT: return 2;
+    case VK_FORMAT_R8_SINT: case VK_FORMAT_R8G8_SINT: case VK_FORMAT_R8G8B8A8_SINT: case VK_FORMAT_R16_SINT:
+    case VK_FORMAT_R16G16_SINT: case VK_FORMAT_R16G16B16A16_SINT: case VK_FORMAT_R32_SINT: case VK_FORMAT_R32G32_SINT:
+    case VK_FORMAT_R32G32B32A32_SINT: return 3;
+    default: return 1;
+    }
+}
+inline bool rt_retarget_on() {
+    static const bool on = [] { const char* e = std::getenv("LEONIDA_CE_RT_RETARGET"); return !e || e[0] != 0x30; }();
+    return on;
 }
 template<typename Resolve>
 ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunctions& vk, PreparedDraw& p) {
@@ -2300,6 +2335,8 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     };
 
     p.colors.assign(pipeline->color_formats.size(), {});
+    std::array<VkFormat, max_render_targets> retarget_formats{};  // agA29 RT_RETARGET
+    bool retargeted = false;
     const std::uint32_t render_target_count = draw.views ? draw.views->render_target_count : 0;
     for (std::size_t slot = 0; slot < render_target_count && slot < p.colors.size(); ++slot) {
         const TargetView& target = draw.views->render_targets[slot];
@@ -2317,8 +2354,18 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         ResourceBinding viewed = a.binding;
         if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED) viewed.format = pipeline->color_formats[slot];
         if (rt_format_mismatch(a.binding.format, viewed.format, VK_IMAGE_ASPECT_COLOR_BIT, slot, a.binding)) {
-            p.skip = true;
-            return ReplayResult::success;
+            const bool can = rt_retarget_on() && pipeline->retarget && !a.binding.typeless &&
+                             rt_numeric_class(a.binding.format) == rt_numeric_class(viewed.format) &&
+                             block_format(a.binding.format, VK_IMAGE_ASPECT_COLOR_BIT).bytes != 0;
+            rt_format_log(true, slot, a.binding.format, viewed.format, a.binding, can ? "retargeted to the image format" : "draw left out",
+                          pipeline);
+            if (!can) {
+                p.skip = true;
+                return ReplayResult::success;
+            }
+            viewed.format = a.binding.format;
+            retarget_formats[slot] = a.binding.format;
+            retargeted = true;
         }
         a.view = vk.image_view(viewed, a.range);
         if (!a.view) return ReplayResult::unsupported;
@@ -2336,6 +2383,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         ResourceBinding viewed = a.binding;
         viewed.format = pipeline->depth_format;
         if (rt_format_mismatch(a.binding.format, viewed.format, VK_IMAGE_ASPECT_DEPTH_BIT, 99, a.binding)) {
+            rt_format_log(false, 99, a.binding.format, viewed.format, a.binding, "draw left out", pipeline);
             p.skip = true;
             return ReplayResult::success;
         }
@@ -2355,8 +2403,11 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     for (std::size_t slot = 0; slot < p.colors.size(); ++slot)
         if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED && !p.colors[slot].id) unbound |= 1u << slot;
     if (pipeline->depth_format != VK_FORMAT_UNDEFINED && !p.depth.id) unbound |= GraphicsPipeline::unbound_depth;
-    if (unbound) {
-        p.pipeline = pipeline->variant ? pipeline->variant(unbound) : VK_NULL_HANDLE;
+    if (unbound || retargeted) {
+        if (retargeted)
+            p.pipeline = pipeline->retarget(unbound, retarget_formats.data());
+        else
+            p.pipeline = pipeline->variant ? pipeline->variant(unbound) : VK_NULL_HANDLE;
         if (!p.pipeline) {
             p.skip = true;
             rtdiag::count_draw(p.colors, 0, 2);

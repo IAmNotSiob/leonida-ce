@@ -4747,7 +4747,7 @@ public:
         if (pipeline_.layout) vk.vkDestroyPipelineLayout(dev, pipeline_.layout, nullptr);
         if (module_) vk.vkDestroyShaderModule(dev, module_, nullptr);
         if (graphics_.pipeline) vk.vkDestroyPipeline(dev, graphics_.pipeline, nullptr);
-        for (const auto& [unbound, built] : variants_) vk.vkDestroyPipeline(dev, built, nullptr);
+        for (const auto& [key, built] : variants_) vk.vkDestroyPipeline(dev, built, nullptr);
         if (graphics_.layout) vk.vkDestroyPipelineLayout(dev, graphics_.layout, nullptr);
         for (VkShaderModule module : modules_) vk.vkDestroyShaderModule(dev, module, nullptr);
         if (code_bytes_) device_.arena_release(code_base_, code_bytes_, DeviceState::arena_shader);
@@ -5481,6 +5481,11 @@ public:
                 std::fprintf(stderr, "[rt] d3d12: graphics pipelines are built on first use (LEONIDA_CE_EAGER_PSO=1: at creation)\n");
         }
         graphics_.variant = [this](std::uint32_t unbound) { return variant(unbound); };
+        graphics_.retarget = [this](std::uint32_t unbound, const VkFormat* formats) {
+            VariantKey key{unbound, {}};
+            for (std::size_t i = 0; i < key.second.size(); ++i) key.second[i] = formats[i];
+            return variant(key);
+        };
 
         if (code_stage) {
             VkDeviceSize offset = 0;
@@ -5890,7 +5895,9 @@ private:
     };
 
     // The graphics pipeline with the formats of the `unbound` slots (leonida::GraphicsPipeline::variant) undefined.
-    VkPipeline build(std::uint32_t unbound) const {
+    using VariantKey = std::pair<std::uint32_t, std::array<VkFormat, leonida::detail::max_render_targets>>;
+    // agA29: overrides[i] != VK_FORMAT_UNDEFINED replaces colour slot i's format (RT_RETARGET).
+    VkPipeline build(std::uint32_t unbound, const VkFormat* overrides = nullptr) const {
         // The stride state is last: a pipeline without vertex bindings (a full-screen pass that builds its vertices
         // from SV_VertexID) leaves it out, since no vkCmdBindVertexBuffers2 would ever set it
         // (VUID-vkCmdDraw-pStrides-04913).
@@ -5901,8 +5908,11 @@ private:
             VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};
         const Recipe& r = recipe_;
         std::vector<VkFormat> colors = graphics_.color_formats;
-        for (std::size_t slot = 0; slot < colors.size(); ++slot)
+        for (std::size_t slot = 0; slot < colors.size(); ++slot) {
+            if (overrides && slot < leonida::detail::max_render_targets && overrides[slot] != VK_FORMAT_UNDEFINED)
+                colors[slot] = overrides[slot];
             if (unbound & (1u << slot)) colors[slot] = VK_FORMAT_UNDEFINED;
+        }
         const bool depth_bound = !(unbound & leonida::GraphicsPipeline::unbound_depth);
         VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
         rendering.colorAttachmentCount = std::uint32_t(colors.size());
@@ -5978,34 +5988,39 @@ private:
     // HACK (Leonida CE): built in the background. The first draws that need it get VK_NULL_HANDLE and are left out
     // (the replay skips them) while a pool of compile threads builds it; compiling at the draw froze the frame for
     // every new pipeline. LEONIDA_CE_SYNC_PSO=1 compiles at the draw again.
-    VkPipeline variant(std::uint32_t unbound) {
+    VkPipeline variant(std::uint32_t unbound) { return variant(VariantKey{unbound, {}}); }
+    VkPipeline variant(const VariantKey& key) {
+        const std::uint32_t unbound = key.first;
+        bool overridden = false;
+        for (VkFormat f : key.second) overridden |= f != VK_FORMAT_UNDEFINED;
+        const VkFormat* overrides = overridden ? key.second.data() : nullptr;
         static const bool sync = [] {
             char v[8] = {};
             return GetEnvironmentVariableA("LEONIDA_CE_SYNC_PSO", v, sizeof(v)) && v[0] == '1';
         }();
         std::unique_lock lock(variants_mutex_);
-        if (const auto it = variants_.find(unbound); it != variants_.end()) return it->second;
+        if (const auto it = variants_.find(key); it != variants_.end()) return it->second;
         if (sync) {
-            const VkPipeline pipeline = build(unbound);
+            const VkPipeline pipeline = build(unbound, overrides);
             leonida::ce::name_pipeline(pipeline, ce_name_);
             if (!pipeline) {
                 log_once("a pipeline variant for unbound attachment slots could not be built; slots", int(unbound));
                 return VK_NULL_HANDLE;
             }
-            variants_.emplace(unbound, pipeline);
+            variants_.emplace(key, pipeline);
             return pipeline;
         }
-        if (!pending_.insert(unbound).second) return VK_NULL_HANDLE;  // already queued
+        if (!pending_.insert(key).second) return VK_NULL_HANDLE;  // already queued
         static_cast<ID3D12PipelineState*>(this)->AddRef();  // released by the compile job
         lock.unlock();
-        compile_pool().post([this, unbound] {
-            const VkPipeline pipeline = build(unbound);
+        compile_pool().post([this, key, unbound, overridden] {
+            const VkPipeline pipeline = build(unbound, overridden ? key.second.data() : nullptr);
             leonida::ce::name_pipeline(pipeline, ce_name_);
             {
                 std::lock_guard l(variants_mutex_);
-                pending_.erase(unbound);
+                pending_.erase(key);
                 // A failure stays in the map as VK_NULL_HANDLE: its draws are left out, nothing retries.
-                variants_.emplace(unbound, pipeline);
+                variants_.emplace(key, pipeline);
             }
             if (!pipeline) log_once("a graphics pipeline could not be built; unbound slots", int(unbound));
             static std::atomic<std::uint64_t> built{0};
@@ -6057,9 +6072,9 @@ private:
     leonida::GraphicsPipeline graphics_;
     Recipe recipe_;
     std::mutex variants_mutex_;
-    std::map<std::uint32_t, VkPipeline> variants_;
+    std::map<VariantKey, VkPipeline> variants_;
     std::string ce_name_;  // HACK (agA12): shader names, for NV checkpoints
-    std::set<std::uint32_t> pending_;  // variants queued for a background build
+    std::set<VariantKey> pending_;  // variants queued for a background build
     VkShaderModule module_ = VK_NULL_HANDLE;
     std::shared_ptr<AsyncCompute> async_job_;  // HACK (Leonida CE boot): background compute compile
     std::vector<VkPipeline> retired_;          // placeholders replaced by their real pipeline
