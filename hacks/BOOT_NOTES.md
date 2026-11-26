@@ -2402,3 +2402,15 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
 - rt37 Aftermath (main session): "Reset", vertex_01 (size 89600) 142 active warps @0x9260, FAULTED WARP "Misaligned
   Address Error" in vertex_01 @0x9220 => the compute PTR_ALIGN case, now in a VERTEX shader (VS_TransformPreSkin_
   VfxVBuffer). rt38.env sets LEONIDA_CE_PTR_ALIGN_GFX=1 (all graphics modules; same cold compile as the layout change).
+- rt38 (build 131 + rt38.env: BINDLESS_2D=262144 / 2DA=8192 / 3D=1024, PTR_ALIGN_GFX=1, UPLOAD_3D, 3D_TWIN, STANDIN_UPLOAD;
+  cold compile): *** LONGEST RUN: NO device loss, NO AV in 1800 s, frame 6120+ *** ("bindless set: 262144 2D, 8192
+  2D-array, 1024 3D"; only the 1D table (256) filled; 3D_TWIN 0 "NO common index"). States 9/10/11 at t~736 (cold
+  compile). Pace 3-8 s/60 frames 3400-5520, then 21.9 s at 5820 and 158 s at 6120 (a late crawl again). Frames 3000-5800
+  flat dark / navy; from ~5950 the teal 64-px noise layer WITH a GTA help box "(L) Move ... / (R) Move the camera"
+  (VM shot rt38v/s14.ppm 05:37; most glyphs missing) => GAMEPLAY (the control tutorial) has started, under the noise
+  (Likely). The noise is NOT the full tables, the 3D twin or the 3D uploads (all on here).
+  PTR_ALIGN_GFX=1 (all graphics) is the probable reason the VS misaligned-address hang (rt37) did not come back.
+- NEXT (agA32): (1) the 64-px full-scale noise layer over the game view (find the full-screen pass: LIST_TIME / checkpoint
+  names of the last full-screen draws before the UI; DIAG_TEX on the 64x64 2D-array SRVs too); (2) the late crawl past
+  frame ~5800 (HANG_SAMPLE with gta6rt-131.pdb); (3) glyph cache (help text glyphs missing); (4) stand-in / bindless
+  leak (entries never freed while g_placed holds every stand-in).
