@@ -2399,3 +2399,6 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
      New defaults on: PLACED_INDEX, ARENA_BUCKETS, TRACKER_UNDO, PLACED_RESTAND, REFRESH_CURRENT, SKIP_BAD_COPY (with
      SKIP_BAD=1). Opt-in used: RT_RETARGET=2, STANDIN_UPLOAD=1, NV_DIAG=0x2, LOOP_CAP_GFX/PTR_ALIGN_GFX +HairStrand,
      3D_TWIN=1, UPLOAD_3D=1, BINDLESS_*.
+- rt37 Aftermath (main session): "Reset", vertex_01 (size 89600) 142 active warps @0x9260, FAULTED WARP "Misaligned
+  Address Error" in vertex_01 @0x9220 => the compute PTR_ALIGN case, now in a VERTEX shader (VS_TransformPreSkin_
+  VfxVBuffer). rt38.env sets LEONIDA_CE_PTR_ALIGN_GFX=1 (all graphics modules; same cold compile as the layout change).
