@@ -1353,6 +1353,22 @@ void xs_upload_placed_texture(ID3D12Device* dev, const D3D12_RESOURCE_DESC& cons
                               std::uint64_t va, bool force = false) {
     ID3D12CommandQueue* queue = g_upload_queue.load();
     if (!queue || !tex || console_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return;
+    // FIX candidate (agA28): depth/stencil targets placed in title memory are written by the GPU only; uploading (and every
+    // 30-frame refresh re-uploading) their title bytes copies into the depth image, and the Aftermath Copy Engine write
+    // faults (rt3/rt4) sit exactly at the end of a D32 2560x1440 depth image's own VA mapping. Skipped by default;
+    // LEONIDA_CE_UPLOAD_DS=1 uploads them as before.
+    static const bool upload_ds = [] { const char* v = std::getenv("LEONIDA_CE_UPLOAD_DS"); return v && v[0] == 0x31; }();
+    if (!upload_ds && (console_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) {
+        static std::atomic<std::uint64_t> skipped{0};
+        const auto k = ++skipped;
+        if (k <= 4 || (k & (k - 1)) == 0) {
+            std::fprintf(stderr, "[hack] UPLOAD_DS: placed depth/stencil texture %llux%u fmt %d at va %llx not uploaded from title memory (%llu so far)\n",
+                         (unsigned long long)console_desc.Width, console_desc.Height, (int)console_desc.Format, (unsigned long long)va,
+                         (unsigned long long)k);
+            std::fflush(stderr);
+        }
+        return;
+    }
     {
         std::lock_guard lock(g_uploaded_mu);
         if (!g_uploaded.insert(tex).second && !force) return;
