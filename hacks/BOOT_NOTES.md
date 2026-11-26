@@ -2107,3 +2107,17 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   count stayed at 611 during the whole press window (landing ran 6.9 s/60 frames, compiles avg 8.2 s), so no press
   registered and 3->13 never came; frame_010000 = the landing UI (ACCOUNT PICKER / PLAYER). Fix: more presses
   (rt19.env: A@s3+8/10x40).
+- rt19 (build 106 + PTR_ALIGN, A@s3+8/10x40): A registered (13->0 t=550.6); lived ~860 s after the press (longest yet).
+  Loss = PAGE FAULT (not a hang): compute READ, Faulted Warp "MMU Fault Error" in cs_bedf0201 (image_load_mip +
+  image_store), VA 0x1796b56000 = +0x26000 from a live 256x256 BC3 9-mip image (0x15e00 bytes, mapped 0x20000; the next
+  64 KiB is a hole). Aftermath named a destroyed 5.4 MiB staging buffer only because it was the last thing mapped there.
+  Cause (Likely): the T# names another format (uint view for a BC compress/mip kernel); vulkan_view_format() gives a view of
+  another size class on a non-mutable image, extent = image texels => NVIDIA reads past the image (SRV/UAV twin of rt12).
+- Build 108 (7c332a6d9): VIEW_FMT_GUARD (refuse T# views whose texel/block size differs from the image; =0 old) and
+  GUARD_SLOT_HASH (VSHARP_GUARD_ALL hit slot = FNV-1a(name) % 16384 instead of compile order; the order-based slot made the
+  compute SPIR-V differ every run => cache misses, 8-20 s compiles on "warm" runs). rt20 tests both.
+- Translator note (tools/rdna2spirv.py): buffer_load / buffer_store of dwords are "byte exact" (addr = V#.base + offsets,
+  OpLoad %uint ... Aligned 4) with no handling for a base that is not 4-aligned, while buffer_load_sub and
+  buffer_load_format already split into an aligned dword + byte shift. PTR_ALIGN rounds such addresses down (it stops the
+  trap but returns the aligned dword, not the unaligned one RDNA's unaligned mode would give). The exact fix is in the
+  translator (two aligned loads + funnel shift for b3 != 0; read-modify-write for stores), which means regenerating SPIR-V.
