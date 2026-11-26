@@ -28,6 +28,7 @@
 #include <system_error>
 #include <vector>
 
+#include <cstring>
 #include "base_reservation.h"
 #include "code_hooks.h"
 #include "host_cpu.h"
@@ -65,6 +66,51 @@ int usage() {
 }  // namespace
 
 namespace {
+// agA28: "module+offset" (or game+offset) of a code address, for the crash stack.
+void ce_name_address(std::uint64_t a, char* out, std::size_t n) {
+    if (a >= 0x140000000ull && a < 0x147000000ull) {
+        std::snprintf(out, n, "game+0x%llx", static_cast<unsigned long long>(a - 0x140000000ull));
+        return;
+    }
+    HMODULE m = nullptr;
+    char path[MAX_PATH] = "";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(a), &m) && m && GetModuleFileNameA(m, path, MAX_PATH)) {
+        const char* base = std::strrchr(path, 0x5c);
+        std::snprintf(out, n, "%s+0x%llx", base ? base + 1 : path,
+                      static_cast<unsigned long long>(a - reinterpret_cast<std::uint64_t>(m)));
+        return;
+    }
+    std::snprintf(out, n, "0x%llx", static_cast<unsigned long long>(a));
+}
+// agA28: the faulting thread's stack from the exception context (rt6/rt8/rt11 died in a host routine reading title memory
+// with no caller known). No C++ objects here: a __try frame; a fault inside the walk ends it.
+void ce_crash_stack(const CONTEXT* ctx) {
+    __try {
+        CONTEXT c = *ctx;
+        for (int i = 0; i < 32 && c.Rip; ++i) {
+            char name[192];
+            ce_name_address(c.Rip, name, sizeof(name));
+            std::fprintf(stderr, "[error]   #%d %s (rsp 0x%llx)\n", i, name, static_cast<unsigned long long>(c.Rsp));
+            DWORD64 image_base = 0;
+            PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(c.Rip, &image_base, nullptr);
+            if (!fn) {  // leaf: the return address is at [rsp]
+                c.Rip = *reinterpret_cast<const DWORD64*>(c.Rsp);
+                c.Rsp += 8;
+                continue;
+            }
+            void* handler_data = nullptr;
+            DWORD64 establisher = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, c.Rip, fn, &c, &handler_data, &establisher, nullptr);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        std::fprintf(stderr, "[error]   <stack walk faulted>\n");
+    }
+    std::fflush(stderr);
+}
+}  // namespace
+
+namespace {
 // Leonida CE: the last word before an unhandled crash (any thread). It only reports; the crash then goes on as before
 // (Wine's debugger / Windows error reporting, and the trace's "exception" record).
 LONG WINAPI ce_last_words(EXCEPTION_POINTERS* info) {
@@ -82,6 +128,7 @@ LONG WINAPI ce_last_words(EXCEPTION_POINTERS* info) {
     std::fprintf(stderr, "[error] I have fallen, and I can't get up! exception 0x%08lx at %s%s (thread %lx)\n",
                  r ? static_cast<unsigned long>(r->ExceptionCode) : 0ul, where, detail, GetCurrentThreadId());
     std::fflush(stderr);
+    if (info && info->ContextRecord) ce_crash_stack(info->ContextRecord);  // agA28
     return EXCEPTION_CONTINUE_SEARCH;
 }
 }  // namespace
