@@ -1156,6 +1156,7 @@ bool xs_placed_indexed() { return xs_placed_index_mode() >= 1 && !xs_placed_evic
 ce_placed::PaintIndex g_placed_paint;                       // va -> newest record covering it
 ce_placed::ContainIndex g_placed_buffers;                   // buffer records, for placed_buffer_holds
 std::unordered_map<const void*, std::size_t> g_placed_res;  // resource -> newest record
+std::unordered_multimap<std::uint64_t, std::size_t> g_placed_tex_at;  // texture records by start (PLACED_RESTAND)
 std::atomic<std::uint64_t> g_placed_xchecks{0}, g_placed_xbad{0};
 bool xs_placed_xcheck_now() {  // under g_placed_mu
     if (xs_placed_index_mode() < 2) return false;
@@ -1215,6 +1216,7 @@ void xs_record_placed(std::uint64_t va, std::uint64_t size, ID3D12Resource* reso
             g_placed_paint.add(e.va, e.size, idx);
             g_placed_res[e.resource] = idx;
             if (e.desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) g_placed_buffers.add(e.va, e.size);
+            else g_placed_tex_at.emplace(e.va, idx);
         }
         // agA13: LEONIDA_CE_PLACED_CAP=N keeps at most N of the runtime's own slot-70/71 stand-ins (re31 census: they
         // are the arena growth, +0x83b94 = proxy_slot<70>, ~8k per minute at fresh VAs); the oldest live one goes first.
@@ -1312,6 +1314,23 @@ const XsPlaced* xs_find_placed_scan(std::uint64_t va) {
     for (auto it = g_placed.rbegin(); it != g_placed.rend(); ++it)
         if (va >= it->va && va < it->va + it->size) return &*it;
     return nullptr;
+}
+// agA31 PLACED_RESTAND: the newest texture record that starts at va with exactly this description (no PLACED_EVICT).
+bool xs_same_tex_desc(const D3D12_RESOURCE_DESC& a, const D3D12_RESOURCE_DESC& b) {
+    return a.Dimension == b.Dimension && a.Width == b.Width && a.Height == b.Height &&
+           a.DepthOrArraySize == b.DepthOrArraySize && a.Format == b.Format && a.MipLevels == b.MipLevels;
+}
+const XsPlaced* xs_find_placed_tex(std::uint64_t va, const D3D12_RESOURCE_DESC& d) {
+    std::lock_guard lock(g_placed_mu);
+    if (xs_placed_evict()) return nullptr;
+    const XsPlaced* best = nullptr;
+    std::size_t best_idx = 0;
+    const auto [lo, hi] = g_placed_tex_at.equal_range(va);
+    for (auto it = lo; it != hi; ++it) {
+        const XsPlaced& e = g_placed[it->second];
+        if (e.resource && xs_same_tex_desc(e.desc, d) && (!best || it->second > best_idx)) { best = &e; best_idx = it->second; }
+    }
+    return best;
 }
 const XsPlaced* xs_find_placed(std::uint64_t va) {
     std::lock_guard lock(g_placed_mu);
@@ -5356,6 +5375,38 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         std::uint64_t va = 0;
         std::memcpy(&va, vbytes + 40, sizeof va);
         const XsPlaced* placed = va ? xs_find_placed(va) : nullptr;
+        const XsPlaced* restand_from = nullptr;  // agA31: the stale record, used again if no stand-in can be made
+        // HACK (agA31, LEONIDA_CE_PLACED_RESTAND, default 1; =0 old): the newest record at va may be a TEXTURE the
+        // title had at that address before (it reused the memory: texture pool / streaming). Viewing the old
+        // resource with the new view made VIEW_FMT_GUARD refuse it (rt29: 37k refusals, BC1 image viewed as BC7, ...)
+        // and the descriptor fell back to index 0, or showed the old texture. A texture request whose description
+        // differs from such a record (or starts elsewhere) gets a fresh stand-in, recorded as the newest (the old one
+        // stays alive: older descriptors may still use it). =2 also re-stands texture requests that land in a BUFFER
+        // record (off by default: the newer texture record would then hide that buffer from CBV_FIX lookups).
+        if (placed && va && rdesc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+            static const int restand = [] { const char* e = std::getenv("LEONIDA_CE_PLACED_RESTAND"); return e && e[0] ? std::atoi(e) : 1; }();
+            const D3D12_RESOURCE_DESC& o = placed->desc;
+            const bool old_tex = o.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && o.Dimension != D3D12_RESOURCE_DIMENSION_UNKNOWN;
+            const bool differs = placed->va != va || !xs_same_tex_desc(o, *rdesc);
+            if (differs && ((restand >= 1 && old_tex) || (restand >= 2 && !old_tex))) {
+                static std::atomic<std::uint64_t> n{0};
+                const std::uint64_t k = ++n;
+                if (k <= 24 || (k & (k - 1)) == 0) {
+                    std::fprintf(stderr, "[hack] PLACED_RESTAND #%llu %s va %llx: record @%llx dim %d %llux%ux%u fmt %d mips %u -> "
+                                 "request dim %d %llux%ux%u fmt %d mips %u\n", (unsigned long long)k, Slot == 70 ? "SRV" : "UAV",
+                                 (unsigned long long)va, (unsigned long long)placed->va, (int)o.Dimension, (unsigned long long)o.Width,
+                                 o.Height, (unsigned)o.DepthOrArraySize, (int)o.Format, (unsigned)o.MipLevels, (int)rdesc->Dimension,
+                                 (unsigned long long)rdesc->Width, rdesc->Height, (unsigned)rdesc->DepthOrArraySize, (int)rdesc->Format,
+                                 (unsigned)rdesc->MipLevels);
+                    std::fflush(stderr);
+                }
+                // an earlier record of exactly this texture at va (two descriptions alternating at one address must
+                // not make a stand-in per view)
+                const XsPlaced* same = xs_find_placed_tex(va, *rdesc);
+                restand_from = placed;
+                placed = same;
+            }
+        }
         if (!placed && va) {  // not from slot 133: make a stand-in from the description and remember it
             D3D12_RESOURCE_DESC d = *rdesc;
             d.Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<unsigned>(d.Flags) & 0xffu);
@@ -5373,6 +5424,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                 placed = xs_find_placed(va);
             }
         }
+        if (!placed) placed = restand_from;  // agA31
         static std::atomic<int> logged{0};
         if (logged++ < 8) {
             std::fprintf(stderr, "[hack] placed %s: va=%llx dim=%d %llux%u fmt=%d -> %s\n", Slot == 70 ? "SRV" : "UAV",
