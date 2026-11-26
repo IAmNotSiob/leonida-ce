@@ -2060,3 +2060,50 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   a bigger texel size makes the ROP address a bigger surface.
 - Build 104 (622848832): RT_FMT_GUARD (draws whose PSO attachment format differs in texel size / depth aspects from the image
   are left out; default on, =0 old) + draw scissor clamped to the render area. rt13 = its test.
+
+## agA29 (sender gen 29, 2026-11-26 overnight)
+- Receiver = the main session. Builds 105+.
+- rt13 (build 104) INCONCLUSIVE: boot state 0->1 took 317 s (55 s in rt12); the pipeline cache was warm (loaded exactly what rt12
+  saved, +10 MB as usual), but background compute compiles averaged 7.6 s (0.5 s in rt12; 428 over 2 s vs 50-67). Not our code:
+  builds 102-104 touch no shader/pipeline code, and the scissor clamp is dynamic state. rt14 (same build) booted normally.
+- rt14 (build 104, 900 s): RT_FMT_GUARD 2048+ draws left out: colour slot 0 image fmt 97 (R16G16B16A16_SFLOAT, 2560x1440 and
+  128x128) / 101 (R32G32_UINT) / 16 (R8G8_UNORM) viewed as PSO fmt 37 (R8G8B8A8_UNORM). No fmt 76 640x360 line, no ROP fault,
+  no CE fault (DS_XFMT_STAGE 5x). HANG at frame 2183, device lost t=394.8 (227 s after 13->0), Aftermath "Reset", 14 warps at one
+  PC; direct checkpoints top cs_d9ea3225 / bottom cs_00f50ab8. cs_d9ea3225 is loop-free (no backward branch / barrier / atomic in
+  RDNA, 0 OpLoopMerge in SPIR-V; plain buffer loads/stores) => memory/corruption, not a spin (Likely).
+- Build 105 (072e4fb0e): RT_RETARGET - instead of skipping, a colour slot whose texel size differs from the PSO RTV format is
+  viewed in the IMAGE format with a pipeline variant built for that format (GraphicsPipeline::retarget; variants keyed by
+  (unbound mask, format overrides), background-built). Same numeric class only; depth mismatches still skipped. =0 old.
+  Rationale: on the console the CB format comes from the RTV (resource), the PSO only sets the export format (Plausible).
+- GUARD GAP (Plausible as the hang cause): VSHARP_GUARD_ALL sinks pointers >= heap_base + 0x1000000000; the POOL_GPU=1 adjacent
+  sparse buffer (unbound: reads 0, writes dropped) covers heap_base + [0xffe00000, 0xdc00e0000). VA [0xdc00e0000, 0x1000000000)
+  is raw driver VA: rt14 had 9397 live memory/image ranges there (rt12's ROP-fault R16F target 0x120f140000 = VA 0xf0f130000
+  is inside it), and the title's placed buffers' raw VAs 0xd9..-0xe3.. land in it. Env-only fix: LEONIDA_CE_POOL_GPU_END=
+  0x1000000000 grows the sparse buffer to reach the guard limit (no shader change). rt16 tests it.
+- rt15 (build 105): RT_RETARGET works (222 retargeted, 0 variant failures; fmt 101 R32G32_UINT vs 37 still left out, class
+  mismatch). HANG again at frame 2348, loss t=394.6 (189 s after 13->0), checkpoint cs_edc5d4c7 (loop-free too), Aftermath
+  "compute_01" size 215296 @0x4e80 = the same shader/PC as rs11.
+- rt16 (build 105 + POOL_GPU_END=0x1000000000): cover took (0xf40200000 bytes, COVERS); STILL hangs (frame 2222, pace collapse,
+  checkpoints compute cs_c5b1005e / cs_344692c2 / cs_752cc8dc). The guard gap is not the hang cause (Likely); keep or drop.
+- ROOT CAUSE CANDIDATE (Likely): every hang dump rt14/rt15/rt16 has an Aftermath "Faulted Warps: Misaligned Address Error"
+  just before the parked warps (PC 0xcac0/0xcb00, 0x4de0/0x4e80, 0x51d0/0x5200). The translator emits u32 "Aligned 4" PSB
+  accesses at heap_base + VA + k; RDNA scalar loads drop the 2 low bits and buffer ops run unaligned, NVIDIA traps and the
+  trapped warp hangs the queue. Guard warnings show non-4-aligned bases (0x...63e, 0x...6be).
+- Build 106 (a5f101c67): LEONIDA_CE_PTR_ALIGN=1 (default off, compute only): VSHARP_GUARD_ALL ANDs each guarded pointer with
+  ~(pointee scalar size - 1). spirv-val clean (400 modules + hang shaders). Offline harness /root/a29/gt.cpp. rt17 tests it.
+- rt17 (build 106 + PTR_ALIGN=1, 1200 s): cold compute recompile (1594 compiles, avg 20.6 s; 13->0 at t=536.9). NO device
+  loss before the cap; post-press frames before the stall: rt14 563, rt15 488, rt16 479, rt17 1461 (~630 s after the press).
+  At the very end the direct queue's first ticket sat 31 s "stalled INSIDE its command buffer" = the hang signature again,
+  cut by the cap before TDR (no Aftermath). => PTR_ALIGN fixes the compute misaligned traps (Likely); a later hang remains,
+  maybe a GRAPHICS module (not aligned) -> build 107 LEONIDA_CE_PTR_ALIGN_GFX=1 (recompiles every graphics pipeline).
+- Pace: 2-3 s/60 frames before the press, 11-20 s/60 after (transition, not a leak). The arena does leak: 0 releases ever,
+  live 1333 -> 2096 MiB, largest free block 2753 -> 1892 MiB over ~660 s of gameplay (placed resources never give back arena
+  space; caller +0x84612 66k buffers / 911 MiB). That fills the 4 GiB arena in roughly 20-30 more minutes: a future blocker.
+- The GPU box hard-reset at ~22:13 (no Xid/panic; not from a run or build).
+- Build 107 (84b8eca4e): LEONIDA_CE_PTR_ALIGN_GFX=1 (with PTR_ALIGN=1) aligns graphics modules too. Default off.
+- rt17 frames (/root/rb/rt17_frames): frame_004096 and frame_006000 (~540 frames after the A) are flat navy #20202C: no new
+  screen yet (same as since agA8).
+- rt18 (build 106, rt17 env, after the host reset): NOT A TEST. All 6 A presses fired at s3+8.., but the title's reading
+  count stayed at 611 during the whole press window (landing ran 6.9 s/60 frames, compiles avg 8.2 s), so no press
+  registered and 3->13 never came; frame_010000 = the landing UI (ACCOUNT PICKER / PLAYER). Fix: more presses
+  (rt19.env: A@s3+8/10x40).
