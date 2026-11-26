@@ -2415,6 +2415,16 @@ public:
                 hold(std::move(op));
             } else {
                 ok = submit(VK_NULL_HANDLE, fence, value);
+                // HACK (agA28, LEONIDA_CE_FENCE_PIN, default on; =0 restores the old behaviour): an unheld Signal also
+                // keeps the fence until its submission has completed on the GPU. Before, nothing held it: a title that
+                // released the fence right after Signal destroyed the VkSemaphore under a pending GPU signal
+                // (VUID-vkDestroySemaphore-semaphore-05149); on a COPY queue the Copy Engine then writes the semaphore
+                // payload into freed driver memory (the Aftermath "Copy Engine write, failed to translate" loss).
+                static const bool fence_pin_on = [] {
+                    const char* e = std::getenv("LEONIDA_CE_FENCE_PIN");
+                    return !e || e[0] != 0;
+                }();
+                if (ok && pin && fence_pin_on) pin_queue_.push_back({submitted_, pin()});
             }
             drain_pins(retired);
         }

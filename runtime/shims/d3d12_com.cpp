@@ -1634,7 +1634,23 @@ public:
         : context_(context), fence_(context, initial), flags_(flags), highest_(initial) {}
 
     // As in D3D12, releasing the fence completes the waits still pending on it (ALL counts it as one fence).
-    ~Fence() override { context_.cancel_fence_waits(fence_.semaphore()); }
+    ~Fence() override {
+        // agA28: a fence destroyed while a queue signal of it is still pending on the GPU destroys its VkSemaphore under
+        // the GPU (LEONIDA_CE_FENCE_PIN=0, or a path that does not pin). Counted; the first 8 and powers of two logged.
+        if (!context_.is_device_lost() && queued_ && fence_.semaphore()) {
+            const std::uint64_t done = fence_.completed();
+            if (done < queued_) {
+                static std::atomic<std::uint64_t> n{0};
+                const auto k = ++n;
+                if (k <= 8 || (k & (k - 1)) == 0) {
+                    std::fprintf(stderr, "[hack] FENCE_EARLY: fence %p destroyed with GPU signal %llu pending (completed %llu; %llu so far)\n",
+                                 (void*)this, (unsigned long long)queued_, (unsigned long long)done, (unsigned long long)k);
+                    std::fflush(stderr);
+                }
+            }
+        }
+        context_.cancel_fence_waits(fence_.semaphore());
+    }
 
     bool ok() const { return fence_.semaphore() != VK_NULL_HANDLE; }
     VkSemaphore semaphore() const { return fence_.semaphore(); }
@@ -1764,7 +1780,19 @@ public:
     static leonida::VulkanQueue::PinFn fence_pin(ID3D12Fence* fence) {
         return [fence]() -> std::shared_ptr<void> {
             fence->AddRef();
-            return std::shared_ptr<void>(fence, [](void* held) { static_cast<ID3D12Fence*>(held)->Release(); });
+            return std::shared_ptr<void>(fence, [](void* held) {
+                // agA28: count the fences whose last reference was this pin (the title released them while the queue
+                // still used them; without the pin their VkSemaphore would have been destroyed under the GPU).
+                if (static_cast<ID3D12Fence*>(held)->Release() == 0) {
+                    static std::atomic<std::uint64_t> n{0};
+                    const auto k = ++n;
+                    if ((k & (k - 1)) == 0) {
+                        std::fprintf(stderr, "[hack] FENCE_PIN: a queue pin dropped the last reference of a fence (%llu so far)\n",
+                                     (unsigned long long)k);
+                        std::fflush(stderr);
+                    }
+                }
+            });
         };
     }
 
