@@ -104,9 +104,13 @@ inline int spirv_guard_va(std::vector<std::uint32_t>& words, std::uint64_t windo
 // hits != 0 (compute only: graphics stages may lack the store feature): on a trip, a small selection stores into the
 // 16-byte record at heap_base + hits: atomic count (+0), low (+4) and high (+8) dword of the bad pointer. Sites in a
 // loop header block are guarded without recording (splitting the block would move OpLoopMerge out of the header).
+// agA29 (align, LEONIDA_CE_PTR_ALIGN=1): every guarded pointer is also rounded DOWN to its pointee's scalar size (4 bytes
+// for 32-bit, 8 for 64-bit, 2 for 16-bit; 8-bit untouched). RDNA scalar loads drop the 2 low address bits and its buffer
+// ops run in unaligned mode, so the console tolerates misaligned bases; NVIDIA traps ("Misaligned Address Error"), and a
+// trapped warp hangs the queue (rt14 / rt15 / rt16: every hang had one such faulted warp in Aftermath).
 // Returns the number of pointers guarded (0: unchanged).
 inline int spirv_guard_ptr_all(std::vector<std::uint32_t>& words, std::uint64_t limit, std::uint64_t sink = 0,
-                               std::uint64_t hits = 0) {
+                               std::uint64_t hits = 0, bool align = false, int* aligned_out = nullptr) {
     constexpr std::uint16_t op_type_int = 21, op_type_bool = 20, op_constant = 43, op_function = 54, op_iadd = 128,
                             op_isub = 130, op_convert_u_to_ptr = 120, op_ult = 176, op_select = 169, op_label = 248,
                             op_loop_merge = 246, op_phi = 245, op_type_pointer = 32, op_lnot = 168, op_sel_merge = 247,
@@ -136,9 +140,15 @@ inline int spirv_guard_ptr_all(std::vector<std::uint32_t>& words, std::uint64_t 
     std::unordered_map<std::uint32_t, std::size_t> def;  // result id -> instruction index (typed ops in functions)
     std::vector<std::uint32_t> block_of(insts.size(), 0);  // label of the block holding each instruction
     std::unordered_map<std::uint32_t, bool> loop_header;
+    std::unordered_map<std::uint32_t, std::uint32_t> scalar_bytes, pointee;  // agA29 align: type id -> bytes / pointer -> pointee
     std::uint32_t label = 0;
     for (std::size_t i = 0; i < insts.size(); ++i) {
         const std::uint32_t* w = &words[insts[i].at];
+        if ((insts[i].op == 21 || insts[i].op == 22) && insts[i].count >= 3) scalar_bytes[w[1]] = w[2] / 8;  // OpTypeInt / OpTypeFloat
+        if (insts[i].op == 23 && insts[i].count == 4 && scalar_bytes.count(w[2])) scalar_bytes[w[1]] = scalar_bytes[w[2]];  // vector
+        if (insts[i].op == 29 && insts[i].count == 3 && scalar_bytes.count(w[2])) scalar_bytes[w[1]] = scalar_bytes[w[2]];  // runtime array
+        if (insts[i].op == 28 && insts[i].count == 4 && scalar_bytes.count(w[2])) scalar_bytes[w[1]] = scalar_bytes[w[2]];  // array
+        if (insts[i].op == op_type_pointer && insts[i].count == 4) pointee[w[1]] = w[3];
         if (insts[i].op == op_type_int && insts[i].count == 4 && w[2] == 64 && w[3] == 0 && !t_u64) t_u64 = w[1];
         if (insts[i].op == op_type_int && insts[i].count == 4 && w[2] == 32 && w[3] == 0 && !t_u32) t_u32 = w[1];
         if (insts[i].op == op_type_bool && !t_bool) t_bool = w[1];
@@ -177,6 +187,15 @@ inline int spirv_guard_ptr_all(std::vector<std::uint32_t>& words, std::uint64_t 
     std::vector<std::uint32_t> decls = {(5u << 16) | op_constant, t_u64, c_lim, std::uint32_t(limit + low), std::uint32_t((limit + low) >> 32),
                                         (5u << 16) | op_constant, t_u64, c_low, std::uint32_t(low), std::uint32_t(low >> 32),
                                         (5u << 16) | op_constant, t_u64, c_sink, std::uint32_t(sink), std::uint32_t(sink >> 32)};
+    std::uint32_t c_mask[9] = {};  // agA29 align: ~(bytes - 1) for bytes 2, 4, 8
+    if (align)
+        for (std::uint32_t b : {2u, 4u, 8u}) {
+            c_mask[b] = bound++;
+            const std::uint64_t m = ~std::uint64_t(b - 1);
+            const std::uint32_t c[] = {(5u << 16) | op_constant, t_u64, c_mask[b], std::uint32_t(m), std::uint32_t(m >> 32)};
+            decls.insert(decls.end(), std::begin(c), std::end(c));
+        }
+    int aligned = 0;
     std::uint32_t t_ptr = 0, c_hits = 0, c_hits4 = 0, c_hits8 = 0, c_32 = 0, c_scope = 0, c_sem = 0;
     if (hits) {
         t_ptr = bound++; c_hits = bound++; c_hits4 = bound++; c_hits8 = bound++; c_32 = bound++; c_scope = bound++; c_sem = bound++;
@@ -197,11 +216,26 @@ inline int spirv_guard_ptr_all(std::vector<std::uint32_t>& words, std::uint64_t 
         const std::uint32_t p = words[insts[i].at + 3];
         if (p == hb) continue;
         const std::uint32_t rel0 = bound++, rel = bound++, ok = bound++, sk = bound++, safe = bound++;
+        std::uint32_t mask = 0;
+        if (align) {
+            const auto pt = pointee.find(words[insts[i].at + 1]);
+            const auto sb = pt == pointee.end() ? scalar_bytes.end() : scalar_bytes.find(pt->second);
+            if (sb != scalar_bytes.end() && (sb->second == 2 || sb->second == 4 || sb->second == 8)) mask = c_mask[sb->second];
+        }
+        const std::uint32_t pm = mask ? bound++ : p;
         std::vector<std::uint32_t> v = {(5u << 16) | op_isub, t_u64, rel0, p, hb,
                                         (5u << 16) | op_iadd, t_u64, rel, rel0, c_low,
                                         (5u << 16) | op_ult, t_bool, ok, rel, c_lim,
-                                        (5u << 16) | op_iadd, t_u64, sk, hb, c_sink,
-                                        (6u << 16) | op_select, t_u64, safe, ok, p, sk};
+                                        (5u << 16) | op_iadd, t_u64, sk, hb, c_sink};
+        if (mask) {
+            const std::uint32_t a[] = {(5u << 16) | 199u /* OpBitwiseAnd */, t_u64, pm, p, mask};
+            v.insert(v.end(), std::begin(a), std::end(a));
+            ++aligned;
+        }
+        {
+            const std::uint32_t s[] = {(6u << 16) | op_select, t_u64, safe, ok, pm, sk};
+            v.insert(v.end(), std::begin(s), std::end(s));
+        }
         const std::uint32_t blk = block_of[i];
         if (hits && blk && !loop_header.count(blk)) {
             const std::uint32_t bad = bound++, h = bound++, m = bound++, a0 = bound++, p0 = bound++, cnt = bound++,
@@ -247,6 +281,7 @@ inline int spirv_guard_ptr_all(std::vector<std::uint32_t>& words, std::uint64_t 
     }
     out[3] = bound;
     words.swap(out);
+    if (aligned_out) *aligned_out = aligned;
     return static_cast<int>(new_operand.size());
 }
 

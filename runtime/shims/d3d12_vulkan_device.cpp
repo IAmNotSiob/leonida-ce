@@ -1130,15 +1130,20 @@ static void ce_guard_all(std::vector<std::uint32_t>& words, const char* name, bo
         static bool started = false;
         if (!started) { started = true; std::thread(ce_guard_reader).detach(); }
     }
-    const int n = leonida::spirv_guard_ptr_all(words, limit, mapped ? kGuardSink : 0, hits);
-    static std::atomic<std::uint64_t> modules{0}, pointers{0}, untouched{0};
+    // agA29 (LEONIDA_CE_PTR_ALIGN=1, default off; compute modules only so graphics pipelines keep their cache entries):
+    // guarded pointers are rounded down to their pointee's scalar size (spirv_guard_ptr_all `align`).
+    static const bool align_on = [] { const char* e = std::getenv("LEONIDA_CE_PTR_ALIGN"); return e && e[0] == 0x31; }();
+    int aligned = 0;
+    const int n = leonida::spirv_guard_ptr_all(words, limit, mapped ? kGuardSink : 0, hits, align_on && compute, &aligned);
+    static std::atomic<std::uint64_t> modules{0}, pointers{0}, untouched{0}, aligned_all{0};
     if (!n) ++untouched; else { ++modules; pointers += std::uint64_t(n); }
+    aligned_all += std::uint64_t(aligned);
     const std::uint64_t k = modules.load() + untouched.load();
     static std::atomic<int> told{0};
     if ((n && told++ < 8) || (k & (k - 1)) == 0)
-        std::fprintf(stderr, "[hack] VSHARP_GUARD_ALL: %s: %d pointer(s) guarded%s (%llu modules guarded, %llu pointers, %llu without pointers)\n",
+        std::fprintf(stderr, "[hack] VSHARP_GUARD_ALL: %s: %d pointer(s) guarded%s (%llu modules guarded, %llu pointers, %llu without pointers, %llu aligned)\n",
                      name, n, hits ? ", hits recorded" : "", (unsigned long long)modules.load(), (unsigned long long)pointers.load(),
-                     (unsigned long long)untouched.load());
+                     (unsigned long long)untouched.load(), (unsigned long long)aligned_all.load());
 }
 
 namespace rt::d3d12 {
