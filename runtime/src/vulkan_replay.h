@@ -2236,6 +2236,39 @@ inline std::uint32_t agg_root_word(const std::array<std::uint32_t, 32>& u) {
     return 0;
 }
 
+// FIX candidate (agA28, LEONIDA_CE_RT_FMT_GUARD, default on; =0 = old): attachment views take the PSO's RTV/DSV format, not
+// the image's. A view whose texel size or aspects differ from a non-mutable image makes the ROP address the image as a
+// bigger surface: rt12 lost the device to a ROP READ 48 KiB past the end of an R16_SFLOAT 640x360 colour target (bound
+// 0x78000; fault at +0x8C000, inside 640x360x4). Such draws are left out (logged: first 8, then powers of two).
+inline bool rt_format_mismatch(VkFormat image_format, VkFormat view_format, VkImageAspectFlags aspect, std::size_t slot,
+                               const ResourceBinding& b) {
+    static const bool on = [] { const char* e = std::getenv("LEONIDA_CE_RT_FMT_GUARD"); return !e || e[0] != 0x30; }();
+    if (!on || image_format == view_format || image_format == VK_FORMAT_UNDEFINED || view_format == VK_FORMAT_UNDEFINED) return false;
+    bool bad = false;
+    if (aspect == VK_IMAGE_ASPECT_COLOR_BIT) {
+        bad = block_format(image_format, VK_IMAGE_ASPECT_COLOR_BIT).bytes != block_format(view_format, VK_IMAGE_ASPECT_COLOR_BIT).bytes;
+    } else {
+        const auto aspects_of = [](VkFormat f) -> VkImageAspectFlags {
+            switch (f) {
+            case VK_FORMAT_D16_UNORM: case VK_FORMAT_X8_D24_UNORM_PACK32: case VK_FORMAT_D32_SFLOAT: return VK_IMAGE_ASPECT_DEPTH_BIT;
+            case VK_FORMAT_S8_UINT: return VK_IMAGE_ASPECT_STENCIL_BIT;
+            default: return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+            }
+        };
+        bad = aspects_of(image_format) != aspects_of(view_format) ||
+              block_format(image_format, VK_IMAGE_ASPECT_DEPTH_BIT).bytes != block_format(view_format, VK_IMAGE_ASPECT_DEPTH_BIT).bytes;
+    }
+    if (!bad) return false;
+    static std::atomic<std::uint64_t> n{0};
+    const auto k = ++n;
+    if (k <= 8 || (k & (k - 1)) == 0) {
+        std::fprintf(stderr, "[hack] RT_FMT_GUARD: %s slot %zu image fmt %d (%ux%u) viewed as PSO fmt %d: draw left out (%llu so far)\n",
+                     aspect == VK_IMAGE_ASPECT_COLOR_BIT ? "colour" : "depth", slot, int(image_format), b.width, b.height,
+                     int(view_format), (unsigned long long)k);
+        std::fflush(stderr);
+    }
+    return true;
+}
 template<typename Resolve>
 ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunctions& vk, PreparedDraw& p) {
     if (!vk.graphics_pipeline || !vk.buffer_at || !vk.image_view || !vk.begin_rendering || !vk.end_rendering ||
@@ -2283,6 +2316,10 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         if (!view_range(a.binding, target, VK_IMAGE_ASPECT_COLOR_BIT, a.range)) return ReplayResult::invalid_subresource;
         ResourceBinding viewed = a.binding;
         if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED) viewed.format = pipeline->color_formats[slot];
+        if (rt_format_mismatch(a.binding.format, viewed.format, VK_IMAGE_ASPECT_COLOR_BIT, slot, a.binding)) {
+            p.skip = true;
+            return ReplayResult::success;
+        }
         a.view = vk.image_view(viewed, a.range);
         if (!a.view) return ReplayResult::unsupported;
         shrink(a.binding, target, a.range);
@@ -2298,6 +2335,10 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         if (!view_range(a.binding, draw.depth, a.binding.aspects, a.range)) return ReplayResult::invalid_subresource;
         ResourceBinding viewed = a.binding;
         viewed.format = pipeline->depth_format;
+        if (rt_format_mismatch(a.binding.format, viewed.format, VK_IMAGE_ASPECT_DEPTH_BIT, 99, a.binding)) {
+            p.skip = true;
+            return ReplayResult::success;
+        }
         a.view = vk.image_view(viewed, a.range);
         if (!a.view) return ReplayResult::unsupported;
         shrink(a.binding, draw.depth, a.range);
@@ -5082,9 +5123,12 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const VkViewport viewport{v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth};
             vk.set_viewport(command_buffer, 0, 1, &viewport);
             const Rect& s = draw->scissor;
-            const VkRect2D scissor{{std::max(0, s.left), std::max(0, s.top)},
-                                   {std::uint32_t(std::max(0, s.right - std::max(0, s.left))),
-                                    std::uint32_t(std::max(0, s.bottom - std::max(0, s.top)))}};
+            // agA28: clamped to the render area (D3D12 clips to the targets; Vulkan leaves rendering outside it undefined).
+            const std::int32_t sx = std::min<std::int32_t>(std::max(0, s.left), std::int32_t(d.area.width));
+            const std::int32_t sy = std::min<std::int32_t>(std::max(0, s.top), std::int32_t(d.area.height));
+            const std::int32_t sr = std::min<std::int32_t>(std::max(sx, s.right), std::int32_t(d.area.width));
+            const std::int32_t sb = std::min<std::int32_t>(std::max(sy, s.bottom), std::int32_t(d.area.height));
+            const VkRect2D scissor{{sx, sy}, {std::uint32_t(sr - sx), std::uint32_t(sb - sy)}};
             vk.set_scissor(command_buffer, 0, 1, &scissor);
             // A mesh pipeline has no input assembly: its topology comes from the shader, and neither the topology
             // nor primitive restart is dynamic state there (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065).
