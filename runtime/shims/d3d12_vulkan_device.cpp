@@ -17,6 +17,7 @@
 #include "page_alias.h"
 #include "dxgi_com.h"
 #include "../src/ce_checkpoints.h"
+#include "../src/ce_va_report.h"  // agA28: LEONIDA_CE_VA_REPORT
 #include "../src/arena_size.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/depth24_fragment.h"
@@ -11902,6 +11903,17 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                                 chosen_features.sparseResidencyAliased;
     auto picked = leonida::sparse_capable_queue_families(families, preferred, sparse_buffers);
     if (graphics_family_only(queue_test_settings)) picked = {info.queue_family, info.queue_family, info.queue_family};
+    // HACK (agA28): LEONIDA_CE_COPY_ON_DIRECT=1 puts D3D12 COPY queues on graphics-family VkQueues (no dedicated transfer
+    // family = no Copy Engine for title copies), to see whether the Aftermath Copy Engine write fault follows the copies.
+    {
+        char cv[8] = {};
+        std::size_t cl = 0;
+        if (getenv_s(&cl, cv, "LEONIDA_CE_COPY_ON_DIRECT") == 0 && cl > 1 && cv[0] == 1) {
+            std::fprintf(stderr, "[hack] COPY_ON_DIRECT: COPY queues use the graphics family %u (was %u)\n", info.queue_family,
+                         picked.copy);
+            picked.copy = info.queue_family;
+        }
+    }
     std::uint32_t compute_count = 0, copy_count = 0;
     if (picked.compute != info.queue_family) {
         info.compute_family = picked.compute;
@@ -12197,6 +12209,25 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         }
         std::fprintf(stderr, "[hack] device fault reporting: %s\n", want_fault ? "on" : "off");
     }
+    // HACK (agA28): LEONIDA_CE_VA_REPORT=<file> -> VK_EXT_device_address_binding_report (src/ce_va_report.h).
+    bool want_va_report = false;
+    if (leonida::ce::vareport::on()) {
+        want_va_report = info.debug_utils && std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+            return std::strcmp(e.extensionName, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME) == 0;
+        });
+        auto& vf = leonida::ce::vareport::features();
+        if (want_va_report) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &vf};
+            vkGetPhysicalDeviceFeatures2(info.physical, &query);
+            want_va_report = vf.reportAddressBinding == VK_TRUE;
+        }
+        if (want_va_report) {
+            vf.pNext = *v13.next();
+            *v13.next() = &vf;
+        }
+        std::fprintf(stderr, "[hack] VA_REPORT: device address binding report %s (debug_utils %d)\n",
+                     want_va_report ? "on" : "UNSUPPORTED", int(info.debug_utils));
+    }
 
     // Optional: VK_EXT_external_memory_host lets OpenExistingHeapFromAddress import the caller's committed memory as
     // the heap's backing, so the GPU reads what the CPU writes there without a copy.
@@ -12247,6 +12278,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (info.custom_border_color) device_extensions.push_back(custom_border_name);
     if (info.host_pointer_alignment) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     if (want_fault) device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+    if (want_va_report) device_extensions.push_back(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
     // HACK (agA12): LEONIDA_CE_CHECKPOINTS=1 -> VK_NV_device_diagnostic_checkpoints breadcrumbs (src/ce_checkpoints.h).
     bool want_checkpoints = false;
     {
@@ -12264,6 +12296,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
         return fail("vkCreateDevice failed");
     info.device = owned.device;
+    if (want_va_report) leonida::ce::vareport::install(owned.instance, info.get_instance_proc);
     if (want_fault) {
         static VkDevice fault_device = VK_NULL_HANDLE;
         static PFN_vkGetDeviceFaultInfoEXT get_fault = nullptr;
@@ -12287,6 +12320,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                 for (const auto& a : addrs)
                     std::fprintf(stderr, "[hack]   fault address type %d address 0x%llx precision 0x%llx\n", int(a.addressType),
                                  (unsigned long long)a.reportedAddress, (unsigned long long)a.addressPrecision);
+                for (const auto& a : addrs) leonida::ce::vareport::lookup(a.reportedAddress);
+                leonida::ce::vareport::dump();
                 for (const auto& v : vendors)
                     std::fprintf(stderr, "[hack]   vendor \"%s\" code 0x%llx data 0x%llx\n", v.description,
                                  (unsigned long long)v.vendorFaultCode, (unsigned long long)v.vendorFaultData);
@@ -12301,7 +12336,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         leonida::ce::queue_set().get = reinterpret_cast<PFN_vkGetQueueCheckpointDataNV>(
             vkGetDeviceProcAddr(owned.device, "vkGetQueueCheckpointDataNV"));
         if (!want_fault || !leonida::device_lost_hook().load())
-            leonida::device_lost_hook().store(+[] { leonida::ce::print_checkpoints(); });
+            leonida::device_lost_hook().store(+[] { leonida::ce::print_checkpoints(); leonida::ce::vareport::dump(); });
     }
     owned.destroy_device = reinterpret_cast<PFN_vkDestroyDevice>(vkGetDeviceProcAddr(owned.device, "vkDestroyDevice"));
     info.command_queues.resize(command_queue_count);
