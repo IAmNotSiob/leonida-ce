@@ -16,6 +16,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -790,6 +791,8 @@ struct SignatureElement {
 
 struct ShaderEntry {
     std::string name;
+    // agA30: set for an entry from LEONIDA_CE_SPIRV_OVERRIDE's folder: its module is read from there.
+    std::filesystem::path override_spv;
     std::string stage;  // "vs", "ps", "cs", "ms", "gs"
     std::string fssm_sha256;
     std::string fspx_code_sha256;   // an FSPX program (docs/fspx.md): the SHA-256 of its kind-6 bytes
@@ -852,7 +855,38 @@ public:
             } catch (...) {
             }
         }
+        load_override();
         return true;
+    }
+
+    // agA30: LEONIDA_CE_SPIRV_OVERRIDE=<folder> holding an index.json and .spv modules translated on their own
+    // (a few shaders retranslated with a newer rdna2spirv.py). Each of its entries replaces every main entry of
+    // the same (stage, fssm_sha256), and its module is read from that folder. Main-folder shaders it does not
+    // name are untouched.
+    void load_override() {
+        const char* env = std::getenv("LEONIDA_CE_SPIRV_OVERRIDE");
+        if (!env || !*env) return;
+        try {
+            const std::filesystem::path odir(env);
+            ShaderLibrary ov;
+            std::string why;
+            const auto note = [&](const std::string& w) { why = w; return false; };
+            if (!ov.load_index(odir, "", note)) {
+                std::fprintf(stderr, "[hack] SPIRV_OVERRIDE: %s: %s\n", env, why.c_str());
+                return;
+            }
+            std::size_t replaced = 0, added = 0;
+            for (auto& [key, list] : ov.entries_) {
+                for (ShaderEntry& e : list) e.override_spv = odir / (e.name + ".spv");
+                auto it = entries_.find(key);
+                if (it != entries_.end()) { it->second = list; ++replaced; }
+                else { entries_[key] = list; ++added; }
+            }
+            std::fprintf(stderr, "[hack] SPIRV_OVERRIDE: %s: %zu program(s) replaced, %zu added\n", env, replaced,
+                         added);
+        } catch (...) {
+            std::fprintf(stderr, "[hack] SPIRV_OVERRIDE: %s could not be read\n", env);
+        }
     }
 
     bool loaded() const { return !dir_.empty(); }
@@ -920,6 +954,7 @@ public:
     std::vector<std::uint32_t> spirv(const ShaderEntry& entry) const {
         auto path = dir_;
         path += "/" + entry.name + ".spv";
+        if (!entry.override_spv.empty()) path = entry.override_spv;
         std::ifstream file(path, std::ios::binary | std::ios::ate);
         return read_spirv_words(file, file.tellg());
     }

@@ -5298,6 +5298,12 @@ class Gen:
         self.emit(f"{source} = OpBitwiseOr %uint {half} {local}")
         return source
 
+    def tmp_not(self, b):
+        """OpLogicalNot of a bool id, as a new id."""
+        r = self.tmp()
+        self.emit(f"{r} = OpLogicalNot %bool {b}")
+        return r
+
     def wave32_ballot_word(self, ballot):
         """Select this logical wave32's 32-bit word from a physical subgroup ballot."""
         lo, hi = self.tmp(), self.tmp()
@@ -7518,13 +7524,25 @@ class Gen:
             if self.wave32_fragment:
                 self.uses_subgroup = self.uses_ballot = True
                 v, act = self.src_u(a[1]), self.active_b()
-                ballot, any_, lsb, first, r = (self.tmp() for _ in range(5))
+                ballot, any_, lsb, first, shuffled = (self.tmp() for _ in range(5))
                 self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} {act}")
                 word = self.wave32_ballot_word(ballot)
                 self.emit(f"{any_} = OpINotEqual %bool {word} {self.cu(0)}")
                 self.emit(f"{lsb} = OpExtInst %uint %glsl FindILsb {word}")
                 self.emit(f"{first} = OpSelect %uint {any_} {lsb} {self.wave32_first_running_lane()}")
-                self.g_shuffle(r, v, first)
+                self.g_shuffle(shuffled, v, first)
+                # A lane that is on in EXEC but missing from its own ballot word (a helper a driver leaves out of
+                # subgroup operations, SHADER-1016) takes its own value. Waterfall loops (v_readfirstlane, v_cmpx_eq,
+                # s_andn2_wrexec, s_cbranch_execnz: one descriptor per group of lanes) retire a lane only when its
+                # value equals the broadcast one; a left-out helper never matched, stayed on, and once the others
+                # had retired, read lane 0's value forever (agA30: PS_MIRROR_PBR_* GPU hangs, rt21). Lanes in the
+                # ballot, i.e. every lane on every driver without the quirk, are unchanged.
+                bit, own, mine, alone, r = (self.tmp() for _ in range(5))
+                self.emit(f"{bit} = OpBitwiseAnd %uint {self.subgroup_lane()} {self.cu(31)}")
+                self.emit(f"{own} = OpBitFieldUExtract %uint {word} {bit} {self.cu(1)}")
+                self.emit(f"{mine} = OpIEqual %bool {own} {self.cu(0)}")
+                self.emit(f"{alone} = OpLogicalAnd %bool {act} {mine}")
+                self.emit(f"{r} = OpSelect %uint {alone} {v} {shuffled}")
                 self.dst(a[0], r)
                 return
             if self.emulate:
@@ -7553,6 +7571,14 @@ class Gen:
             self.emit(f"{any_} = OpGroupNonUniformAny %bool {self.cu(3)} {act}")
             self.emit(f"{first} = OpSelect %uint {any_} {lsb} {self.cu(0)}")
             self.emit(f"{r} = OpGroupNonUniformShuffle %uint {self.cu(3)} {v} {first}")
+            if self.stage == "ps":
+                # As in the wave32 path above: an active helper left out of its own ballot takes its own value, so a
+                # waterfall loop retires it (agA30).
+                inb, alone, own = (self.tmp() for _ in range(3))
+                self.emit(f"{inb} = OpGroupNonUniformBallotBitExtract %bool {self.cu(3)} {bal} {self.subgroup_lane()}")
+                self.emit(f"{alone} = OpLogicalAnd %bool {act} {self.tmp_not(inb)}")
+                self.emit(f"{own} = OpSelect %uint {alone} {v} {r}")
+                r = own
             self.dst(a[0], r)
         elif op in ("image_sample_o", "image_sample_lz_o", "image_sample_l_o", "image_sample_b_o",
                     "image_sample_c_lz_o", "image_sample_c_o", "image_sample_c_b_o", "image_sample_cl_o", "image_sample_b_cl_o",
