@@ -1123,7 +1123,21 @@ static void ce_guard_all(std::vector<std::uint32_t>& words, const char* name, bo
     std::uint64_t hits = 0;
     if (compute && mapped) {
         std::lock_guard lock(g_guard_mu);
-        if (g_guard_names.size() < kGuardSlots) {
+        // agA29 (LEONIDA_CE_GUARD_SLOT_HASH, default on; =0 = old): the hit record slot is baked into the module, so a
+        // slot in compile order (background compiles finish in a different order every run) changed the SPIR-V of
+        // most compute modules from run to run and missed the pipeline cache (rt13 / rt18 / rt19: 8-20 s average
+        // compiles on a "warm" cache). The slot is now a hash of the module name; names sharing a slot share a record.
+        static const bool by_hash = [] { const char* e = std::getenv("LEONIDA_CE_GUARD_SLOT_HASH"); return !e || e[0] != 0x30; }();
+        if (by_hash) {
+            if (g_guard_names.size() < kGuardSlots) g_guard_names.resize(kGuardSlots);
+            std::uint64_t h = 0xcbf29ce484222325ull;
+            for (const char* c = name; *c; ++c) h = (h ^ std::uint8_t(*c)) * 0x100000001b3ull;
+            const std::size_t slot = std::size_t(h % kGuardSlots);
+            hits = kGuardHits + slot * 16;
+            std::string& names = g_guard_names[slot];
+            if (names.empty()) names = name;
+            else if (names.find(name) == std::string::npos) names += std::string("|") + name;
+        } else if (g_guard_names.size() < kGuardSlots) {
             hits = kGuardHits + g_guard_names.size() * 16;
             g_guard_names.emplace_back(name);
         }
@@ -2487,6 +2501,30 @@ struct DeviceState {
             (depth_or_stencil && !g::is_depth_stencil_format(view_format))) {
             log_once("no Vulkan view format for the GFX10 format of a view:", int(image.format));
             return false;
+        }
+        // agA29 (LEONIDA_CE_VIEW_FMT_GUARD, default on; =0 = old): a T# whose format has a different texel / block size
+        // than the image (a BC3 image viewed as R32G32B32A32_UINT by a compress-into-BC shader, say) would be a Vulkan
+        // view of another size class on an image created without MUTABLE / BLOCK_TEXEL_VIEW_COMPATIBLE: the view keeps
+        // the image's texel extent with the bigger texel, so NVIDIA addresses past the image. rt19 lost the device to
+        // cs_bedf0201 (image_load_mip + image_store) reading 0x26000 into a 256x256 BC3 image of 0x15e00 bytes.
+        // Such a view is refused: the descriptor falls back to index 0 (reads 0, writes dropped).
+        {
+            static const bool guard = [] { const char* e = std::getenv("LEONIDA_CE_VIEW_FMT_GUARD"); return !e || e[0] != 0x30; }();
+            const leonida::BlockFormat a = leonida::block_format(image_format, VK_IMAGE_ASPECT_COLOR_BIT);
+            const leonida::BlockFormat b = leonida::block_format(view_format, VK_IMAGE_ASPECT_COLOR_BIT);
+            if (guard && !depth_or_stencil && view_format != image_format && a.bytes && b.bytes &&
+                (a.bytes != b.bytes || a.block != b.block)) {
+                static std::mutex mu;
+                static std::set<std::pair<int, int>> seen;
+                static std::uint64_t n = 0;
+                std::lock_guard l(mu);
+                const auto k = ++n;
+                if ((seen.insert({int(image_format), int(view_format)}).second && seen.size() <= 64) || (k & (k - 1)) == 0)
+                    std::fprintf(stderr, "[hack] VIEW_FMT_GUARD: %s view of image fmt %d as T# fmt %d (%u/%u bytes, block %u/%u) at %llx refused (%llu so far)\n",
+                                 storage ? "storage" : "sampled", int(image_format), int(view_format), a.bytes, b.bytes, a.block, b.block,
+                                 (unsigned long long)image.address, (unsigned long long)k);
+                return false;
+            }
         }
         const unsigned sampled_class = g::multisampled(image.type) ? numeric_class(view_format) : 0;
         if (g::multisampled(image.type) && !bindless->supports_ms_class(sampled_class)) {
