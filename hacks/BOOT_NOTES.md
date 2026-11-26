@@ -2543,3 +2543,23 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   resolves to vs the CB's (0xffdd4c00). If something writes a DIFFERENT stand-in, bind CBV_PLACED to it (or alias the two
   arena ranges). If nothing shows, the writer is a raw V# in a descriptor heap (compute) - hook the V# translation
   (VSHARP_GUARD path) for bases in the range.
+- rt44 (build 138 + WATCH_RANGE, main session; Definite): the TAA CB 0xde22af580 (+ 0xde22ad930, 0xde22affc0) is written
+  every frame by a list CopyBufferRegion: dst = the CB placed buffer (stand-in 0xffdd4c00, resolved correctly), src = a
+  placed buffer over the title's UPLOAD RING (src title VA moves across 0x3ab9da50..0x3c39da50; caller 0x1404F4600). The copy
+  is forwarded, but the source stand-in is never synced from title memory (BUFFER_SYNC off), so the GPU copies zeros: the
+  black screen. Also: placed SRVs (slot 70) at 0xde22af650 +0x50 / 0xde22af6a0 +0x310 were bound to texture record #58 (its
+  PC size overruns the console size), so they got a null view.
+- Build 139 (2fd63afdf):
+  * LEONIDA_CE_COPY_SRC_SYNC=1. Each list CopyBufferRegion whose source is a title placed buffer (<= 1 MiB) is remembered.
+    Right before the list's ExecuteCommandLists, the title source bytes are written into the source stand-in at the copy's
+    source GPU VA, so the forwarded GPU copy moves them in list order. =2 also writes the dst stand-in and dst title on the
+    CPU. Logs: "COPY_SRC_SYNC #k" (recorded), "COPY_SRC_SYNC done #k" (first words), and the summary
+    "CBV_PLACED stand-ins non-zero: N of M".
+  * LEONIDA_CE_PLACED_BUF_OVER_TEX=1: a buffer view over a texture record that starts elsewhere gets its own buffer stand-in.
+- rt45 = build 139 + rt45.env (rt44.env + COPY_SRC_SYNC=1 + PLACED_BUF_OVER_TEX=1), requested from the main session. Not seen
+  by agA35.
+- NEXT (agA36): read rt45 (non-zero count, DRAW_PEEK gains, is the world visible).
+  If the CB is still zero: try COPY_SRC_SYNC=2, and check that the forwarded copy executes (not skipped as invalid).
+  If other CBs / vertex data come through the same ring by CopyBufferRegion with sources > 1 MiB, raise the cap.
+  The general form of this bug: any title placed buffer that the CPU writes and the GPU reads through a copy or a view needs
+  a sync. BUFFER_SYNC hashes everything, which is too slow; syncing per use, as here, is the cheap form.
