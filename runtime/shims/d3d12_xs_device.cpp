@@ -2,6 +2,7 @@
 #include <string>
 #include <set>
 #include <map>
+#include <unordered_map>
 #include <vector>
 #include <deque>
 #include <mutex>
@@ -42,6 +43,7 @@
 #include "rtdiag_probe.h"  // agD hack
 #include "startup_trace.h"  // agA3 hang watch
 #include "../src/ce_checkpoints.h"  // agA21 local_size_fn
+#include "../src/ce_placed_index.h"  // agA31 placed-record indexes
 
 #include <windows.h>
 #include <dxgi1_4.h>
@@ -1141,6 +1143,39 @@ bool xs_placed_evict() {
     static const bool on = [] { const char* e = std::getenv("LEONIDA_CE_PLACED_EVICT"); return e && (e[0] == '1' || e[0] == '2'); }();
     return on;
 }
+// HACK (agA31): LEONIDA_CE_PLACED_INDEX (default 1) answers xs_find_placed / xs_placed_by_resource / placed_title_of /
+// placed_buffer_holds from indexes (src/ce_placed_index.h) instead of walking g_placed (O(records) per call; rt29:
+// 120k records, ~2/3 of the slow-frame HANG_SAMPLE stacks in those scans). Same answers as the scans (newest record
+// wins). Only without PLACED_EVICT (records never change there). =0 old scans; =2 also runs the old scan and compares
+// (every call for the first 65536 checks, then every 64th), logging "[hack] PLACED_INDEX MISMATCH" and a census.
+int xs_placed_index_mode() {
+    static const int m = [] { const char* e = std::getenv("LEONIDA_CE_PLACED_INDEX"); return e && e[0] ? std::atoi(e) : 1; }();
+    return m;
+}
+bool xs_placed_indexed() { return xs_placed_index_mode() >= 1 && !xs_placed_evict(); }
+ce_placed::PaintIndex g_placed_paint;                       // va -> newest record covering it
+ce_placed::ContainIndex g_placed_buffers;                   // buffer records, for placed_buffer_holds
+std::unordered_map<const void*, std::size_t> g_placed_res;  // resource -> newest record
+std::atomic<std::uint64_t> g_placed_xchecks{0}, g_placed_xbad{0};
+bool xs_placed_xcheck_now() {  // under g_placed_mu
+    if (xs_placed_index_mode() < 2) return false;
+    const std::uint64_t n = g_placed_xchecks.fetch_add(1) + 1;
+    if ((n & (n - 1)) == 0 || (n & 0xfffff) == 0) {
+        std::fprintf(stderr, "[hack] PLACED_INDEX: %llu cross-checks, %llu mismatches, %zu records, %zu segments, %zu buffer ranges\n",
+                     (unsigned long long)n, (unsigned long long)g_placed_xbad.load(), g_placed.size(), g_placed_paint.segments(),
+                     g_placed_buffers.size());
+        std::fflush(stderr);
+    }
+    return n <= 65536 || (n & 63) == 0;
+}
+void xs_placed_xbad(const char* what, std::uint64_t key, long long got, long long want) {
+    const std::uint64_t k = g_placed_xbad.fetch_add(1) + 1;
+    if (k <= 32 || (k & (k - 1)) == 0) {
+        std::fprintf(stderr, "[hack] PLACED_INDEX MISMATCH #%llu %s 0x%llx: index %lld, scan %lld\n", (unsigned long long)k, what,
+                     (unsigned long long)key, got, want);
+        std::fflush(stderr);
+    }
+}
 void xs_record_placed(std::uint64_t va, std::uint64_t size, ID3D12Resource* resource,
                       const D3D12_RESOURCE_DESC* console_desc = nullptr, bool owned = false) {
     if (!va || !resource) return;
@@ -1174,6 +1209,13 @@ void xs_record_placed(std::uint64_t va, std::uint64_t size, ID3D12Resource* reso
         g_placed.push_back({va, size ? size : 1, resource, console_desc ? *console_desc : resource->GetDesc(),
                             (keep ? 1 : 0) + ((owned && evict) ? 1 : 0)});
         if (evict) g_placed_live[va] = g_placed.size() - 1;
+        if (!evict) {  // agA31: indexes (cheap; kept even with PLACED_INDEX=0 so the switch costs nothing to flip)
+            const std::size_t idx = g_placed.size() - 1;
+            const XsPlaced& e = g_placed.back();
+            g_placed_paint.add(e.va, e.size, idx);
+            g_placed_res[e.resource] = idx;
+            if (e.desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) g_placed_buffers.add(e.va, e.size);
+        }
         // agA13: LEONIDA_CE_PLACED_CAP=N keeps at most N of the runtime's own slot-70/71 stand-ins (re31 census: they
         // are the arena growth, +0x83b94 = proxy_slot<70>, ~8k per minute at fresh VAs); the oldest live one goes first.
         static const std::size_t cap = [] { const char* e = std::getenv("LEONIDA_CE_PLACED_CAP"); return e ? std::size_t(std::strtoull(e, nullptr, 0)) : std::size_t(0); }();
@@ -1242,11 +1284,34 @@ void xs_record_placed(std::uint64_t va, std::uint64_t size, ID3D12Resource* reso
     for (auto& [r, n] : drop)
         while (n-- > 0) r->Release();
 }
+// agA31: index of the newest record holding resource, or -1 (scan or index; caller holds g_placed_mu).
+long long xs_placed_res_scan(const void* resource) {
+    for (std::size_t i = g_placed.size(); i-- > 0;)
+        if (g_placed[i].resource == resource) return (long long)i;
+    return -1;
+}
+long long xs_placed_res_lookup(const void* resource) {
+    if (!xs_placed_indexed()) return xs_placed_res_scan(resource);
+    const auto it = g_placed_res.find(resource);
+    const long long got = it == g_placed_res.end() ? -1 : (long long)it->second;
+    if (xs_placed_xcheck_now()) {
+        const long long want = xs_placed_res_scan(resource);
+        if (got != want) xs_placed_xbad("resource", (std::uint64_t)(std::uintptr_t)resource, got, want);
+        return want;
+    }
+    return got;
+}
 bool xs_placed_by_resource(const void* resource, XsPlaced& out) {
     std::lock_guard lock(g_placed_mu);
+    const long long i = xs_placed_res_lookup(resource);
+    if (i < 0) return false;
+    out = g_placed[(std::size_t)i];
+    return true;
+}
+const XsPlaced* xs_find_placed_scan(std::uint64_t va) {
     for (auto it = g_placed.rbegin(); it != g_placed.rend(); ++it)
-        if (it->resource == resource) { out = *it; return true; }
-    return false;
+        if (va >= it->va && va < it->va + it->size) return &*it;
+    return nullptr;
 }
 const XsPlaced* xs_find_placed(std::uint64_t va) {
     std::lock_guard lock(g_placed_mu);
@@ -1256,9 +1321,18 @@ const XsPlaced* xs_find_placed(std::uint64_t va) {
         const XsPlaced& e = g_placed[std::prev(it)->second];
         return (e.resource && va >= e.va && va < e.va + e.size) ? &e : nullptr;
     }
-    for (auto it = g_placed.rbegin(); it != g_placed.rend(); ++it)
-        if (va >= it->va && va < it->va + it->size) return &*it;
-    return nullptr;
+    if (xs_placed_index_mode() >= 1) {  // agA31
+        const std::size_t i = g_placed_paint.find(va);
+        const XsPlaced* got = i == ce_placed::PaintIndex::npos ? nullptr : &g_placed[i];
+        if (xs_placed_xcheck_now()) {
+            const XsPlaced* want = xs_find_placed_scan(va);
+            if (got != want)
+                xs_placed_xbad("va (record starts)", va, got ? (long long)got->va : -1, want ? (long long)want->va : -1);
+            return want;
+        }
+        return got;
+    }
+    return xs_find_placed_scan(va);
 }
 // HACK (agA13, LEONIDA_CE_CBV_FIX=1): a GPU address in title memory that a placed / stand-in BUFFER covers becomes that
 // buffer's GPU VA (the GPU-side copy the runtime refreshes), instead of reaching a shader as a raw title pointer
@@ -6145,16 +6219,28 @@ void set_heap_mirror_range(std::uint64_t lo, std::uint64_t hi) {
 
 bool placed_title_of(const void* resource, std::uint64_t& va, std::uint64_t& size) {
     std::lock_guard lock(g_placed_mu);
-    for (auto it = g_placed.rbegin(); it != g_placed.rend(); ++it)
-        if (it->resource == resource) { va = it->va; size = it->size; return true; }
-    return false;
+    const long long i = xs_placed_res_lookup(resource);  // agA31: indexed
+    if (i < 0) return false;
+    va = g_placed[(std::size_t)i].va;
+    size = g_placed[(std::size_t)i].size;
+    return true;
 }
 
 bool placed_buffer_holds(std::uint64_t va, std::uint64_t bytes) {
     std::lock_guard lock(g_placed_mu);
-    for (const auto& p : g_placed)
-        if (p.desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && va >= p.va && va - p.va + bytes <= p.size) return true;
-    return false;
+    const auto scan = [&] {
+        for (const auto& p : g_placed)
+            if (p.desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && va >= p.va && va - p.va + bytes <= p.size) return true;
+        return false;
+    };
+    if (!xs_placed_indexed()) return scan();
+    const bool got = g_placed_buffers.holds(va, bytes);  // agA31
+    if (xs_placed_xcheck_now()) {
+        const bool want = scan();
+        if (got != want) xs_placed_xbad("holds", va, got, want);
+        return want;
+    }
+    return got;
 }
 
 bool set_device_adapter_provider(void* device, DxgiAdapterProvider provider) {

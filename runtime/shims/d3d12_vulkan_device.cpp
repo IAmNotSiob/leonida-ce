@@ -1919,6 +1919,10 @@ struct DeviceState {
         std::uint32_t memory_type = 0;
         std::mutex mutex;
         std::map<VkDeviceSize, VkDeviceSize> free;  // offset -> size
+        // HACK (agA31): largest free block per 1 MiB bucket of block START offsets (LEONIDA_CE_ARENA_BUCKETS, default
+        // on). rt29: 88k free blocks (alignment gaps, 0 releases) walked from the front on every allocation. Buckets
+        // whose largest block is smaller than the request are skipped: the same block wins as in the plain walk.
+        std::vector<VkDeviceSize> bmax;  // empty = rebuild before use
 
         // The high-water mark (D3D-55, open question 5): the arena's size is a guess until a run measures it.
         // `peak_end` is the highest end offset ever handed out, the size the arena must have; `peak_in_use` is the
@@ -1957,10 +1961,70 @@ struct DeviceState {
 
     // A zero-size range is refused: it would share its offset with the next range, and its release would collide
     // with that range's free entry. The fit test cannot wrap: free blocks lie inside the arena (below 4 GiB).
+    static constexpr unsigned kArenaBucketShift = 20;
+    static int arena_buckets_mode() {  // agA31: 0 off, 1 on (default), 2 on + verify every 1024th allocation
+        static const int m = [] { const char* e = std::getenv("LEONIDA_CE_ARENA_BUCKETS"); return e && e[0] ? std::atoi(e) : 1; }();
+        return m;
+    }
+    VkDeviceSize arena_bucket_scan(std::size_t b) const {  // under arena.mutex
+        VkDeviceSize m = 0;
+        const VkDeviceSize hi = VkDeviceSize(b + 1) << kArenaBucketShift;
+        for (auto it = arena.free.lower_bound(VkDeviceSize(b) << kArenaBucketShift); it != arena.free.end() && it->first < hi; ++it)
+            m = (std::max)(m, it->second);
+        return m;
+    }
+    void arena_rebucket(VkDeviceSize offset) {
+        const std::size_t b = std::size_t(offset >> kArenaBucketShift);
+        if (b < arena.bmax.size()) arena.bmax[b] = arena_bucket_scan(b);
+    }
+    bool arena_buckets_ready() {
+        if (arena_buckets_mode() < 1 || !arena.size) return false;
+        const std::size_t n = std::size_t((arena.size + (VkDeviceSize(1) << kArenaBucketShift) - 1) >> kArenaBucketShift);
+        if (arena.bmax.size() != n) {
+            arena.bmax.assign(n, 0);
+            for (const auto& [o, sz] : arena.free) {
+                const std::size_t b = std::size_t(o >> kArenaBucketShift);
+                if (b < n) arena.bmax[b] = (std::max)(arena.bmax[b], sz);
+            }
+        }
+        if (arena_buckets_mode() >= 2 && (arena.allocations & 1023) == 0) {
+            std::size_t bad = 0;
+            for (std::size_t b = 0; b < n; ++b)
+                if (arena.bmax[b] != arena_bucket_scan(b)) { ++bad; arena.bmax[b] = arena_bucket_scan(b); }
+            static std::uint64_t checks = 0;
+            if (bad || (++checks & (checks - 1)) == 0)
+                std::fprintf(stderr, "[hack] ARENA_BUCKETS verify #%llu: %zu bad buckets (of %zu), %zu free blocks\n",
+                             (unsigned long long)checks, bad, n, arena.free.size());
+        }
+        return true;
+    }
+    // Move it forward / backward past blocks in buckets that hold no block of >= bytes.
+    void arena_seek_fwd(std::map<VkDeviceSize, VkDeviceSize>::iterator& it, VkDeviceSize bytes) {
+        const std::size_t n = arena.bmax.size();
+        while (it != arena.free.end()) {
+            std::size_t b = std::size_t(it->first >> kArenaBucketShift);
+            if (b >= n || arena.bmax[b] >= bytes) return;
+            while (b < n && arena.bmax[b] < bytes) ++b;
+            it = b < n ? arena.free.lower_bound(VkDeviceSize(b) << kArenaBucketShift) : arena.free.end();
+        }
+    }
+    void arena_seek_rev(std::map<VkDeviceSize, VkDeviceSize>::reverse_iterator& it, VkDeviceSize bytes) {
+        const std::size_t n = arena.bmax.size();
+        while (it != arena.free.rend()) {
+            std::size_t b = std::size_t(it->first >> kArenaBucketShift);
+            if (b >= n || arena.bmax[b] >= bytes) return;
+            while (b > 0 && arena.bmax[b] < bytes) --b;
+            if (arena.bmax[b] < bytes) { it = arena.free.rend(); return; }
+            it = std::map<VkDeviceSize, VkDeviceSize>::reverse_iterator(
+                arena.free.lower_bound(VkDeviceSize(b + 1) << kArenaBucketShift));
+        }
+    }
+
     bool arena_allocate(VkDeviceSize bytes, VkDeviceSize alignment, VkDeviceSize& out, ArenaUse use,
                         bool from_top = false) {
         if (!bytes || bytes > arena.size) return false;
         std::lock_guard lock(arena.mutex);
+        const bool buckets = arena_buckets_ready();  // agA31
         // HACK (agA12): growth report (is it a leak?): every 8192nd allocation, live bytes / allocations / releases.
         static std::uint64_t growth_told = 0;
         if (arena.allocations && (arena.allocations & 8191) == 0 && growth_told != arena.allocations) {
@@ -1985,6 +2049,7 @@ struct DeviceState {
                         arena.free.erase(it);
                         if (want > block) arena.free[block] = want - block;
                         if (want + bytes < end) arena.free[want + bytes] = end - (want + bytes);
+                        if (buckets) { arena_rebucket(block); arena_rebucket(want + bytes); }
                         out = want;
                         ++arena.allocations;
                         arena.in_use += bytes;
@@ -2006,6 +2071,10 @@ struct DeviceState {
         // so they never land in (and split) the low holes the large 64 KiB-aligned ranges come from.
         if (from_top) {
             for (auto it = arena.free.rbegin(); it != arena.free.rend(); ++it) {
+                if (buckets) {
+                    arena_seek_rev(it, bytes);
+                    if (it == arena.free.rend()) break;
+                }
                 const VkDeviceSize block = it->first, end = it->first + it->second;
                 if (bytes > it->second) continue;
                 const VkDeviceSize start = (end - bytes) / alignment * alignment;
@@ -2013,6 +2082,7 @@ struct DeviceState {
                 arena.free.erase(std::next(it).base());
                 if (start > block) arena.free[block] = start - block;
                 if (start + bytes < end) arena.free[start + bytes] = end - (start + bytes);
+                if (buckets) { arena_rebucket(block); arena_rebucket(start + bytes); }
                 out = start;
                 ++arena.allocations;
                 arena.in_use += bytes;
@@ -2024,6 +2094,10 @@ struct DeviceState {
             }
         }
         for (auto it = arena.free.begin(); it != arena.free.end(); ++it) {
+            if (buckets) {
+                arena_seek_fwd(it, bytes);
+                if (it == arena.free.end()) break;
+            }
             const VkDeviceSize start = (it->first + alignment - 1) / alignment * alignment;
             const VkDeviceSize end = it->first + it->second;
             if (start >= end || bytes > end - start) continue;
@@ -2031,6 +2105,7 @@ struct DeviceState {
             arena.free.erase(it);
             if (start > block) arena.free[block] = start - block;
             if (start + bytes < end) arena.free[start + bytes] = end - (start + bytes);
+            if (buckets) { arena_rebucket(block); arena_rebucket(start + bytes); }
             out = start;
             ++arena.allocations;
             arena.in_use += bytes;
@@ -2094,16 +2169,21 @@ struct DeviceState {
         arena.in_use -= bytes;
         arena.use_in_use[use] -= bytes;
         auto it = arena.free.emplace(offset, bytes).first;
+        VkDeviceSize touched[3] = {offset, offset, offset};  // agA31: buckets whose blocks changed
         if (auto next = std::next(it); next != arena.free.end() && it->first + it->second == next->first) {
             it->second += next->second;
+            touched[1] = next->first;
             arena.free.erase(next);
         }
         if (it != arena.free.begin()) {
             if (auto previous = std::prev(it); previous->first + previous->second == it->first) {
                 previous->second += it->second;
+                touched[2] = previous->first;
                 arena.free.erase(it);
             }
         }
+        if (!arena.bmax.empty())
+            for (const VkDeviceSize t : touched) arena_rebucket(t);
     }
 
     // The translator's output, loaded on first use.
@@ -7615,11 +7695,13 @@ public:
                          (unsigned long long)kGuardHits);
         }
         arena.free[ce_first] = arena.size - ce_first;
+        arena.bmax.clear();  // agA31: rebuilt on the next allocation
         // HACK (agA13): LEONIDA_CE_BUFFER_PAD also keeps that many bytes at the arena top unallocated: small buffers
         // are packed top-down (agA12), so an unbounded scalar overread of the topmost one left the arena.
         if (const char* v = std::getenv("LEONIDA_CE_BUFFER_PAD")) {
             const VkDeviceSize pad = (VkDeviceSize(std::strtoull(v, nullptr, 0)) + 0xFFFF) & ~VkDeviceSize(0xFFFF);
             if (pad && pad < arena.size / 4) arena.free[ce_first] = arena.size - ce_first - pad;
+            arena.bmax.clear();
             std::fprintf(stderr, "[hack] BUFFER_PAD: %llu bytes per own-memory buffer, arena top keeps %llu\n",
                          (unsigned long long)std::strtoull(v, nullptr, 0), (unsigned long long)pad);
         }
