@@ -1475,10 +1475,17 @@ bool xs_hash_title_seh(std::uint64_t va, std::uint64_t len, std::uint64_t stride
     }
 }
 
+bool xs_upload_3d_on() {
+    static const bool on = [] { const char* e = std::getenv("LEONIDA_CE_UPLOAD_3D"); return e && e[0] == '1'; }();
+    return on;
+}
 void xs_upload_placed_texture(ID3D12Device* dev, const D3D12_RESOURCE_DESC& console_desc, ID3D12Resource* tex,
                               std::uint64_t va, bool force = false) {
     ID3D12CommandQueue* queue = g_upload_queue.load();
-    if (!queue || !tex || console_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return;
+    // agA31 (LEONIDA_CE_UPLOAD_3D=1, default off): TEXTURE3D too. Placed 3D textures never got their title bytes (rt33
+    // DIAG_TEX: 64x64x32 / 64x64x64 noise volumes R16F / RGBA16F / R32_UINT; the intro shows full-scale 64-px noise).
+    const bool is3d = console_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    if (!queue || !tex || (console_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D && !(is3d && xs_upload_3d_on()))) return;
     // FIX candidate (agA28): depth/stencil targets placed in title memory are written by the GPU only; uploading (and every
     // 30-frame refresh re-uploading) their title bytes copies into the depth image, and the Aftermath Copy Engine write
     // faults (rt3/rt4) sit exactly at the end of a D32 2560x1440 depth image's own VA mapping. Skipped by default;
@@ -1502,7 +1509,7 @@ void xs_upload_placed_texture(ID3D12Device* dev, const D3D12_RESOURCE_DESC& cons
     // The console layout word is 0x100 | swizzle mode (xg_texture.h); anything else is read as linear.
     const std::uint32_t layout_word = static_cast<std::uint32_t>(console_desc.Layout);
     leonida::xg::TextureDesc td;
-    td.dimension = leonida::xg::Dimension::Tex2d;
+    td.dimension = is3d ? leonida::xg::Dimension::Tex3d : leonida::xg::Dimension::Tex2d;
     td.width = static_cast<std::uint32_t>(console_desc.Width);
     td.height = console_desc.Height;
     td.depth_or_array = std::max<std::uint32_t>(console_desc.DepthOrArraySize, 1);
@@ -1533,7 +1540,8 @@ void xs_upload_placed_texture(ID3D12Device* dev, const D3D12_RESOURCE_DESC& cons
         return;
     }
     const UINT mips = std::min<UINT>(rd.MipLevels ? rd.MipLevels : 1, static_cast<UINT>(lay.mips.size()));
-    const UINT slices = std::min<UINT>(rd.DepthOrArraySize ? rd.DepthOrArraySize : 1, lay.slices ? lay.slices : 1);
+    // 3D: one D3D12 subresource per mip holding every depth slice (detile slice 0 = the whole mip, depth_pitch apart).
+    const UINT slices = is3d ? 1u : std::min<UINT>(rd.DepthOrArraySize ? rd.DepthOrArraySize : 1, lay.slices ? lay.slices : 1);
     const UINT pc_mips = rd.MipLevels ? rd.MipLevels : 1;
     std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> fps(std::size_t(pc_mips) * slices);
     std::vector<UINT> rows(fps.size());
@@ -2169,7 +2177,9 @@ void xs_refresh_placed_textures(ID3D12Device* dev) {
         std::size_t skipped = 0;
         for (std::size_t i = 0; i < g_placed.size(); ++i) {
             const auto& p = g_placed[i];
-            if (!p.resource || p.desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) continue;
+            if (!p.resource || (p.desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                                !(p.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && xs_upload_3d_on())))  // agA31
+                continue;
             if (filter && g_placed_paint.find(p.va) != i) { ++skipped; continue; }
             textures.push_back(p);
             p.resource->AddRef();
@@ -5066,7 +5076,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         if constexpr (Slot == 18) {  // SRV of a texture the title placed: copy its data in
             XsPlaced placed{};
             if (a1 && xs_placed_by_resource(reinterpret_cast<const void*>(a1), placed) &&
-                placed.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+                (placed.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                 (placed.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && xs_upload_3d_on())))
                 xs_upload_placed_texture(self->real, placed.desc, placed.resource, placed.va);
         }
         return r;
@@ -5498,7 +5509,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                 v.Buffer.FirstElement += offset / stride;
             }
             self->real->CreateShaderResourceView(placed->resource, &v, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(handle)});
-            if (rdesc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+            if (rdesc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                (rdesc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && xs_upload_3d_on()))  // agA31
                 xs_upload_placed_texture(self->real, *rdesc, placed->resource, placed->va);
         } else {
             D3D12_UNORDERED_ACCESS_VIEW_DESC v{};
