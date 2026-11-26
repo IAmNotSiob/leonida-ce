@@ -2219,3 +2219,25 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   wall time is spent off the GPU.
 - Build 115 (8340345c3): LEONIDA_CE_HANG_SAMPLE_MS/_FROM/_MAX: stack dump of every thread (+ queue/wait dumps) for each
   frame slower than _MS after frame _FROM. rt29 = rt28 env + SAMPLE_MS=2000, FROM=1500, MAX=120.
+- Build 116 (d5944b3da): LEONIDA_CE_CAPTURE_EVERY=N / _FROM=M (default 2000): capture every N-th frame from M on.
+- rt29 (build 115 + rt29.env): *** PAST THE AUTOSAVE: INTRO CREDITS *** VM screenshots (/root/rb/rt29v): s04 (02:21) =
+  the opening credits ("Written By / RUPERT HUMPHRIES / ..." pink text bottom-left) over a full-screen teal/black NOISE
+  background (the cutscene render is garbage), s05-s08 the same noise with black letterbox bars. No COULDN'T AUTOSAVE.
+  Both listing reads 337/337 ok, no submit this run. Device loss ~845 s after the press, then AV game+0x400b8d1.
+- CRAWL LEAD (Likely, from 120 HANG_SAMPLE blocks, frames 1769-2154): 31/120 samples catch a title thread inside
+  gta6rt xs_find_placed (d3d12_xs_device.cpp ~1235: without LEONIDA_CE_PLACED_EVICT it scans the whole g_placed deque
+  from the back) called from proxy_slot<70> (placed SRV) - g_placed holds 120832 records by then and never shrinks.
+  Every placed SRV/UAV, CBV_FIX lookup (xs_placed_buffer_va) and placed_buffer_holds walks it: O(records) per call, so
+  the CPU cost grows with play time. FIX (next): an interval index kept without eviction (e.g. map start -> index plus
+  the max record size, scanning only starts in [va - max_size, va] and taking the highest index that covers va =
+  the same answer as the reverse scan). Everything else in the samples is waits (title job threads in
+  game+0x221c3c2 / 0x22511f, our compile pool / dstorage workers idle).
+- Teal-noise cutscene: check which VIEW_FMT_GUARD / RT_FMT_GUARD refusals hit 2560x1440 / 3840x2160 targets then.
+- SUMMARY agA30 / NEXT:
+  1. Autosave: FIXED (build 112, read buffer size). Save path complete end to end (rt28 submit S_OK); rt29 reached the intro.
+  2. Crawl: CPU-side (rt28 LIST_TIME); fix xs_find_placed's linear scan first, then re-measure with LIST_TIME/HANG_SAMPLE.
+  3. Hang/loss ~775-850 s after the press persists (tiny "Hung" dumps; compute checkpoints are bystanders).
+  4. Waterfall helper-lane fix: 30 mirror PS deployed (ovr113, pace 7.8-15.8 vs 11.6-21 s/60 before the crawl);
+     /root/handoff/ovr114.tar (all 1445 waterfall PS) is ready, untested.
+  5. Arena leak (0 buffer releases, 2.6 GB by the loss) and the same g_placed growth: proxy_slot<70> stand-ins.
+  Recommended env: build 116 + /root/handoff/rt29.env (add CAPTURE_EVERY=50 to see the screen).
