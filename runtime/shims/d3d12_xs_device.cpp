@@ -993,6 +993,31 @@ std::atomic<std::uint64_t> g_cbv_syncs{0}, g_cbv_changed_bytes{0}, g_cbv_changed
 
 bool xs_cbv_title_of(std::uint64_t va, std::uint64_t* title, std::uint32_t* size, std::uint64_t* shadow_va);  // agA25
 
+// agA33 LEONIDA_CE_CBV_PLACED=1 (default off): rt40 DRAW_PEEK of PS_TAA2_SpatialUpscaleWithDithering: its CB (V# at s9+0x20,
+// 0xd0 bytes) is the title's placed BUFFER at 0xde22af580 (slot 133, width 208, flags 0): the title's bytes there never
+// change (cb+0xbc, the per-frame noise layer, stays 0) and hold unrelated data (-4e27, -2.8e38, int 100, ...: the
+// dither gains cb+0xc0..0xc8 = (int 8, 0, 11.95) = the observed noise; cb+0x0/0x4 = 1/size of the bicubic sample = the
+// black scene term). On the console that buffer is filled by the GPU (a copy into the placed resource); here GPU writes
+// land in its stand-in, but slot 17 shadowed the (readable, stale) title bytes. =1: a CBV inside a slot-133 placed
+// BUFFER names the stand-in (as root CBVs already do, CBV_FIX); =2: also stand-ins slots 70/71 made (owned).
+// LEONIDA_CE_CBV_PLACED_WATCH=1: CPU writes to such a CB still reach the GPU: before every ExecuteCommandLists the title
+// bytes of each retargeted placed buffer (<= 64 KiB) are compared with the last read and changed 16-byte granules are
+// written into the stand-in (GPU-written data is left alone while the CPU does not touch those bytes); =2 also copies
+// the title bytes once when the placed buffer is first retargeted.
+int xs_cbv_placed_mode() {
+    static const int m = [] { const char* v = std::getenv("LEONIDA_CE_CBV_PLACED"); return v ? std::atoi(v) : 0; }();
+    return m;
+}
+int xs_cbv_placed_watch_mode() {
+    static const int m = [] { const char* v = std::getenv("LEONIDA_CE_CBV_PLACED_WATCH"); return v ? std::atoi(v) : 0; }();
+    return m;
+}
+struct XsCbvPlacedSeen { std::uint64_t title = 0, va = 0; std::uint32_t size = 0; bool watch = false; std::vector<std::uint8_t> last; };
+std::map<std::uint64_t, std::size_t> g_cbv_placed_index;  // placed record title va -> g_cbv_placed slot (under g_cbv_mu)
+std::map<std::uint64_t, std::size_t> g_cbv_placed_by_va;  // stand-in VA -> g_cbv_placed slot (diagnostics)
+std::deque<XsCbvPlacedSeen> g_cbv_placed;
+std::atomic<std::uint64_t> g_cbv_placed_views{0}, g_cbv_placed_granules{0};
+
 // agA32 LEONIDA_CE_CBV_SHADOW_CHUNK=1 (default off; needs CBV_SHADOW >= 1): rt38 made 205k shadows (one per (title,
 // size)) - the title creates CBVs over and over on the same reused CB memory - so the 64 MiB pool filled (later CBVs fell
 // back to the ring snapshot, clobbered when the ring wraps) and every ExecuteCommandLists re-read all 205k with one
@@ -1129,6 +1154,16 @@ bool xs_cbv_pool_ready(ID3D12Device* dev) {
 // agA25: which shadow holds arena VA va (linear; diagnostics only).
 bool xs_cbv_title_of(std::uint64_t va, std::uint64_t* title, std::uint32_t* size, std::uint64_t* shadow_va) {
     std::lock_guard lock(g_cbv_mu);
+    if (!g_cbv_placed_by_va.empty()) {  // agA33 CBV_PLACED: a placed stand-in (the "shadow" is the stand-in)
+        auto it = g_cbv_placed_by_va.upper_bound(va);
+        if (it != g_cbv_placed_by_va.begin()) {
+            const XsCbvPlacedSeen& p = g_cbv_placed[std::prev(it)->second];
+            if (va >= p.va && va < p.va + p.size) {
+                *title = p.title; *size = p.size; *shadow_va = p.va;
+                return true;
+            }
+        }
+    }
     if (!g_cbv_pool || va < g_cbv_pool_va || va >= g_cbv_pool_va + g_cbv_pool_size) return false;
     for (const XsCbvChunk& c : g_cbv_chunks)  // agA32
         if (va >= c.va && va < c.va + kCbvChunk) {
@@ -1198,6 +1233,25 @@ std::uint64_t xs_cbv_shadow_root(std::uint64_t title) {
 void xs_cbv_shadow_refresh() {
     if (xs_cbv_shadow_mode() <= 0) return;
     std::lock_guard lock(g_cbv_mu);
+    if (xs_cbv_placed_watch_mode() > 0 && g_arena_mapped) {  // agA33 CBV_PLACED_WATCH
+        static std::vector<std::uint8_t> wscratch;  // plain static under g_cbv_mu (no thread_local)
+        for (XsCbvPlacedSeen& w : g_cbv_placed) {
+            if (!w.watch) continue;
+            if (wscratch.size() < w.size) wscratch.resize(w.size);
+            SIZE_T got = 0;
+            if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(w.title), wscratch.data(), w.size, &got) ||
+                got != w.size)
+                continue;
+            if (std::memcmp(w.last.data(), wscratch.data(), w.size) == 0) continue;
+            for (std::uint32_t o = 0; o < w.size; o += 16) {
+                const std::uint32_t k = (std::min)(16u, w.size - o);
+                if (std::memcmp(w.last.data() + o, wscratch.data() + o, k) == 0) continue;
+                std::memcpy(w.last.data() + o, wscratch.data() + o, k);
+                std::memcpy(g_arena_mapped + w.va + o, wscratch.data() + o, k);
+                ++g_cbv_placed_granules;
+            }
+        }
+    }
     if (!g_cbv_pool) return;
     std::uint64_t bytes = 0, views = 0;
     if (!g_cbv_chunks.empty()) {  // agA32 CBV_SHADOW_CHUNK: one read per chunk, changed 4 KiB pages written
@@ -1494,6 +1548,59 @@ std::uint64_t xs_placed_buffer_va(std::uint64_t va, std::uint64_t bytes) {
     if (bytes && va - p->va + bytes > p->size) return 0;
     const std::uint64_t gpu = p->resource->GetGPUVirtualAddress();
     return gpu ? gpu + (va - p->va) : 0;
+}
+// agA33 LEONIDA_CE_CBV_PLACED (see xs_cbv_placed_mode): the stand-in VA for a CBV on [title, title + size), or 0.
+std::uint64_t xs_cbv_placed(std::uint64_t title, std::uint32_t size) {
+    const int mode = xs_cbv_placed_mode();
+    if (mode <= 0 || !title || !size) return 0;
+    const XsPlaced* p = xs_find_placed(title);
+    if (!p || !p->resource || p->desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return 0;
+    if (p->owned && mode < 2) return 0;
+    if (title - p->va + size > p->size) return 0;
+    const std::uint64_t base = p->resource->GetGPUVirtualAddress();
+    if (!base) return 0;
+    const std::uint64_t rec_va = p->va, rec_size = p->size;
+    const bool in_arena = g_arena_mapped && base < g_arena_size && rec_size <= g_arena_size - base;
+    const std::uint64_t k = ++g_cbv_placed_views;
+    std::lock_guard lock(g_cbv_mu);
+    if (!g_cbv_placed_index.count(rec_va)) {
+        XsCbvPlacedSeen s;
+        s.title = rec_va;
+        s.va = base;
+        s.size = static_cast<std::uint32_t>((std::min)(rec_size, std::uint64_t(64) << 10));
+        s.watch = in_arena && xs_cbv_placed_watch_mode() > 0 && rec_size <= (64u << 10);
+        s.last.assign(s.size, 0);
+        SIZE_T got = 0;
+        const bool read = ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(rec_va), s.last.data(), s.size, &got) &&
+                          got == s.size;
+        bool same = false;
+        if (read && in_arena) same = std::memcmp(g_arena_mapped + base, s.last.data(), s.size) == 0;
+        static int told = 0;
+        if (told < 32) {  // proof: does the stand-in hold other (GPU-written) bytes than the title?
+            ++told;
+            std::uint32_t tw[8] = {}, gw[8] = {};
+            const std::uint64_t off = title - rec_va, n = (std::min)(std::uint64_t(32), rec_size - off);
+            if (read && off < s.size) std::memcpy(tw, s.last.data() + off, (std::min)(n, std::uint64_t(s.size - off)));
+            if (in_arena) std::memcpy(gw, g_arena_mapped + base + off, n);
+            std::fprintf(stderr, "[hack] CBV_PLACED: CBV title 0x%llx +0x%x in placed buffer 0x%llx +0x%llx%s -> stand-in 0x%llx: "
+                         "title %08x %08x %08x %08x %08x %08x %08x %08x | stand-in %08x %08x %08x %08x %08x %08x %08x %08x (%s)\n",
+                         (unsigned long long)title, size, (unsigned long long)rec_va, (unsigned long long)rec_size,
+                         p->owned ? " (owned)" : "", (unsigned long long)(base + (title - rec_va)), tw[0], tw[1], tw[2], tw[3],
+                         tw[4], tw[5], tw[6], tw[7], gw[0], gw[1], gw[2], gw[3], gw[4], gw[5], gw[6], gw[7],
+                         !in_arena ? "stand-in not in the arena" : !read ? "title unreadable" : same ? "same" : "DIFFERENT");
+            std::fflush(stderr);
+        }
+        if (s.watch && read && xs_cbv_placed_watch_mode() >= 2) std::memcpy(g_arena_mapped + base, s.last.data(), s.size);
+        g_cbv_placed_index[rec_va] = g_cbv_placed.size();
+        g_cbv_placed_by_va[base] = g_cbv_placed.size();
+        g_cbv_placed.push_back(std::move(s));
+    }
+    if ((k & (k - 1)) == 0 || (k & 65535) == 0) {
+        std::fprintf(stderr, "[hack] CBV_PLACED: %llu CBVs retargeted, %zu placed buffers, %llu granules written by the watch\n",
+                     (unsigned long long)k, g_cbv_placed.size(), (unsigned long long)g_cbv_placed_granules.load());
+        std::fflush(stderr);
+    }
+    return base + (title - rec_va);
 }
 void xs_cbv_fix_note(const char* what, std::uint64_t from, std::uint64_t to) {
     static std::atomic<int> told{0};
@@ -5101,7 +5208,9 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                     // snapshot them into the arena when the view is made (VIctory copies changed title memory).
                     // fspx CB analysis: a stable, refreshed arena shadow first (see xs_cbv_shadow); the ring copy
                     // below is the fallback (stale after the title's next write, clobbered when the ring wraps).
-                    if (const std::uint64_t shadow = xs_cbv_shadow(self->real, cbv.BufferLocation, cbv.SizeInBytes)) {
+                    if (const std::uint64_t placed_to = xs_cbv_placed(cbv.BufferLocation, cbv.SizeInBytes)) {
+                        cbv.BufferLocation = placed_to;  // agA33 CBV_PLACED: the GPU-side buffer
+                    } else if (const std::uint64_t shadow = xs_cbv_shadow(self->real, cbv.BufferLocation, cbv.SizeInBytes)) {
                         cbv.BufferLocation = shadow;
                     } else if (const std::uint64_t copy = xs_upload_alloc(cbv.SizeInBytes, 256)) {
                         std::memcpy(reinterpret_cast<void*>(copy), reinterpret_cast<const void*>(cbv.BufferLocation),
