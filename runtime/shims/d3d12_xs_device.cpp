@@ -1102,7 +1102,9 @@ void xs_cbv_shadow_refresh() {
         // agA31: one ReadProcessMemory into a scratch copy instead of xs_readable + memcmp on title memory: rt34 died
         // in that memcmp (VCRUNTIME, read of 0xbf3d9fd00) on CB pages the title released between the check and the read.
         // A failed read = released title memory: keep the last contents.
-        static thread_local std::vector<std::uint8_t> scratch;
+        // Under g_cbv_mu: a plain static (a thread_local std::vector - dynamic TLS init + a TLS destructor - made builds
+        // 124/125 exit ~2 s after launch, before xgameruntime loads; Likely the title-thread TLS handling).
+        static std::vector<std::uint8_t> scratch;
         if (scratch.size() < e.size) scratch.resize(e.size);
         SIZE_T got = 0;
         if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(e.title), scratch.data(), e.size, &got) ||
