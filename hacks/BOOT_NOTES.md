@@ -2360,3 +2360,42 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
 - Build 129 (b49ebb030): LEONIDA_CE_UPLOAD_3D=1 (default off): placed TEXTURE3D are uploaded from title memory (SRV
   creation via slot 18 / 70, and the periodic refresh) with the xg Tex3d layout; before only TEXTURE2D were, so placed 3D
   volumes (the intro's 64x64x32/64 noise volumes) held whatever the allocation contained. rt37 = build 129 + rt37.env.
+- rt36 also logged "[rt] d3d12: a bindless image array is full; dimension 1": the sampled 2D-array table (1024) ran FULL,
+  so every later 2D-array view fell back to index 0 (broken rendering of every texture array after that point), and
+  3D_TWIN found "NO common index" for the 64x64x64 volumes (the 3D table holds 256). bindless set at boot: 65536 2D,
+  3936 samplers, 1024 2D-array, 256 3D, 256 1D, 4096 storage indices in 2D.
+- Build 130 (39e5d7d06): LEONIDA_CE_BINDLESS_2DA=<n> / LEONIDA_CE_BINDLESS_3D=<n> (default 1024 / 256) size those tables
+  (runtime arrays in the SPIR-V; the set layout change = one cold pipeline compile). rt38 = build 130 + rt38.env
+  (rt37.env + 2DA=8192, 3D=1024).
+- rt37 (build 129 + UPLOAD_3D=1): starts, 47 "uploaded placed texture" lines; noise still there (blue/black at 05:03);
+  pace 3.3 s/60 at 1620-1920, 13.8 at 2220, 7.7 at 2520, 16.5 at 2820, 104 at 3120. All three image tables FULL again
+  (2D-array line 10651, 1D 19437, 2D 24264 - in rt36 too: 10423 / 18318 / 22871): from the intro on, new 2D views fall
+  back to index 0. DEVICE LOST t=1050.5 (the latest yet), direct checkpoint VS_TransformPreSkin_VfxVBuffer_01a5f889 +
+  PS_VfxVBuffer_01a5f889, device_fault VA 0x22f6da1a0 = 3.4 GB below heap_base (like rt33's 0x22531f480: a pointer
+  heap_base + VA with a small negative VA; VSHARP_GUARD_ALL lets pointers below heap_base pass).
+- Build 131 (ca830e4f6): LEONIDA_CE_BINDLESS_2D=<n> raises the 2D growth target (default 65536). The tables fill because
+  bindless entries live as long as their images and the placed stand-ins never die (the stand-in / arena leak again).
+  rt38 = build 131 + rt38.env (rt37.env + BINDLESS_2DA=8192, BINDLESS_3D=1024, BINDLESS_2D=262144; cold compile).
+- SUMMARY agA31 / NEXT:
+  1. CRAWL: FIXED for the first ~3000 frames (Likely). rt36: 2.7-4.3 s/60 before the intro (was 7-10), 4-17 s/60 through
+     frame ~3000 (was 130-330). Causes removed: O(n) g_placed scans (PLACED_INDEX, exact, cross-checked), arena first-fit
+     walk (ARENA_BUCKETS, exact), LayoutTracker copy per submission (TRACKER_UNDO), superseded-texture refresh
+     (REFRESH_CURRENT). A slower crawl returns past frame ~3100 (28 -> 104-156 s/60): next samples show CopyPageMappings
+     (map_alias per page, std::map), DirectStorage zlib inflate, child_slot<0,37>.
+  2. WRONG TEXTURES: PLACED_RESTAND (default on) - the old lookup gave 1x1 / small textures their neighbour's resource
+     and reused stale records after memory reuse (65k+ restands per run, 40k VIEW_FMT_GUARD refusals -> 0).
+  3. CRASHES fixed: rt34's CPU AV (CB shadow memcmp on released title pages, = rt6/rt8/rt11's) via ReadProcessMemory;
+     STANDIN_UPLOAD copies via ReadProcessMemory. gta6rt has no /EHa: __try does not protect inline loads/memcpy.
+     Never add thread_local objects (builds 124/125 died at start); check the .tls size.
+  4. INTRO NOISE: still there. It is a 64-px-periodic full-scale signed noise (R/G vs B saturate oppositely), from frame
+     ~3250 in rt36. Tried: RT_RETARGET=2 (all left-out draws now drawn), 3D_TWIN, UPLOAD_3D - none removed it. Open
+     leads: the image tables are FULL by then (everything new samples index 0) - rt38 tests bigger tables; the 2D_ARRAY-
+     instruction-on-3D-T# mismatch (3D_TWIN could not twin the 64x64x64 volumes in rt36: no common index).
+  5. DEVICE LOSS moved later: t=674 (rt33, HairStrand VS, before the cap), 750 (rt36, DistantWindowEmissives), 1050
+     (rt37, VfxVBuffer); rt33/rt37 have a fault VA ~3.4 GB below heap_base: graphics pointers with negative VAs.
+     Candidate: a lower-bound guard (sink pointers below heap_base - X) for graphics modules, keeping the upload-buffer
+     window.
+  6. Recommended env: /root/handoff/rt38.env with build 131 (or rt36.env + build 128 if the cold compile is unwanted).
+     New defaults on: PLACED_INDEX, ARENA_BUCKETS, TRACKER_UNDO, PLACED_RESTAND, REFRESH_CURRENT, SKIP_BAD_COPY (with
+     SKIP_BAD=1). Opt-in used: RT_RETARGET=2, STANDIN_UPLOAD=1, NV_DIAG=0x2, LOOP_CAP_GFX/PTR_ALIGN_GFX +HairStrand,
+     3D_TWIN=1, UPLOAD_3D=1, BINDLESS_*.
