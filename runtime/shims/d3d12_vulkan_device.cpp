@@ -1111,6 +1111,34 @@ static void ce_guard_reader() {
         }
     }
 }
+// agA29: `env` = "1" (every name) or a comma list of substrings; true when `name` matches. Parsed once per variable.
+static bool ce_name_list_match(const char* env, const std::string& name) {
+    static std::mutex mu;
+    static std::map<std::string, std::vector<std::string>> lists;
+    std::vector<std::string>* list;
+    {
+        std::lock_guard l(mu);
+        auto it = lists.find(env);
+        if (it == lists.end()) {
+            std::vector<std::string> v;
+            if (const char* e = std::getenv(env)) {
+                std::string all(e);
+                for (std::size_t at = 0; at <= all.size();) {
+                    const std::size_t comma = all.find(',', at);
+                    const std::string item = all.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+                    if (!item.empty()) v.push_back(item == "1" ? std::string() : item);
+                    if (comma == std::string::npos) break;
+                    at = comma + 1;
+                }
+            }
+            it = lists.emplace(env, std::move(v)).first;
+        }
+        list = &it->second;
+    }
+    for (const std::string& s : *list)
+        if (s.empty() || name.find(s) != std::string::npos) return true;
+    return false;
+}
 static void ce_guard_all(std::vector<std::uint32_t>& words, const char* name, bool compute) {
     if (!ce_guard_all_on() || std::strncmp(name, "bvh/", 4) == 0) return;  // the runtime BVH builder uses real addresses
     static const std::uint64_t limit = [] {
@@ -1147,8 +1175,9 @@ static void ce_guard_all(std::vector<std::uint32_t>& words, const char* name, bo
     // agA29 (LEONIDA_CE_PTR_ALIGN=1, default off; compute modules only so graphics pipelines keep their cache entries):
     // guarded pointers are rounded down to their pointee's scalar size (spirv_guard_ptr_all `align`).
     static const bool align_on = [] { const char* e = std::getenv("LEONIDA_CE_PTR_ALIGN"); return e && e[0] == 0x31; }();
-    // agA29 (LEONIDA_CE_PTR_ALIGN_GFX=1, default off): graphics modules too (every graphics pipeline recompiles once).
-    static const bool align_gfx = [] { const char* e = std::getenv("LEONIDA_CE_PTR_ALIGN_GFX"); return e && e[0] == 0x31; }();
+    // agA29 (LEONIDA_CE_PTR_ALIGN_GFX=1 = every graphics module, or sub1,sub2 = graphics modules whose name contains one;
+    // default off). Every matched graphics pipeline recompiles once.
+    const bool align_gfx = !compute && ce_name_list_match("LEONIDA_CE_PTR_ALIGN_GFX", name);
     int aligned = 0;
     const int n = leonida::spirv_guard_ptr_all(words, limit, mapped ? kGuardSink : 0, hits, align_on && (compute || align_gfx), &aligned);
     static std::atomic<std::uint64_t> modules{0}, pointers{0}, untouched{0}, aligned_all{0};
@@ -5112,6 +5141,18 @@ public:
                 } else {
                     stage.words = std::move(patched);
                 }
+            }
+            // agA29 (LEONIDA_CE_LOOP_CAP_GFX=sub1,sub2 or 1 = every graphics stage; default off): the compute loop cap
+            // (src/spirv_loop_cap.h) on graphics stages whose name contains one of the substrings. rt21 hung (TDR, no
+            // faulted warp) in PS_MIRROR_PBR_MATERIAL_CLEARCOAT/STANDARD_5f34c83e (17 / 13 loops). Only the matched
+            // modules change, so only their pipelines recompile.
+            if (ce_name_list_match("LEONIDA_CE_LOOP_CAP_GFX", stage.entry->name)) {
+                static const std::uint32_t inner = [] { const char* v = std::getenv("LEONIDA_CE_LOOP_CAP_INNER"); return std::uint32_t(v ? std::strtoul(v, nullptr, 0) : (1u << 22)); }();
+                static const std::uint32_t outer = [] { const char* v = std::getenv("LEONIDA_CE_LOOP_CAP_OUTER"); return std::uint32_t(v ? std::strtoul(v, nullptr, 0) : (1u << 18)); }();
+                const int n = leonida::spirv_cap_loops(stage.words, inner, outer);
+                static std::atomic<int> told{0};
+                if (n && told++ < 64)
+                    std::fprintf(stderr, "[hack] LOOP_CAP_GFX: %s: %d loop(s) capped (%u blocks)\n", stage.entry->name.c_str(), n, inner);
             }
             ce_guard_all(stage.words, stage.entry->name.c_str(), false);  // agA25
             VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
