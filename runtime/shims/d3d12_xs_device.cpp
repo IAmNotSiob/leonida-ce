@@ -476,7 +476,8 @@ std::map<const void*, XsFenceMirror*> g_fence_mirrors;
 // magic code, don't wanna deal with hours of plumbing with what these conjured devils of the souls of gpt 6 astra did.. jeez
 struct XsDeferredWrite { std::uint64_t address, value; unsigned bytes, what; };  // what: 0 value, 1 GPU ts, 2 system ts
 std::atomic<IUnknown*> g_placeholder_pso{nullptr};  // slot 57 stand-in (see the HACK there)
-struct XsListCopy { std::uint64_t dst, src, bytes, flags, ra; };  // agA35 console list slot 62 (GPU memcpy by VA)
+struct XsListCopy { std::uint64_t dst, src, bytes, flags, ra;  // agA35 console list slot 62 (GPU memcpy by VA)
+                    int kind = 0; std::uint64_t src_gpu = 0, dst_gpu = 0; };  // kind 1: CopyBufferRegion source sync (COPY_SRC_SYNC)
 struct XsListExtras { std::vector<XsDeferredWrite> writes; std::vector<std::unique_ptr<std::uint8_t[]>> uploads;
                       std::vector<XsListCopy> copies; };
 std::mutex g_list_extras_mu;
@@ -1820,8 +1821,54 @@ void xs_lc62_record(const void* list, std::uint64_t dst, std::uint64_t src, std:
     g_list_extras[list].copies.push_back({dst, src, bytes, flags, ra});
 }
 // Submit time: perform the lists' recorded copies (mode >= 2), in list order.
+// agA35 LEONIDA_CE_COPY_SRC_SYNC (default 0). rt44 [watch]: the TAA CB 0xde22af580 (and 0xde22ad930, 0xde22affc0) is
+// filled every frame by a list CopyBufferRegion(dst = the CB's placed buffer, src = a placed buffer over the title's UPLOAD
+// RING 0x3ab9da50..0x3c39da50, which the CPU writes). The copy is forwarded, but the source resource is a stand-in that
+// nothing syncs from title memory (BUFFER_SYNC off), so the GPU copied zeros: the black screen. =1: each CopyBufferRegion
+// whose SOURCE is a title placed buffer (<= 1 MiB) is remembered; right before the list's ExecuteCommandLists its title
+// source bytes are written into the source stand-in (arena, at the copy's own source GPU VA), so the forwarded GPU copy
+// moves the title's constants, in list order. =2: also writes them into the destination stand-in and the destination's
+// title memory on the CPU (as the console copy would leave them).
+int xs_copy_src_sync_mode() {
+    static const int m = [] { const char* v = std::getenv("LEONIDA_CE_COPY_SRC_SYNC"); return v ? std::atoi(v) : 0; }();
+    return m;
+}
+std::atomic<std::uint64_t> g_css_recorded{0}, g_css_done{0}, g_css_bytes{0}, g_css_skip{0};
+void xs_css_record(const void* list, std::uint64_t dst_res, std::uint64_t dst_off, std::uint64_t src_res, std::uint64_t src_off,
+                   std::uint64_t bytes) {
+    if (!src_res || !bytes || bytes > (1ull << 20)) return;
+    XsPlaced sp{}, dp{};
+    if (!xs_placed_by_resource(reinterpret_cast<const void*>(src_res), sp) || sp.desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+        src_off + bytes > sp.size) {
+        ++g_css_skip;
+        return;
+    }
+    const std::uint64_t sg = reinterpret_cast<ID3D12Resource*>(src_res)->GetGPUVirtualAddress();
+    if (!sg || !g_arena_mapped || sg + src_off + bytes > g_arena_size) { ++g_css_skip; return; }
+    XsListCopy c{};
+    c.kind = 1;
+    c.src = sp.va + src_off;
+    c.src_gpu = sg + src_off;
+    c.bytes = bytes;
+    if (dst_res && xs_placed_by_resource(reinterpret_cast<const void*>(dst_res), dp) && dp.desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+        dst_off + bytes <= dp.size) {
+        c.dst = dp.va + dst_off;
+        const std::uint64_t dg = reinterpret_cast<ID3D12Resource*>(dst_res)->GetGPUVirtualAddress();
+        if (dg && dg + dst_off + bytes <= g_arena_size) c.dst_gpu = dg + dst_off;
+    }
+    const std::uint64_t k = ++g_css_recorded;
+    if (k <= 8 || (k & (k - 1)) == 0) {
+        std::fprintf(stderr, "[hack] COPY_SRC_SYNC #%llu: CopyBufferRegion src title 0x%llx (stand-in 0x%llx) -> dst title 0x%llx (stand-in 0x%llx), "
+                     "0x%llx bytes; %llu skipped (source not a title placed buffer in the arena)\n", (unsigned long long)k,
+                     (unsigned long long)c.src, (unsigned long long)c.src_gpu, (unsigned long long)c.dst, (unsigned long long)c.dst_gpu,
+                     (unsigned long long)bytes, (unsigned long long)g_css_skip.load());
+        std::fflush(stderr);
+    }
+    std::lock_guard lock(g_list_extras_mu);
+    g_list_extras[list].copies.push_back(c);
+}
 void xs_lc62_apply(UINT count, const std::uint64_t* lists) {
-    if (xs_list_copy62_mode() < 2 || !lists) return;
+    if ((xs_list_copy62_mode() < 2 && xs_copy_src_sync_mode() < 1) || !lists) return;
     std::vector<XsListCopy> copies;
     {
         std::lock_guard lock(g_list_extras_mu);
@@ -1836,6 +1883,31 @@ void xs_lc62_apply(UINT count, const std::uint64_t* lists) {
     std::lock_guard lock(mu);
     for (const XsListCopy& c : copies) {
         if (buf.size() < c.bytes) buf.resize(static_cast<std::size_t>(c.bytes));
+        if (c.kind == 1) {  // COPY_SRC_SYNC
+            SIZE_T got = 0;
+            if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(c.src), buf.data(), static_cast<SIZE_T>(c.bytes), &got) ||
+                got != c.bytes) {
+                ++g_css_skip;
+                continue;
+            }
+            std::memcpy(g_arena_mapped + c.src_gpu, buf.data(), static_cast<std::size_t>(c.bytes));
+            if (xs_copy_src_sync_mode() >= 2) {
+                if (c.dst_gpu) std::memcpy(g_arena_mapped + c.dst_gpu, buf.data(), static_cast<std::size_t>(c.bytes));
+                SIZE_T put = 0;
+                if (c.dst) WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(c.dst), buf.data(), static_cast<SIZE_T>(c.bytes), &put);
+            }
+            const std::uint64_t d = ++g_css_done;
+            g_css_bytes += c.bytes;
+            if (d <= 8 || (d & (d - 1)) == 0) {
+                const std::uint32_t* w = reinterpret_cast<const std::uint32_t*>(buf.data());
+                std::fprintf(stderr, "[hack] COPY_SRC_SYNC done #%llu: title 0x%llx -> stand-in 0x%llx (dst title 0x%llx), 0x%llx bytes: "
+                             "%08x %08x %08x %08x\n", (unsigned long long)d, (unsigned long long)c.src, (unsigned long long)c.src_gpu,
+                             (unsigned long long)c.dst, (unsigned long long)c.bytes, c.bytes >= 16 ? w[0] : 0, c.bytes >= 16 ? w[1] : 0,
+                             c.bytes >= 16 ? w[2] : 0, c.bytes >= 16 ? w[3] : 0);
+                std::fflush(stderr);
+            }
+            continue;
+        }
         SIZE_T got = 0;
         if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(c.src), buf.data(), static_cast<SIZE_T>(c.bytes), &got) ||
             got != c.bytes) {
@@ -1879,9 +1951,11 @@ void xs_lc62_apply(UINT count, const std::uint64_t* lists) {
                     if (b[i]) { ++nonzero; break; }
             }
         }
-        std::fprintf(stderr, "[hack] LIST_COPY62: %llu submits with copies, %llu calls recorded (%llu onto CBV_PLACED buffers), %llu done, "
+        std::fprintf(stderr, "[hack] LIST_COPY62 / COPY_SRC_SYNC: %llu submits with copies; COPY_SRC_SYNC %llu recorded, %llu done, %llu KiB, "
+                     "%llu skipped; slot 62: %llu calls recorded (%llu onto CBV_PLACED buffers), %llu done, "
                      "%llu MiB, %llu stand-in bytes, %llu src failures; CBV_PLACED stand-ins non-zero: %zu of %zu\n",
-                     (unsigned long long)subs, (unsigned long long)g_lc62_calls.load(), (unsigned long long)g_lc62_cbv.load(),
+                     (unsigned long long)subs, (unsigned long long)g_css_recorded.load(), (unsigned long long)g_css_done.load(),
+                     (unsigned long long)(g_css_bytes.load() >> 10), (unsigned long long)g_css_skip.load(), (unsigned long long)g_lc62_calls.load(), (unsigned long long)g_lc62_cbv.load(),
                      (unsigned long long)g_lc62_done.load(), (unsigned long long)(g_lc62_bytes.load() >> 20),
                      (unsigned long long)g_lc62_standin.load(), (unsigned long long)g_lc62_fail.load(), nonzero, total);
         std::fflush(stderr);
@@ -4040,6 +4114,9 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 return 0;
             }
         }
+        if constexpr (Slot == 15) {  // agA35 COPY_SRC_SYNC
+            if (xs_copy_src_sync_mode() > 0) xs_css_record(self, unwrap_object(a1), a2, unwrap_object(a3), a4, a5);
+        }
         if constexpr (Slot == 15 || Slot == 17) {  // agA35 WATCH_RANGE: CopyBufferRegion(dst, doff, src, soff, n) / CopyResource(dst, src)
             std::uint64_t ds = 0, ss = 0;
             const std::uint64_t dv = xs_watch_res_va(unwrap_object(a1), Slot == 15 ? a2 : 0, &ds);
@@ -6074,6 +6151,25 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                 const XsPlaced* same = xs_find_placed_tex(va, *rdesc);
                 restand_from = placed;
                 placed = same;
+            }
+        }
+        // agA35 LEONIDA_CE_PLACED_BUF_OVER_TEX=1 (default 0): a BUFFER view whose newest record is a TEXTURE starting
+        // elsewhere (rt44: SRVs at 0xde22af650 / 0xde22af6a0 bound to #58, the 3840x2160 target, whose PC size 0x3fc0000
+        // overruns its console size 0x2850000 and covers the CB page) gets its own buffer stand-in instead (null before).
+        if (placed && va && rdesc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && placed->desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+            placed->va != va) {
+            static const bool bot = [] { const char* e = std::getenv("LEONIDA_CE_PLACED_BUF_OVER_TEX"); return e && e[0] == '1'; }();
+            if (bot) {
+                static std::atomic<std::uint64_t> n{0};
+                const std::uint64_t k = ++n;
+                if (k <= 24 || (k & (k - 1)) == 0) {
+                    std::fprintf(stderr, "[hack] PLACED_BUF_OVER_TEX #%llu %s va 0x%llx +0x%llx: texture record @0x%llx %llux%u fmt %d -> own buffer stand-in\n",
+                                 (unsigned long long)k, Slot == 70 ? "SRV" : "UAV", (unsigned long long)va, (unsigned long long)rdesc->Width,
+                                 (unsigned long long)placed->va, (unsigned long long)placed->desc.Width, placed->desc.Height, int(placed->desc.Format));
+                    std::fflush(stderr);
+                }
+                restand_from = nullptr;
+                placed = nullptr;
             }
         }
         if (!placed && va) {  // not from slot 133: make a stand-in from the description and remember it
