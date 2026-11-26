@@ -2475,6 +2475,7 @@ struct DeviceState {
         VkImageView sampled;
         VkImageView storage;  // the same range without a component mapping, for the storage bindings; or null
         std::uint64_t address;
+        bool twin = false;  // agA31 3D_TWIN: the index is also held (fallback) in the 2D-array table
     };
     std::unique_ptr<leonida::BindlessSet> bindless;
     std::mutex descriptor_mutex;  // the set and the containers below
@@ -2547,6 +2548,9 @@ struct DeviceState {
         const std::uint64_t slot_handle =
             (static_cast<std::uint64_t>(entry.dimension) << 32) | static_cast<std::uint64_t>(entry.index);
         context->defer_destroy(leonida::DeferredDeletionQueue::Kind::bindless_slot, slot_handle);
+        if (entry.twin)  // agA31 3D_TWIN
+            context->defer_destroy(leonida::DeferredDeletionQueue::Kind::bindless_slot,
+                                   (static_cast<std::uint64_t>(leonida::ImageDimension::dim_2d_array) << 32) | entry.index);
         context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_view, entry.sampled);
         if (entry.storage) context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_view, entry.storage);
     }
@@ -2718,7 +2722,21 @@ struct DeviceState {
             if (storage_format == VK_FORMAT_R32_UINT) views.r32ui = entry.storage;
         }
         // Every state a shader can read or write the texture in is GENERAL (ResourceBinding::sampled_in_general).
-        entry.index = bindless->add_image(dimension, entry.sampled, VK_IMAGE_LAYOUT_GENERAL, views, sampled_class);
+        // agA31 (LEONIDA_CE_3D_TWIN=1, default off): a sampled 3D view also reserves its index in the 2D-array table
+        // (fallback there). rt31's intro noise: Scaleform dither PS image_load dim:2D_ARRAY on a 64x64x32 3D noise volume.
+        static const bool twin3d = [] { const char* e = std::getenv("LEONIDA_CE_3D_TWIN"); return e && e[0] == '1'; }();
+        if (twin3d && !storage && dimension == leonida::ImageDimension::dim_3d) {
+            entry.index = bindless->add_image_twin(dimension, leonida::ImageDimension::dim_2d_array, entry.sampled,
+                                                   VK_IMAGE_LAYOUT_GENERAL);
+            entry.twin = entry.index != 0;
+            static std::atomic<std::uint64_t> n{0}, miss{0};
+            const std::uint64_t k = ++(entry.twin ? n : miss);
+            if ((k & (k - 1)) == 0)
+                std::fprintf(stderr, "[hack] 3D_TWIN: %s %llu (3D %ux%ux%u at %llx, index %u)\n", entry.twin ? "twinned" : "NO common index",
+                             (unsigned long long)k, image.width, image.height, image.depth, (unsigned long long)image.address, entry.index);
+        }
+        if (!entry.index)
+            entry.index = bindless->add_image(dimension, entry.sampled, VK_IMAGE_LAYOUT_GENERAL, views, sampled_class);
         if (!entry.index) {
             log_once("a bindless image array is full; dimension", int(dimension));
             vk.vkDestroyImageView(info.device, entry.sampled, nullptr);

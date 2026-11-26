@@ -410,6 +410,28 @@ public:
         return index;
     }
 
+    // HACK (agA31, LEONIDA_CE_3D_TWIN): add_image for a sampled-only view that also takes the SAME index in `twin`'s
+    // table and leaves the fallback there. A shader that reads a 3D T# with a 2D_ARRAY instruction (the translator picks
+    // the table from the instruction's dim) then gets the fallback instead of an unrelated 2D-array texture that
+    // happened to own that index. 0 when no index is free in both. remove_image both dimensions to free it.
+    std::uint32_t add_image_twin(ImageDimension dimension, ImageDimension twin, VkImageView sampled, VkImageLayout sampled_layout) {
+        if (bindless::multisampled(dimension) || bindless::multisampled(twin)) return 0;
+        auto& used = image_used_[std::uint32_t(dimension)];
+        auto& used2 = image_used_[std::uint32_t(twin)];
+        const std::uint32_t end = std::min(std::uint32_t(used.size()), std::uint32_t(used2.size()));
+        const std::uint32_t low_end = std::min(end, std::min(storage_capacity(dimension), storage_capacity(twin)));
+        std::uint32_t index = 0;
+        for (std::uint32_t pass = 0; pass < 2 && !index; ++pass)
+            for (std::uint32_t i = pass ? 1 : low_end; i < (pass ? low_end : end); ++i)
+                if (!used[i] && !used2[i]) { index = i; break; }
+        if (!index) return 0;
+        used[index] = 1;
+        used2[index] = 1;
+        write_image(dimension, index, sampled, sampled_layout, {}, 0);
+        write_image(twin, index, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL, {}, 0);
+        return index;
+    }
+
     // New views or a new layout for an index add_image returned (a texture's state changed, say).
     void update_image(ImageDimension dimension, std::uint32_t index, VkImageView sampled, VkImageLayout sampled_layout,
                       const StorageViews& storage = {}, std::uint32_t sampled_class = 0) {
