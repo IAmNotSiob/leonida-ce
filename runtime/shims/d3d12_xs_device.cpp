@@ -2105,20 +2105,29 @@ bool xs_copy_title_seh(void* dst, std::uint64_t va, std::uint64_t len) {
     return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(va), dst, static_cast<SIZE_T>(len), &got) && got == len;
 }
 bool xs_hash_title_seh(std::uint64_t va, std::uint64_t len, std::uint64_t stride, std::uint64_t* hash, std::uint64_t* nonzero) {
-    __try {
-        std::uint64_t h = *hash, nz = *nonzero;
-        for (std::uint64_t o = 0; o + 8 <= len; o += stride) {
-            std::uint64_t w = 0;
-            std::memcpy(&w, reinterpret_cast<const void*>(va + o), 8);
+    // main session (rt45): the __try + memcpy loop did not catch a vanished title page (AV at 0xcc52fe000 in here,
+    // same clang SEH problem as agA31 STANDIN_UPLOAD). Read through ReadProcessMemory in 4 KiB chunks on the stack.
+    std::uint64_t h = *hash, nz = *nonzero;
+    alignas(8) std::uint8_t chunk[4096];
+    std::uint64_t o = 0;
+    while (o + 8 <= len) {
+        // Read [o, o + n): the whole 4 KiB around the samples when the stride is small, else just the one word.
+        const std::uint64_t n = stride < sizeof chunk ? std::min<std::uint64_t>(sizeof chunk, len - o) & ~7ull : 8;
+        SIZE_T got = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(va + o), chunk, static_cast<SIZE_T>(n), &got) || got != n)
+            return false;
+        std::uint64_t i = 0;
+        for (; i + 8 <= n; i += stride) {
+            std::uint64_t w;
+            std::memcpy(&w, chunk + i, 8);
             h = (h ^ w) * 1099511628211ull;
             nz |= w;
         }
-        *hash = h;
-        *nonzero = nz;
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
+        o += stride < sizeof chunk ? i : stride;
     }
+    *hash = h;
+    *nonzero = nz;
+    return true;
 }
 
 bool xs_upload_3d_on() {
