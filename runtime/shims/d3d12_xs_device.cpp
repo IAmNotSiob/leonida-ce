@@ -475,7 +475,9 @@ std::map<const void*, XsFenceMirror*> g_fence_mirrors;
 // magic code, don't wanna deal with hours of plumbing with what these conjured devils of the souls of gpt 6 astra did.. jeez
 struct XsDeferredWrite { std::uint64_t address, value; unsigned bytes, what; };  // what: 0 value, 1 GPU ts, 2 system ts
 std::atomic<IUnknown*> g_placeholder_pso{nullptr};  // slot 57 stand-in (see the HACK there)
-struct XsListExtras { std::vector<XsDeferredWrite> writes; std::vector<std::unique_ptr<std::uint8_t[]>> uploads; };
+struct XsListCopy { std::uint64_t dst, src, bytes, flags, ra; };  // agA35 console list slot 62 (GPU memcpy by VA)
+struct XsListExtras { std::vector<XsDeferredWrite> writes; std::vector<std::unique_ptr<std::uint8_t[]>> uploads;
+                      std::vector<XsListCopy> copies; };
 std::mutex g_list_extras_mu;
 std::mutex g_list_pso_mu;                          // agA21: last SetPipelineState per console list proxy
 std::map<const void*, std::uint64_t> g_list_pso;
@@ -1735,6 +1737,154 @@ std::uint64_t xs_cbv_placed(std::uint64_t title, std::uint32_t size) {
         }
     }
     return base + (title - rec_va);
+}
+// agA35 LEONIDA_CE_LIST_COPY62 (default 0). Console command-list slot 62 is a GPU memcpy by VA: (dst VA, src VA, bytes,
+// flags) (agA21: fn 0x140979650 dst [rdx+0x50], src f([rdx+0x30]), size [rdx+0x24]); the runtime DROPPED it (generic
+// "not forwarded"). The TAA CB 0xde22af580 (and the other 22 CBV_PLACED buffers) hold stale CPU data in title memory and
+// zero stand-ins: on the console nothing but the GPU writes them, and this copy is the only GPU writer the proxy drops
+// (Likely). =1: record + log (who copies where; whether dst covers a placed buffer / a CBV_PLACED buffer). =2: also
+// perform each recorded copy on the CPU right before the list's ExecuteCommandLists: src bytes (title memory, read with
+// ReadProcessMemory) -> dst title memory (WriteProcessMemory, ignores page guards) AND -> every placed BUFFER stand-in in
+// the arena covering dst (so CBV_PLACED / CBV_FIX views see it). =3: like 2, but only copies whose dst touches a placed
+// buffer. The CBV_SHADOW refresh runs after it, so shadowed CBVs see the new title bytes as well.
+int xs_list_copy62_mode() {
+    static const int m = [] { const char* v = std::getenv("LEONIDA_CE_LIST_COPY62"); return v ? std::atoi(v) : 0; }();
+    return m;
+}
+std::atomic<std::uint64_t> g_lc62_calls{0}, g_lc62_done{0}, g_lc62_bytes{0}, g_lc62_fail{0}, g_lc62_standin{0}, g_lc62_cbv{0};
+// Writes [dst, dst + n) bytes into every placed BUFFER stand-in (in the arena) covering it; returns the bytes written.
+std::uint64_t xs_lc62_standins(std::uint64_t dst, const std::uint8_t* src, std::uint64_t n, std::string* why) {
+    std::uint64_t pos = dst, end = dst + n, wrote = 0;
+    int guard = 0;
+    while (pos < end && guard++ < 4096) {
+        const XsPlaced* p = xs_find_placed(pos);
+        if (!p || !p->resource || !p->size) { pos = (pos | 0xfff) + 1; continue; }
+        const std::uint64_t stop = (std::min)(end, p->va + p->size);
+        if (p->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            const std::uint64_t g = p->resource->GetGPUVirtualAddress();
+            const std::uint64_t at = g + (pos - p->va), len = stop - pos;
+            if (g && g_arena_mapped && at < g_arena_size && len <= g_arena_size - at) {
+                std::memcpy(g_arena_mapped + at, src + (pos - dst), static_cast<std::size_t>(len));
+                wrote += len;
+                if (why && why->size() < 400) {
+                    char b[160];
+                    std::snprintf(b, sizeof b, " [rec @0x%llx +0x%llx -> stand-in 0x%llx +0x%llx]", (unsigned long long)p->va,
+                                  (unsigned long long)p->size, (unsigned long long)at, (unsigned long long)len);
+                    *why += b;
+                }
+            }
+        }
+        pos = stop > pos ? stop : pos + 1;
+    }
+    return wrote;
+}
+// Describes the placed record at va (for the log).
+std::string xs_lc62_rec(std::uint64_t va, std::uint64_t n) {
+    const XsPlaced* p = xs_find_placed(va);
+    if (!p) p = n > 1 ? xs_find_placed(va + n - 1) : nullptr;
+    if (!p) return "none";
+    char b[200];
+    bool cbv = false;
+    {
+        std::lock_guard lock(g_cbv_mu);
+        cbv = g_cbv_placed_index.count(p->va) != 0;
+    }
+    std::snprintf(b, sizeof b, "rec @0x%llx +0x%llx dim %d %llux%u fmt %d%s gpu 0x%llx", (unsigned long long)p->va,
+                  (unsigned long long)p->size, int(p->desc.Dimension), (unsigned long long)p->desc.Width, p->desc.Height,
+                  int(p->desc.Format), cbv ? " CBV_PLACED" : "",
+                  (unsigned long long)(p->resource && p->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? p->resource->GetGPUVirtualAddress() : 0));
+    return b;
+}
+// Record time (list slot 62).
+void xs_lc62_record(const void* list, std::uint64_t dst, std::uint64_t src, std::uint64_t bytes, std::uint64_t flags, std::uint64_t ra) {
+    const std::uint64_t k = ++g_lc62_calls;
+    const XsPlaced* dp = dst ? xs_find_placed(dst) : nullptr;
+    const bool dbuf = dp && dp->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+    bool dcbv = false;
+    if (dp) {
+        std::lock_guard lock(g_cbv_mu);
+        dcbv = g_cbv_placed_index.count(dp->va) != 0;
+    }
+    if (dcbv) ++g_lc62_cbv;
+    static std::atomic<int> told{0}, told_cbv{0};
+    if ((k <= 48 || (k & (k - 1)) == 0 || (dbuf && told++ < 200) || (dcbv && told_cbv++ < 200))) {
+        std::fprintf(stderr, "[hack] LIST_COPY62 #%llu from %p: dst 0x%llx <- src 0x%llx, 0x%llx bytes, flags 0x%llx | dst %s | src %s\n",
+                     (unsigned long long)k, (void*)ra, (unsigned long long)dst, (unsigned long long)src, (unsigned long long)bytes,
+                     (unsigned long long)flags, xs_lc62_rec(dst, bytes).c_str(), xs_lc62_rec(src, bytes).c_str());
+        std::fflush(stderr);
+    }
+    if (!dst || !src || !bytes || bytes > (64ull << 20)) return;
+    if (xs_list_copy62_mode() >= 3 && !dbuf) return;
+    std::lock_guard lock(g_list_extras_mu);
+    g_list_extras[list].copies.push_back({dst, src, bytes, flags, ra});
+}
+// Submit time: perform the lists' recorded copies (mode >= 2), in list order.
+void xs_lc62_apply(UINT count, const std::uint64_t* lists) {
+    if (xs_list_copy62_mode() < 2 || !lists) return;
+    std::vector<XsListCopy> copies;
+    {
+        std::lock_guard lock(g_list_extras_mu);
+        for (UINT i = 0; i < count; ++i) {
+            auto it = g_list_extras.find(reinterpret_cast<const void*>(lists[i]));
+            if (it != g_list_extras.end()) copies.insert(copies.end(), it->second.copies.begin(), it->second.copies.end());
+        }
+    }
+    if (copies.empty()) return;
+    static std::vector<std::uint8_t> buf;  // submit thread(s): serialised below (no thread_local in gta6rt)
+    static std::mutex mu;
+    std::lock_guard lock(mu);
+    for (const XsListCopy& c : copies) {
+        if (buf.size() < c.bytes) buf.resize(static_cast<std::size_t>(c.bytes));
+        SIZE_T got = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(c.src), buf.data(), static_cast<SIZE_T>(c.bytes), &got) ||
+            got != c.bytes) {
+            const std::uint64_t f = ++g_lc62_fail;
+            if (f <= 16 || (f & (f - 1)) == 0) {
+                std::fprintf(stderr, "[hack] LIST_COPY62: src 0x%llx +0x%llx unreadable (%llu failures)\n", (unsigned long long)c.src,
+                             (unsigned long long)c.bytes, (unsigned long long)f);
+                std::fflush(stderr);
+            }
+            continue;
+        }
+        SIZE_T put = 0;
+        WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(c.dst), buf.data(), static_cast<SIZE_T>(c.bytes), &put);
+        std::string why;
+        static std::atomic<int> told{0};
+        const bool say = told < 64;
+        const std::uint64_t sw = xs_lc62_standins(c.dst, buf.data(), c.bytes, say ? &why : nullptr);
+        g_lc62_standin += sw;
+        const std::uint64_t d = ++g_lc62_done;
+        g_lc62_bytes += c.bytes;
+        if (say && (sw || d <= 16)) {
+            ++told;
+            const std::uint32_t* w = reinterpret_cast<const std::uint32_t*>(buf.data());
+            std::fprintf(stderr, "[hack] LIST_COPY62 done #%llu: 0x%llx <- 0x%llx +0x%llx, title %llu bytes written, stand-ins %llu bytes%s; "
+                         "first words %08x %08x %08x %08x\n", (unsigned long long)d, (unsigned long long)c.dst, (unsigned long long)c.src,
+                         (unsigned long long)c.bytes, (unsigned long long)put, (unsigned long long)sw, why.c_str(),
+                         c.bytes >= 16 ? w[0] : 0, c.bytes >= 16 ? w[1] : 0, c.bytes >= 16 ? w[2] : 0, c.bytes >= 16 ? w[3] : 0);
+            std::fflush(stderr);
+        }
+    }
+    static std::uint64_t subs = 0;
+    if (((++subs) & (subs - 1)) == 0 || (subs & 1023) == 0) {
+        std::size_t nonzero = 0, total = 0;
+        {
+            std::lock_guard l2(g_cbv_mu);
+            for (const auto& e : g_cbv_placed) {
+                if (!g_arena_mapped || e.va >= g_arena_size || e.size > g_arena_size - e.va) continue;
+                ++total;
+                const std::uint8_t* b = g_arena_mapped + e.va;
+                for (std::uint32_t i = 0; i < e.size; ++i)
+                    if (b[i]) { ++nonzero; break; }
+            }
+        }
+        std::fprintf(stderr, "[hack] LIST_COPY62: %llu submits with copies, %llu calls recorded (%llu onto CBV_PLACED buffers), %llu done, "
+                     "%llu MiB, %llu stand-in bytes, %llu src failures; CBV_PLACED stand-ins non-zero: %zu of %zu\n",
+                     (unsigned long long)subs, (unsigned long long)g_lc62_calls.load(), (unsigned long long)g_lc62_cbv.load(),
+                     (unsigned long long)g_lc62_done.load(), (unsigned long long)(g_lc62_bytes.load() >> 20),
+                     (unsigned long long)g_lc62_standin.load(), (unsigned long long)g_lc62_fail.load(), nonzero, total);
+        std::fflush(stderr);
+    }
 }
 void xs_cbv_fix_note(const char* what, std::uint64_t from, std::uint64_t to) {
     static std::atomic<int> told{0};
@@ -3762,6 +3912,11 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 g_list_extras[self].writes.push_back({a1, a2, Slot == 71 ? 4u : 8u, what});
             }
             return 0;
+        } else if constexpr (Slot == 62) {  // agA35 LEONIDA_CE_LIST_COPY62: GPU memcpy by VA (dst, src, bytes, flags)
+            if (xs_list_copy62_mode() > 0) {
+                xs_lc62_record(self, a1, a2, a3, a4, reinterpret_cast<std::uint64_t>(_ReturnAddress()));
+                return 0;
+            }
         } else if constexpr (Slot == 148) {  // AllocateUploadMemory(size, alignment) -> pointer, until the next reset
             const std::uint64_t align = a2 < 16 ? 16 : a2;
             if ((align & (align - 1)) != 0 || a1 > (1ull << 31)) return 0;
@@ -4368,6 +4523,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                 ? reinterpret_cast<ID3D12CommandList* const*>(console_lists.data()) : lists;
             if (!g_upload_queue.load() && q->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) g_upload_queue = q;
             if (n && q->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) xs_refresh_placed_buffers(q);
+            if (n && lists) xs_lc62_apply(n, reinterpret_cast<const std::uint64_t*>(lists));  // agA35, before the CBV refresh
             if (n) xs_cbv_shadow_refresh();  // fspx CB analysis: every queue (the fspx passes also run on compute)
             if (n && real_lists) q->ExecuteCommandLists(n, real_lists);
             if (n && lists) xs_schedule_list_writes(q, n, reinterpret_cast<const std::uint64_t*>(lists));
@@ -4448,6 +4604,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         if constexpr (K == ChildKind::queue && (Slot == kQueueSignal || Slot == kQueueWait)) a1 = unwrap_object(a1);
         UnwrappedArray unwrapped_lists;
         if constexpr (K == ChildKind::queue && Slot == 10) {
+            if (a1 && a2) xs_lc62_apply(static_cast<UINT>(a1), reinterpret_cast<const std::uint64_t*>(a2));  // agA35
             if (a1) xs_cbv_shadow_refresh();  // fspx CB analysis: PC-slot ExecuteCommandLists as well
             if (!unwrapped_lists.fill(a2, a1)) return hr_to_u64(E_OUTOFMEMORY);
             if (unwrapped_lists.data()) a2 = unwrapped_lists.data();
