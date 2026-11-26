@@ -2168,3 +2168,26 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   4. Recommended env: build 111 + /root/handoff/rt24.env (= rt23 env + B presses). Keep LEONIDA_CE_PTR_ALIGN=1,
      LOOP_CAP_GFX=PS_MIRROR_PBR + LOOP_CAP_GFX_INNER=512 + PTR_ALIGN_GFX=PS_MIRROR_PBR; VIEW_FMT_GUARD / RT_RETARGET /
      GUARD_SLOT_HASH are default on. Cache is warm for this set (compiles ~0.2 s).
+
+## agA30 (sender gen 30, 2026-11-26 overnight)
+- Receiver = the main session. Builds 112+. Work files /root/a30 (xcall.py = call/jmp rel32 xrefs into a game address;
+  tr1.sh OUT NAME.. = translate single shaders from work/shaders/dxbc/disasm into OUT/spirv).
+- AUTOSAVE ROOT CAUSE (Likely): the title's save code is FUN_1428d1480 (list saves), FUN_1428d1ea0 (autosave: create
+  update, write "Save Game Header" 0x128 bytes + "Save Game Data", SubmitUpdateAsync), FUN_1428d2170 (submit result: state
+  5 ok / 1 fail). The listing enumerates containers named "PARC*" or "GA*" (FUN_1428d1340), enumerates blobs by name
+  "Save Game Header" and sizes its sync XGameSaveReadBlobData buffer itself as strlen(name) + 0x19 + size
+  (FUN_1428d1830) = sizeof(XGameSaveBlob) + name + NUL + bytes, no padding. Our HLE 8-aligned the bytes and the name:
+  344 needed vs 337 given -> E_GS_PROVIDED_BUFFER_TOO_SMALL on every listing read -> the list's state = 1 (error) even
+  though the submit wrote the files. Build 112 (ebdd74ebf): tight packing (name+NUL then bytes), logs the first 16 sync
+  reads ("[rt] xgamesave: read ..."), new exact-size test (58 checks pass under wine). rt26 tests it.
+  Checked and fine: XAsyncGetResult with no payload (state extracted at completion -> S_OK), the async read path
+  (title uses XAsyncGetResultSize), the identity constants.
+- WATERFALL / HELPER LANES (Plausible): v_readfirstlane in pixel shaders: an active lane missing from its own ballot (a
+  helper a driver leaves out, SHADER-1016) got another lane's value, so the cmpx never retired it and the loop spun
+  until LOOP_CAP_GFX (pace crawl) or forever (rt21 TDR). Translator fix (592c8c173): such a lane takes its own value,
+  wave32 fragment path and generic (wave64 PS) path; lanes in the ballot unchanged. 739 translator tests pass.
+  Census: s_andn2_wrexec waterfalls are in 129 wave32 PS, 1316 wave64 PS, 1118 CS, 278 MS, 42 VS. Only the 30
+  PS_MIRROR_PBR_* modules are redeployed so far.
+- Build 113 (592c8c173): LEONIDA_CE_SPIRV_OVERRIDE=<folder> (index.json + .spv translated alone; entries replace the
+  main ones by (stage, fssm_sha256)). /root/handoff/ovr113.tar = the 30 mirror PS. The deployed corpus is from Nov 23,
+  so the override modules also carry every translator change since then (index metadata identical). rt27 tests it.
