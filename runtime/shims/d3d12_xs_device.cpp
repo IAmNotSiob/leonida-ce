@@ -1069,7 +1069,9 @@ std::uint64_t xs_cbv_shadow(ID3D12Device* dev, std::uint64_t title, std::uint32_
         e = &g_cbv.back();
     }
     // Copy now as well: the first use may come before the next ExecuteCommandLists refresh.
-    std::memcpy(e->last.data(), reinterpret_cast<const void*>(title), size);
+    SIZE_T got = 0;  // agA31: ReadProcessMemory (a released title page reads as a failure, not an AV)
+    if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(title), e->last.data(), size, &got) || got != size)
+        return e->va;  // keep the previous (or zero) contents
     std::memcpy(g_arena_mapped + e->va, e->last.data(), size);
     return e->va;
 }
@@ -1097,10 +1099,17 @@ void xs_cbv_shadow_refresh() {
     if (!g_cbv_pool) return;
     std::uint64_t bytes = 0, views = 0;
     for (XsCbvShadow& e : g_cbv) {
-        const auto* src = reinterpret_cast<const std::uint8_t*>(e.title);
-        if (!xs_readable(src, e.size)) continue;  // released title memory: keep the last contents
-        if (std::memcmp(e.last.data(), src, e.size) == 0) continue;
-        std::memcpy(e.last.data(), src, e.size);
+        // agA31: one ReadProcessMemory into a scratch copy instead of xs_readable + memcmp on title memory: rt34 died
+        // in that memcmp (VCRUNTIME, read of 0xbf3d9fd00) on CB pages the title released between the check and the read.
+        // A failed read = released title memory: keep the last contents.
+        static thread_local std::vector<std::uint8_t> scratch;
+        if (scratch.size() < e.size) scratch.resize(e.size);
+        SIZE_T got = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(e.title), scratch.data(), e.size, &got) ||
+            got != e.size)
+            continue;
+        if (std::memcmp(e.last.data(), scratch.data(), e.size) == 0) continue;
+        std::memcpy(e.last.data(), scratch.data(), e.size);
         std::memcpy(g_arena_mapped + e.va, e.last.data(), e.size);
         bytes += e.size;
         ++views;
