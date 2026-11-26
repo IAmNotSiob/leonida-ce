@@ -2150,11 +2150,23 @@ void xs_refresh_placed_textures(ID3D12Device* dev) {
     XsHold hold{textures};
     {
         std::lock_guard lock(g_placed_mu);
-        for (const auto& p : g_placed)
-            if (p.resource && p.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
-                textures.push_back(p);
-                p.resource->AddRef();
-            }
+        // agA31 (LEONIDA_CE_REFRESH_CURRENT, default on; =0 old): only records still the newest at their own start
+        // address. A record the title's memory reuse superseded (PLACED_RESTAND) would be re-hashed every pass and
+        // re-uploaded with the NEW texture's bytes into the old resource.
+        static const bool current_only = [] { const char* e = std::getenv("LEONIDA_CE_REFRESH_CURRENT"); return !(e && e[0] == '0'); }();
+        const bool filter = current_only && xs_placed_indexed();
+        std::size_t skipped = 0;
+        for (std::size_t i = 0; i < g_placed.size(); ++i) {
+            const auto& p = g_placed[i];
+            if (!p.resource || p.desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) continue;
+            if (filter && g_placed_paint.find(p.va) != i) { ++skipped; continue; }
+            textures.push_back(p);
+            p.resource->AddRef();
+        }
+        static std::uint64_t passes = 0;
+        if ((++passes & (passes - 1)) == 0)
+            std::fprintf(stderr, "[hack] REFRESH_CURRENT: pass %llu: %zu textures, %zu superseded skipped\n",
+                         (unsigned long long)passes, textures.size(), skipped);
     }
     for (const auto& t : textures) {
         const std::uint64_t len = t.size;
