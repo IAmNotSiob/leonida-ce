@@ -227,6 +227,21 @@ int main() {
               std::strcmp(out[1].info.name, "profile/main") == 0 &&
               std::memcmp(out[1].data, profile.data(), profile.size()) == 0,
           "ReadBlobData returns both blobs, byte for byte, pointing into the buffer");
+    // agA30: the size is exact - sizeof(XGameSaveBlob) + name + NUL + bytes per blob, no padding - because GTA VI
+    // sizes its buffer that way ("Save Game Header": 24 + 16 + 1 + 296 = 337).
+    {
+        const char* one[] = {"story"};
+        uint32_t n1 = 1;
+        std::vector<uint8_t> exact(sizeof(Blob) + std::strlen("story") + 1 + story.size());
+        auto* eout = reinterpret_cast<Blob*>(exact.data());
+        check(at<Read>(save, 20)(save, container, one, &n1, exact.size(), eout) == S_OK && n1 == 1 &&
+                  std::strcmp(eout[0].info.name, "story") == 0 && eout[0].info.size == story.size() &&
+                  std::memcmp(eout[0].data, story.data(), story.size()) == 0,
+              "ReadBlobData fits exactly sizeof(XGameSaveBlob) + strlen(name) + 1 + size");
+        n1 = 1;
+        check(at<Read>(save, 20)(save, container, one, &n1, exact.size() - 1, eout) == E_GS_PROVIDED_BUFFER_TOO_SMALL,
+              "one byte less is too small");
+    }
     const char* absent[] = {"nope"};
     count = 1;
     check(at<Read>(save, 20)(save, container, absent, &count, buffer.size() * 8, out) == E_GS_BLOB_NOT_FOUND,
