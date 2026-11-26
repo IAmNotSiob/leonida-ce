@@ -314,7 +314,14 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
     const std::uint32_t creatable =
         limits.maxSamplerAllocationCount - std::min(limits.maxSamplerAllocationCount, reserved_samplers);
     grow(samplers, std::max(samplers, std::min(max_samplers, creatable)), growth_headroom, set_limit);
-    grow(images, std::max(images, max_2d_images), growth_headroom, set_limit);
+    // agA31: LEONIDA_CE_BINDLESS_2D=<n> raises the 2D growth target (default 65536). rt36 / rt37 filled the 2D table
+    // (65536) during the intro ("a bindless image array is full; dimension 0"): later 2D views fall back to index 0.
+    const std::uint32_t max_2d = [] {
+        const char* e = std::getenv("LEONIDA_CE_BINDLESS_2D");
+        const unsigned long v = e ? std::strtoul(e, nullptr, 0) : 0;
+        return v >= 1024 && v <= (1u << 20) ? std::uint32_t(v) : max_2d_images;
+    }();
+    grow(images, std::max(images, max_2d), growth_headroom, set_limit);
     grow(storage, std::max(storage, max_storage_indices), growth_headroom, set_limit);
     apply(true);
     return full;
