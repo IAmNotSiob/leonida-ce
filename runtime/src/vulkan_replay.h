@@ -2349,6 +2349,113 @@ inline bool rt_retarget_any_class() {
     static const bool on = [] { const char* e = std::getenv("LEONIDA_CE_RT_RETARGET"); return e && e[0] == '2'; }();
     return on;
 }
+// agA32 LEONIDA_CE_DRAW_PEEK=name:off:cboff:len[,..] (needs LEONIDA_CE_CHECKPOINTS=1 for the names): for a draw whose
+// pipeline name contains <name>, every user-data word that looks like a table address W is taken as a root table; the
+// buffer V# at W + off is decoded and <len> (<= 64) bytes at V#.base + cboff are printed as the GPU sees them (arena) and
+// as title memory holds them, with the CBV_SHADOW entry (title address / size) that V#.base belongs to. For the noise
+// over gameplay: PS_TAA2_SpatialUpscaleWithDithering reads its per-channel dither gains at CB+0xc0..0xc8 (V# at s9+0x20).
+// First 12 lines per target, then only when the bytes change (<= 300 in all).
+inline void draw_peek(const Draw& draw, std::uint64_t pipe) {
+    struct Peek { std::string name; std::uint32_t off, cboff, len; std::string last; int lines; };
+    static std::vector<Peek> peeks = [] {
+        std::vector<Peek> r;
+        const char* e = std::getenv("LEONIDA_CE_DRAW_PEEK");
+        if (!e) return r;
+        const std::string t = e;
+        std::size_t p = 0;
+        while (p < t.size()) {
+            std::size_t q = t.find(',', p);
+            if (q == std::string::npos) q = t.size();
+            const std::string one = t.substr(p, q - p);
+            const std::size_t a = one.find(':');
+            const std::size_t b = a == std::string::npos ? a : one.find(':', a + 1);
+            const std::size_t c = b == std::string::npos ? b : one.find(':', b + 1);
+            if (c != std::string::npos) {
+                const std::uint32_t len = std::uint32_t(std::strtoul(one.c_str() + c + 1, nullptr, 0));
+                r.push_back({one.substr(0, a), std::uint32_t(std::strtoul(one.c_str() + a + 1, nullptr, 0)),
+                             std::uint32_t(std::strtoul(one.c_str() + b + 1, nullptr, 0)), std::min<std::uint32_t>(len ? len : 16, 64), {}, 0});
+            }
+            p = q + 1;
+        }
+        std::fprintf(stderr, "[hack] DRAW_PEEK: %zu target(s)\n", r.size());
+        return r;
+    }();
+    if (peeks.empty() || !pipe) return;
+    static std::mutex mu;
+    static std::unordered_map<std::uint64_t, std::vector<int>> which;
+    static int total = 0;
+    std::lock_guard lock(mu);
+    auto it = which.find(pipe);
+    if (it == which.end()) {
+        const std::string nm = ::leonida::ce::pipeline_name(pipe);
+        std::vector<int> w;
+        for (std::size_t i = 0; i < peeks.size(); ++i)
+            if (nm.find(peeks[i].name) != std::string::npos) w.push_back(int(i));
+        it = which.emplace(pipe, std::move(w)).first;
+    }
+    if (it->second.empty() || total >= 300) return;
+    std::uint8_t* const arena = ::leonida::ce::arena_host().load(std::memory_order_relaxed);
+    const std::uint64_t arena_n = ::leonida::ce::arena_bytes().load(std::memory_order_relaxed);
+    for (const int pi : it->second) {
+        Peek& pk = peeks[std::size_t(pi)];
+        std::string out;
+        char buf[256];
+        for (std::size_t k = 0; k < draw.user_data.size(); ++k) {
+            const std::uint32_t word = draw.user_data[k];
+            if (word < 0x10000) continue;
+            const std::uint64_t at = std::uint64_t(word) + pk.off;
+            std::uint32_t d[4] = {};
+            const char* dsrc = "arena";
+            if (arena && at + 16 <= arena_n) std::memcpy(d, arena + at, 16);
+            else if (copy_title_bytes(at, d, 16)) dsrc = "title";
+            else continue;
+            const std::uint64_t base = d[0] | (std::uint64_t(d[1] & 0xffff) << 32);
+            std::snprintf(buf, sizeof buf, "\n[hack]   ud[%zu]=%x +0x%x V#(%s) [%08x %08x %08x %08x] base 0x%llx size 0x%x:", k, word,
+                          pk.off, dsrc, d[0], d[1], d[2], d[3], (unsigned long long)base, d[2]);
+            out += buf;
+            std::uint32_t g[16] = {}, t[16] = {};
+            const std::uint64_t cb = base + pk.cboff;
+            const bool gok = arena && base && cb + pk.len <= arena_n;
+            if (gok) std::memcpy(g, arena + cb, pk.len);
+            const bool tok = base && copy_title_bytes(cb, t, pk.len);
+            out += gok ? " gpu" : " gpu UNREADABLE";
+            for (std::uint32_t i = 0; gok && i < pk.len / 4; ++i) {
+                float f;
+                std::memcpy(&f, &g[i], 4);
+                std::snprintf(buf, sizeof buf, " %08x(%g)", g[i], double(f));
+                out += buf;
+            }
+            if (tok) {
+                out += " | title@base";
+                for (std::uint32_t i = 0; i < pk.len / 4; ++i) {
+                    std::snprintf(buf, sizeof buf, " %08x", t[i]);
+                    out += buf;
+                }
+            }
+            std::uint64_t ct = 0, sva = 0;
+            std::uint32_t csz = 0;
+            if (auto fn = ::leonida::ce::cbv_title_fn().load(); base && fn && fn(base, &ct, &csz, &sva)) {
+                std::uint32_t now[16] = {};
+                const bool nok = copy_title_bytes(ct + (base - sva) + pk.cboff, now, pk.len);
+                std::snprintf(buf, sizeof buf, " | CBV_SHADOW 0x%llx = title 0x%llx size 0x%x (cb+0x%x %s the shadow)%s",
+                              (unsigned long long)sva, (unsigned long long)ct, csz, pk.cboff,
+                              base - sva + pk.cboff + pk.len <= csz ? "inside" : "PAST THE END OF", nok ? "; title now" : "");
+                out += buf;
+                for (std::uint32_t i = 0; nok && i < pk.len / 4; ++i) {
+                    std::snprintf(buf, sizeof buf, " %08x", now[i]);
+                    out += buf;
+                }
+            }
+        }
+        if (pk.lines >= 12 && out == pk.last) continue;
+        pk.last = out;
+        ++pk.lines;
+        ++total;
+        std::fprintf(stderr, "[hack] DRAW_PEEK %s (+0x%x, %u bytes at cb+0x%x) frame %llu:%s\n", pk.name.c_str(), pk.off, pk.len,
+                     pk.cboff, (unsigned long long)::leonida::ce::present_frame().load(std::memory_order_relaxed), out.c_str());
+        std::fflush(stderr);
+    }
+}
 template<typename Resolve>
 ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunctions& vk, PreparedDraw& p) {
     if (!vk.graphics_pipeline || !vk.buffer_at || !vk.image_view || !vk.begin_rendering || !vk.end_rendering ||
@@ -2460,6 +2567,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         }
     }
     rtdiag::count_draw(p.colors, p.depth.id, 0, reinterpret_cast<std::uint64_t>(p.pipeline));
+    draw_peek(draw, reinterpret_cast<std::uint64_t>(p.pipeline));  // agA32
 
     // HACK (Leonida CE): the shaders read the title's per-draw data (root arguments point into its upload ring) at
     // heap_base + VA, but the title writes it in its own memory; copy a window around each such address into the arena.
