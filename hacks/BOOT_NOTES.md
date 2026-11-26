@@ -2209,3 +2209,13 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   rt28 = rt27 env + LIST_TIME=1, LIST_TIME_MS=100.
 - /root/handoff/ovr114.tar (1.9 GB): all 1445 PS with waterfalls (129 wave32 + 1316 wave64) retranslated with the fix,
   1445/1445 spirv-val, index metadata identical. Not run yet (cold compile of 1445 PS pipelines).
+- rt28 (build 114, LIST_TIME): SAVE PATH END TO END: both listing reads 337/337 ok and "submit 2 op(s) ... -> 0x00000000"
+  (no re-list before the loss; the dialog itself not yet seen either way). Device loss ~850 s after the press (Hung, tiny
+  dump). LIST_TIME: the crawl is NOT GPU-bound (Likely): frames 2280-2340 took 215 s of wall time with only ~20 s of
+  direct-queue GPU time (1024-list summaries of 0.4-3.2 s). Top GPU users: Scaleform UI lists of 60-130 draws at
+  320-360 ms each (VBatchVertexCxformEAlpha_bc8bd7de, VText_a4ab6e63, VVertexCxformEAlpha_dc4780ad, VS_Blit), fspx
+  cs_fbda83d0 / cs_5b9456a5 / cs_02a02d7d / cs_8513f5a0 / cs_acb7f63b, one 1330 ms list of 76 dispatches (cs_acb7f63b,
+  cs_cd41306b, cs_ecb62afb, cs_3cc33dec). The UI lists are slow per draw (~3 ms) and worth a look, but most of the
+  wall time is spent off the GPU.
+- Build 115 (8340345c3): LEONIDA_CE_HANG_SAMPLE_MS/_FROM/_MAX: stack dump of every thread (+ queue/wait dumps) for each
+  frame slower than _MS after frame _FROM. rt29 = rt28 env + SAMPLE_MS=2000, FROM=1500, MAX=120.
