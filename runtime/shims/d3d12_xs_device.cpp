@@ -992,6 +992,101 @@ bool g_cbv_pool_failed = false;
 std::atomic<std::uint64_t> g_cbv_syncs{0}, g_cbv_changed_bytes{0}, g_cbv_changed_views{0};
 
 bool xs_cbv_title_of(std::uint64_t va, std::uint64_t* title, std::uint32_t* size, std::uint64_t* shadow_va);  // agA25
+
+// agA32 LEONIDA_CE_CBV_SHADOW_CHUNK=1 (default off; needs CBV_SHADOW >= 1): rt38 made 205k shadows (one per (title,
+// size)) - the title creates CBVs over and over on the same reused CB memory - so the 64 MiB pool filled (later CBVs fell
+// back to the ring snapshot, clobbered when the ring wraps) and every ExecuteCommandLists re-read all 205k with one
+// ReadProcessMemory each under g_cbv_mu: the late crawl (rt38 HANG_SAMPLE: title threads in xs_cbv_shadow waiting on the
+// mutex, the submit thread in xs_cbv_shadow_refresh). Here the shadow is per 64 KiB title chunk: a CBV on
+// [title, title + size) names chunk.va + (title - chunk.title); every CBV over the same title bytes shares them (as on the
+// console, where all of them read that memory). Chunks are refreshed whole (one read, per-4 KiB-page fallback when part
+// of the chunk is not readable) and only changed 4 KiB pages are written to the arena. A CBV whose chunks are not mapped
+// contiguously takes the old per-view shadow.
+constexpr std::uint64_t kCbvChunk = 64 << 10, kCbvPage = 4 << 10;
+struct XsCbvChunk {
+    std::uint64_t title = 0, va = 0;
+    std::vector<std::uint8_t> last;
+};
+std::map<std::uint64_t, std::size_t> g_cbv_chunk_index;  // title chunk base -> g_cbv_chunks slot
+std::deque<XsCbvChunk> g_cbv_chunks;
+std::uint64_t g_cbv_chunk_fallbacks = 0;
+bool xs_cbv_chunk_on() {
+    static const bool on = [] { const char* e = std::getenv("LEONIDA_CE_CBV_SHADOW_CHUNK"); return e && e[0] == '1'; }();
+    return on;
+}
+// Read title [at, at + n) into dst; pages that cannot be read keep dst's bytes. Returns true if anything was read.
+bool xs_cbv_read_pages(std::uint64_t at, std::uint8_t* dst, std::uint64_t n) {
+    SIZE_T got = 0;
+    if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(at), dst, n, &got) && got == n) return true;
+    bool any = false;
+    for (std::uint64_t o = 0; o < n; o += kCbvPage) {
+        got = 0;
+        const std::uint64_t k = (std::min)(kCbvPage, n - o);
+        if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(at + o), dst + o, k, &got) && got == k) any = true;
+    }
+    return any;
+}
+// Under g_cbv_mu with the pool ready. The arena VA for [title, title + size), or 0 (use the per-view shadow).
+std::uint64_t xs_cbv_chunk_shadow(std::uint64_t title, std::uint32_t size) {
+    const std::uint64_t p = title & ~(kCbvChunk - 1), q = (title + size - 1) & ~(kCbvChunk - 1);
+    const std::uint64_t n = (q - p) / kCbvChunk + 1;
+    std::uint64_t va0 = 0;
+    std::uint64_t mapped = 0;
+    for (std::uint64_t k = 0; k < n; ++k) {
+        const auto it = g_cbv_chunk_index.find(p + k * kCbvChunk);
+        if (it == g_cbv_chunk_index.end()) continue;
+        ++mapped;
+        const std::uint64_t va = g_cbv_chunks[it->second].va;
+        if (!va0 && k == 0) va0 = va;
+        if (!va0 || va != va0 + k * kCbvChunk) { ++g_cbv_chunk_fallbacks; return 0; }
+    }
+    if (mapped == n) {  // copy now as well (the per-view path did): the next refresh may come after the first use
+        static std::vector<std::uint8_t> tmp;  // plain static under g_cbv_mu
+        tmp.resize(size);
+        SIZE_T got = 0;
+        const std::uint64_t off = title - p;
+        if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(title), tmp.data(), size, &got) && got == size) {
+            for (std::uint64_t i = 0; i < size;) {
+                const std::uint64_t idx = (off + i) / kCbvChunk, within = (off + i) % kCbvChunk;
+                const std::uint64_t len = (std::min)(std::uint64_t(size) - i, kCbvChunk - within);
+                std::memcpy(g_cbv_chunks[g_cbv_chunk_index[p + idx * kCbvChunk]].last.data() + within, tmp.data() + i, len);
+                i += len;
+            }
+            std::memcpy(g_arena_mapped + va0 + off, tmp.data(), size);
+        }
+        return va0 + off;
+    }
+    if (mapped) { ++g_cbv_chunk_fallbacks; return 0; }
+    const std::uint64_t at = (g_cbv_pool_used + kCbvChunk - 1) & ~(kCbvChunk - 1);
+    if (at + n * kCbvChunk > g_cbv_pool_size) {
+        static std::atomic<int> told{0};
+        if (told++ < 4) {
+            std::fprintf(stderr, "[hack] CBV_SHADOW_CHUNK: pool full (%zu chunks); CBV at 0x%llx (+0x%x) takes a per-view shadow\n",
+                         g_cbv_chunks.size(), (unsigned long long)title, size);
+            std::fflush(stderr);
+        }
+        return 0;
+    }
+    g_cbv_pool_used = at + n * kCbvChunk;
+    for (std::uint64_t k = 0; k < n; ++k) {
+        XsCbvChunk c;
+        c.title = p + k * kCbvChunk;
+        c.va = g_cbv_pool_va + at + k * kCbvChunk;
+        c.last.assign(kCbvChunk, 0);
+        xs_cbv_read_pages(c.title, c.last.data(), kCbvChunk);
+        std::memcpy(g_arena_mapped + c.va, c.last.data(), kCbvChunk);
+        g_cbv_chunk_index[c.title] = g_cbv_chunks.size();
+        g_cbv_chunks.push_back(std::move(c));
+    }
+    const std::size_t total = g_cbv_chunks.size();
+    if ((total & (total - 1)) == 0 || (total & 255) == 0) {
+        std::fprintf(stderr, "[hack] CBV_SHADOW_CHUNK: %zu chunks (%llu MiB), %llu per-view fallbacks, pool used %llu KiB\n", total,
+                     (unsigned long long)(total * kCbvChunk >> 20), (unsigned long long)g_cbv_chunk_fallbacks,
+                     (unsigned long long)(g_cbv_pool_used >> 10));
+        std::fflush(stderr);
+    }
+    return g_cbv_pool_va + at + (title - p);
+}
 // Under g_cbv_mu. A DEFAULT buffer lands in the arena (VA = arena offset), so g_arena_mapped + VA is its CPU view.
 bool xs_cbv_pool_ready(ID3D12Device* dev) {
     if (g_cbv_pool) return true;
@@ -1035,6 +1130,11 @@ bool xs_cbv_pool_ready(ID3D12Device* dev) {
 bool xs_cbv_title_of(std::uint64_t va, std::uint64_t* title, std::uint32_t* size, std::uint64_t* shadow_va) {
     std::lock_guard lock(g_cbv_mu);
     if (!g_cbv_pool || va < g_cbv_pool_va || va >= g_cbv_pool_va + g_cbv_pool_size) return false;
+    for (const XsCbvChunk& c : g_cbv_chunks)  // agA32
+        if (va >= c.va && va < c.va + kCbvChunk) {
+            *title = c.title; *size = std::uint32_t(kCbvChunk); *shadow_va = c.va;
+            return true;
+        }
     for (const XsCbvShadow& e : g_cbv)
         if (va >= e.va && va < e.va + e.size) {
             *title = e.title; *size = e.size; *shadow_va = e.va;
@@ -1048,6 +1148,8 @@ std::uint64_t xs_cbv_shadow(ID3D12Device* dev, std::uint64_t title, std::uint32_
     if (xs_cbv_shadow_mode() <= 0 || !title || !size) return 0;
     std::lock_guard lock(g_cbv_mu);
     if (!xs_cbv_pool_ready(dev)) return 0;
+    if (xs_cbv_chunk_on())  // agA32
+        if (const std::uint64_t va = xs_cbv_chunk_shadow(title, size)) return va;
     XsCbvShadow* e = nullptr;
     auto it = g_cbv_index.find({title, size});
     if (it != g_cbv_index.end()) {
@@ -1098,6 +1200,21 @@ void xs_cbv_shadow_refresh() {
     std::lock_guard lock(g_cbv_mu);
     if (!g_cbv_pool) return;
     std::uint64_t bytes = 0, views = 0;
+    if (!g_cbv_chunks.empty()) {  // agA32 CBV_SHADOW_CHUNK: one read per chunk, changed 4 KiB pages written
+        static std::vector<std::uint8_t> chunk_scratch;  // plain static under g_cbv_mu (no thread_local: see below)
+        chunk_scratch.resize(kCbvChunk);
+        for (XsCbvChunk& c : g_cbv_chunks) {
+            std::memcpy(chunk_scratch.data(), c.last.data(), kCbvChunk);  // unreadable pages keep their contents
+            if (!xs_cbv_read_pages(c.title, chunk_scratch.data(), kCbvChunk)) continue;
+            for (std::uint64_t o = 0; o < kCbvChunk; o += kCbvPage) {
+                if (std::memcmp(c.last.data() + o, chunk_scratch.data() + o, kCbvPage) == 0) continue;
+                std::memcpy(c.last.data() + o, chunk_scratch.data() + o, kCbvPage);
+                std::memcpy(g_arena_mapped + c.va + o, chunk_scratch.data() + o, kCbvPage);
+                bytes += kCbvPage;
+                ++views;
+            }
+        }
+    }
     for (XsCbvShadow& e : g_cbv) {
         // agA31: one ReadProcessMemory into a scratch copy instead of xs_readable + memcmp on title memory: rt34 died
         // in that memcmp (VCRUNTIME, read of 0xbf3d9fd00) on CB pages the title released between the check and the read.
@@ -1129,8 +1246,8 @@ void xs_cbv_shadow_refresh() {
     g_cbv_changed_views += views;
     const std::uint64_t k = ++g_cbv_syncs;
     if ((k & (k - 1)) == 0 || (k & 4095) == 0) {
-        std::fprintf(stderr, "[hack] CBV_SHADOW: %llu syncs, %zu views, %llu KiB pool used, %llu views / %llu KiB refreshed in all\n",
-                     (unsigned long long)k, g_cbv.size(), (unsigned long long)(g_cbv_pool_used >> 10),
+        std::fprintf(stderr, "[hack] CBV_SHADOW: %llu syncs, %zu views + %zu chunks, %llu KiB pool used, %llu views / %llu KiB refreshed in all\n",
+                     (unsigned long long)k, g_cbv.size(), g_cbv_chunks.size(), (unsigned long long)(g_cbv_pool_used >> 10),
                      (unsigned long long)g_cbv_changed_views.load(), (unsigned long long)(g_cbv_changed_bytes.load() >> 10));
         std::fflush(stderr);
     }
