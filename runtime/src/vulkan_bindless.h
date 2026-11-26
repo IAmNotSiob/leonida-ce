@@ -49,6 +49,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <unordered_map>
@@ -242,6 +243,16 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
 
     auto& counts = features.counts;
     counts = default_counts();
+    // HACK (agA31): LEONIDA_CE_BINDLESS_2DA=<n> / LEONIDA_CE_BINDLESS_3D=<n> size the sampled 2D-array / 3D arrays (default
+    // 1024 / 256). rt36: "a bindless image array is full; dimension 1" (2D-array) - every later 2D-array view fell back
+    // to index 0. A different set layout changes every pipeline layout: one cold pipeline compile.
+    for (const auto& [name, dimension] : {std::pair<const char*, ImageDimension>{"LEONIDA_CE_BINDLESS_2DA", ImageDimension::dim_2d_array},
+                                          std::pair<const char*, ImageDimension>{"LEONIDA_CE_BINDLESS_3D", ImageDimension::dim_3d}}) {
+        if (const char* e = std::getenv(name)) {
+            const unsigned long v = std::strtoul(e, nullptr, 0);
+            if (v >= 16 && v <= 65536) counts[sampled_binding(dimension)] = std::uint32_t(v);
+        }
+    }
     std::uint32_t images = 1, samplers = 1, storage = 1;
     // Until the end the 2D storage arrays are not capped by the 2D images, which grow after them: capping can only
     // take descriptors away.

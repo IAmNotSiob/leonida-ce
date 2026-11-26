@@ -2241,3 +2241,122 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
      /root/handoff/ovr114.tar (all 1445 waterfall PS) is ready, untested.
   5. Arena leak (0 buffer releases, 2.6 GB by the loss) and the same g_placed growth: proxy_slot<70> stand-ins.
   Recommended env: build 116 + /root/handoff/rt29.env (add CAPTURE_EVERY=50 to see the screen).
+
+## agA31 (sender gen 31, 2026-11-26 overnight)
+- Receiver = the main session. Builds 117+. Work files /root/a31 (commit messages). Each handoff exe now has its pdb next to
+  it (/root/handoff/gta6rt-N.pdb): the build dir pdb is overwritten by the next build, so offsets of older runs' stacks
+  only symbolize against the matching pdb (rt29's samples symbolize only approximately now).
+- rt29 HANG_SAMPLE census (top non-waiting frames, 120 samples): xs_find_placed ~26, placed_title_of ~25 (ExecuteIndirect
+  argument buffer lookup), placed_buffer_holds ~15, arena_allocate ~10 => ~2/3 of slow-frame samples in O(n) walks
+  (g_placed 120k records; arena 88k free blocks = alignment gaps, 0 releases).
+- Build 117 (ac0d1e547, 791e8386a, 006073b0e):
+  * src/ce_placed_index.h: PaintIndex (disjoint segments tagged with the newest covering record = the reverse scan's
+    answer), ContainIndex (antichain of buffer ranges = placed_buffer_holds), resource -> newest record map. Only
+    without PLACED_EVICT. LEONIDA_CE_PLACED_INDEX=0 old scans, =2 cross-check ("[hack] PLACED_INDEX" census,
+    "PLACED_INDEX MISMATCH"). Offline random test vs the scans: 4.8M queries, 0 mismatches (Definite for the logic).
+  * Arena: largest free block per 1 MiB bucket of start offsets; first-fit / top-down walks skip buckets that cannot
+    fit => same block chosen. LEONIDA_CE_ARENA_BUCKETS=0 old, =2 verifies the table. Offline: 300k random ops give
+    identical offsets with and without (Definite), ~4.5x faster on a fragmented arena.
+  * PLACED_RESTAND (default 1): slot 70/71 texture view over the newest record being a TEXTURE of another description
+    (or another start) => reuse an exact earlier record at that va, else a fresh stand-in. rt29's ~37k VIEW_FMT_GUARD
+    refusals (BC1 image viewed as BC7, RGBA8 as BC7, ...) were all such stale records (Likely). =2 also for requests
+    landing in a buffer record (off: it would hide the buffer from CBV_FIX lookups). =0 old.
+  * LEONIDA_CE_NV_DIAG=<flags> VK_NV_device_diagnostics_config (0x2 resource tracking, 0x8 error reporting, 0x1 debug
+    info = cold shader cache, 0x4 auto checkpoints).
+- Build 118 (9b39c3440): SKIP_BAD also leaves out a refused texture copy (rt29: 14 whole submissions dropped,
+  "[copy] rejected at line 1906" = buffer<->image copy with no VkBuffer; 4 during the intro) - LEONIDA_CE_SKIP_BAD_COPY=0
+  old; LEONIDA_CE_RT_RETARGET=2 retargets across numeric classes (rt29: ~15k intro draws into 2560x1440 R32G32_UINT /
+  R32G32B32A32_UINT / R16_UINT targets left out for PSO fmt R8G8B8A8_UNORM; fragment outputs are float vec4 for every
+  target anyway, uint PSOs included).
+- rt30 (build 116, CAPTURE_EVERY=50): VM shots show the intro as exploded geometry (screen-wide triangles fanning
+  from one point, pink/green/grey), credits "Art Production / JAMES NICHOLSON ..." on top: the 3D scene draws, but
+  vertex positions are garbage (NaN/huge or a common point) => vertex/transform data, not just a refused texture.
+- rt30 (build 116, main session): two xgamesave submits S_OK (251528 bytes = a real game save, then 2308). Pace 9-22 s/60
+  then 284-333 s/60 from frame 2040. 65536+ "draw left out" (uint 2560x1440 targets), ~40k VIEW_FMT_GUARD refusals,
+  18 "ExecuteCommandLists failed". frame_002050 = exploded geometry, 2100-2250 flat purple. No device loss in 1800 s.
+- rt31 (build 118 + PLACED_INDEX=2, ARENA_BUCKETS=2, NV_DIAG=0x2, RT_RETARGET=2): PLACED_INDEX 0 mismatches in 1M
+  cross-checks (135k records, 72k segments); ARENA_BUCKETS verify 0 bad; VIEW_FMT_GUARD 0 (was ~40k); "draw left out" 0
+  (234 retarget lines); "ExecuteCommandLists failed" 0; PLACED_RESTAND 65536+: the old lookup handed 1x1 textures
+  (allocation 64 KiB, 4 KiB apart) their NEIGHBOUR's resource ("record @dd7bc7000 -> request va dd7bc8000") and
+  2048x512 textures the previous texture at overlapping addresses - every such view showed the wrong texture before.
+  NEW boot states after the press: 0->9 t=411, 9->10, 10->0, 0->11, 11->0 (t=432); never seen before (Plausible: the
+  load/save flow advancing). No device loss in 1500 s. Screens: navy ~10 min, then PURPLE noise, then GREEN noise: the
+  full-screen layer still shows noise (hue follows the scene grade). CRAWL NOT FIXED: 10-17 s/60, then 99-265 s/60 from
+  ~frame 2100. Its 65 samples (98 busy stacks, gta6rt-118.pdb): DirectStorage zlib inflate ~21, LayoutTracker copy in
+  VulkanQueue::execute ~12, placed texture uploads ~14 (proxy_slot<70> 9, refresh 6), placed scans only 2 (the =2
+  cross-check itself).
+- Build 119 (3bde79880): LEONIDA_CE_STANDIN_UPLOAD=1 (default off) copies title bytes into slot-70 BUFFER stand-ins
+  (made at fresh VAs by CreateCommittedResource; nothing ever filled them: BUFFER_SYNC off, the ring sync writes
+  arena[title VA]) on each view made over them. ~95k such stand-ins / 1.2 GB by the intro.
+- Build 120 (e9f244142): LayoutTracker undo log (LEONIDA_CE_TRACKER_UNDO, default on): VulkanQueue::execute copied the
+  whole tracker per submission for rollback; now edits in place with a first-touch undo log (tracker_mutex_ held from
+  the copy point to the commit, so identical). rt32 = build 120 + rt32.env (STANDIN_UPLOAD=1, PLACED_INDEX=1,
+  ARENA_BUCKETS=1).
+- rt31 noise analysis (frame_002300, 3840x2160): G = 211 everywhere, R and B jump 0/255 per pixel (R and B together), and
+  the pattern repeats EXACTLY every 64 px in x and y => a 64x64 tile at full scale, not uninitialised memory (Definite
+  for the periodicity). Candidate: the 64x64x32 blue-noise array the Scaleform dither PS read
+  (FTexTGDither_99e97f05: image_load (x&63, y&63, s0&31) unorm, triangular noise * 1/127.5 added to all 4 channels;
+  log has FTexTGDither / FTexTGCxformDither / _FTexTGCxformEAlphaDither in the lists). Why only R and B: open (exp is
+  compr: v1 = (R,G) halves, v2 = (B,A); R and B are the low halves - Trust me bro).
+- rt31 slow-frame SYNC_DUMP: GPU idle (direct queue submitted == completed), queue state "busy" = a thread inside
+  VulkanQueue::execute replaying lists on the CPU => the crawl is the single submit thread's CPU replay (Likely).
+- rt32 (build 120 + STANDIN_UPLOAD=1): states 9/10/11 ~2 min sooner (t=285-297); pace 7.0/7.7/24.4 s/60, then 53.6 s
+  at frame 2220 (rt31 265 s) => the LayoutTracker undo log cut the crawl ~5x (Likely). STANDIN_UPLOAD 32581 copies /
+  306 MiB, 187 unreadable. Died at t~400: AV in memcpy from proxy_slot<70> on a vanished title page (0xd4dfe0000):
+  xs_copy_title_seh's __try compiled to a 5-byte tail call into memcpy (memcpy is nounwind; no -fasync-exceptions)
+  => no SEH frame. xs_hash_title_seh / xs_detile_seh use the same pattern with inlined loads: probably unprotected too.
+- Build 121 (7a48d05bd): LEONIDA_CE_DIAG_TEX=WxH logs new SRV/UAV views of WxH images. Build 122 (8d697954d):
+  STANDIN_UPLOAD copies with ReadProcessMemory. rt33 = build 122 + rt33.env (rt32.env + DIAG_TEX=64x64).
+- rt33 (build 122 + DIAG_TEX=64x64): no early AV (ReadProcessMemory: 63705 copies / 1271 MiB, 1831 unreadable). States
+  9/10/11 at t=260-273. Pace 7.4/7.6/14.4 s/60, 67 s at 2220, 123 s at 2280. DEVICE LOST t~674 (~530 s after the press),
+  Aftermath "Reset" (hang), vertex shader "vertex_01" (size 34048) warps parked @0x3350/0x3370, no faulted warp; direct
+  checkpoint VS_HairStrandGeometry_8e7634e5 + PS_HairStrandVBuffer_8e7634e5 (hair strands: character rendering - new;
+  most likely it only gets real input now that STANDIN_UPLOAD fills the stand-ins). device_fault address 0x22531f480 =
+  3.4 GB BELOW heap_base (0x300010000): VSHARP_GUARD_ALL lets pointers below heap_base pass (upload buffers live there).
+- NOISE LEAD (Plausible): DIAG_TEX shows the 64x64 noise-sized SRVs are 3D volumes (T# type 10 = SQ_RSRC_IMG_3D,
+  64x64x32 / 64x64x64: R16F, RGBA16F, R32_UINT, R8, RG16F), while the Scaleform dither PS reads its noise with
+  image_load dim:SQ_RSRC_IMG_2D_ARRAY (layer = frame & 31). rdna2spirv picks the bindless table from the INSTRUCTION's
+  dim (%images_arr for 2D_ARRAY), but bind_image registers a 3D T# only in the 3D table, and the tables have separate
+  index spaces (vulkan_bindless.h add_image) => the dither reads slot <3D index> of the 2D-array table = some unrelated
+  texture, tiled 64x64 => full-scale periodic noise. On RDNA the T# type wins over the instruction dim. Fix options:
+  (a) bind_image: for a 3D T# also make a 2D-array twin image (W x H x depth layers; vkCmdCopyImage 3D <-> 2D array is
+  legal with maintenance1) and put it in the 2D-array table at the SAME index (reserve the index in both tables);
+  (b) translator: when the instruction dim and the T# type can differ, select the table from T# TYPE (word3 [31:28]) at
+  run time. Not done (time).
+- Build 123 (a33d72d96): REFRESH_CURRENT (default on, =0 old): the periodic placed-texture refresh only hashes records
+  still newest at their start (paint index). rt34: "pass 64: 7638 textures, 3043 superseded skipped".
+- rt34 (build 123 + LOOP_CAP_GFX / PTR_ALIGN_GFX = PS_MIRROR_PBR,HairStrand): HairStrand VS/PS capped (1 loop each,
+  512 blocks) + PS_MIRROR_PBR_MATERIAL_HAIR 13 loops. PACE HEALTHY: 7.6 / 7.7 / 15.5 / 11.9 s per 60 frames at frame
+  2220 (rt29-31: 130-290 s; rt33: 67 s) => the crawl is fixed at that point (Likely: index + tracker undo + refresh).
+  No GPU loss, but a CPU AV at t~370: memcpy+0x2023 reading 0xbf3d9fd00 from xs_cbv_shadow_refresh (gta6rt+0xf8dae)
+  <- child_slot<0,35> (console ExecuteCommandLists) on a title worker: the CB shadow memcmp against title memory
+  after an xs_readable check (TOCTOU). Same module offset as rt6 / rt8 / rt11's early AV (Likely the same bug).
+- Build 124 (c1f36082f): CBV_SHADOW refresh and first copy read title bytes with ReadProcessMemory. rt35 = build 124 +
+  rt35.env (= rt34.env).
+- Builds 124 AND 125 exited 2-4 s after launch on the VM (right after the title's first SetUnhandledExceptionFilter,
+  before xgameruntime loads; no "[error]" line, empty exit code; /root/rb/rt35-b125-fail.err.log), build 123 runs. CAUSE
+  (Likely): both added a "static thread_local std::vector" scratch in xs_cbv_shadow_refresh, which grew gta6rt's .tls block
+  0x1458 -> 0x1590 bytes and added dynamic TLS init + a TLS destructor; the loader's title-TLS handling does not survive
+  that. RULE: no thread_local objects in gta6rt; check "llvm-objdump -p gta6rt.exe" (.tls raw data size) before a handoff.
+  Build 125 (xs_title_copy: memcpy through an opaque pointer in __try; disassembly shows a real SEH landing pad) and 126
+  (same pattern in ce_copy_title / xs_hash_title_seh, + another thread_local) were reverted (954a5865f) unrun; the SEH
+  pattern itself was never tested on the VM.
+- Build 127 (9881293c2) = build 123 + CBV_SHADOW reads via ReadProcessMemory with a plain static scratch (.tls 0x1458 =
+  build 123). rt36 = build 127 + rt36.env (= rt34.env).
+  NOTE for TOCTOU reads of title memory: gta6rt is built without /EHa (only xmem_test / tiny_dll have it), so __try
+  around inlined loads or a direct memcpy protects nothing (ce_copy_title, xs_hash_title_seh, xs_detile_seh included).
+- Build 128 (5f0d4f05a): LEONIDA_CE_3D_TWIN=1 (default off): a sampled 3D view takes an index free in BOTH the 3D and
+  2D-array tables (vulkan_bindless.h add_image_twin) and leaves the fallback in the 2D-array slot, so a 2D_ARRAY read of
+  a 3D T# returns 0 (dither adds a constant -1/127.5) instead of another texture. Freed from both on release. rt36 =
+  build 128 + rt36.env (rt34.env + 3D_TWIN=1).
+- rt36 (build 128 + rt34.env + 3D_TWIN=1): *** FURTHEST RUN *** no early AV (CBV refresh via ReadProcessMemory), pace
+  2.7-4.3 s/60 frames to frame ~2000 (best ever), 13.7 at 2220, 4-10 s/60 to 2940, 28-32 s at 3180-3240, then
+  133-156 s/60 at 3300-3360. States 9/10/11 at t~214. Frames 2000-2650 black, 2700-3200 flat navy (16,16,22), 3250-3350
+  the noise layer again (yellow (255,255,0) / blue (0,0,255) per pixel: R,G and B saturate in opposite directions = a
+  large signed noise, not a mono dither). DEVICE LOST t=749.9, no fault address; direct checkpoint
+  VS/PS_DistantWindowEmissives_4eb040bb (city skyline windows - the 3D scene is the open world now), then a title AV
+  game+0x5267e47 (read 0xd00000008) after the loss. 3D_TWIN: 128+ twinned, 64+ "NO common index" (no index free in both
+  tables); noise unchanged => 3D_TWIN alone does not remove it (Likely).
+- Build 129 (b49ebb030): LEONIDA_CE_UPLOAD_3D=1 (default off): placed TEXTURE3D are uploaded from title memory (SRV
+  creation via slot 18 / 70, and the periodic refresh) with the xg Tex3d layout; before only TEXTURE2D were, so placed 3D
+  volumes (the intro's 64x64x32/64 noise volumes) held whatever the allocation contained. rt37 = build 129 + rt37.env.
