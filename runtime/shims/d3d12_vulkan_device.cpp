@@ -1269,18 +1269,12 @@ bool ce_copy_title(void* dst, std::uint64_t va, std::uint64_t bytes) {
         if (!VirtualQuery(reinterpret_cast<const void*>(at), &mbi, sizeof(mbi)) || mbi.State == MEM_FREE) return false;
         if (mbi.State == MEM_RESERVE && mbi.Type != MEM_MAPPED) return false;
     }
-    // agA31: memcpy through an opaque pointer and the result set after the call: clang (no -fasync-exceptions) drops
-    // the __try scope around a direct memcpy (nounwind), so a page released after the checks above was an AV.
-    static void* (*volatile copy_fn)(void*, const void*, size_t) = &std::memcpy;
-    volatile bool ok = false;
     __try {
-        auto* const f = copy_fn;
-        f(dst, reinterpret_cast<const void*>(va), static_cast<size_t>(bytes));
-        ok = true;
+        std::memcpy(dst, reinterpret_cast<const void*>(va), static_cast<size_t>(bytes));
+        return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        ok = false;
+        return false;
     }
-    return ok;
 }
 
 std::filesystem::path pipeline_cache_path() {

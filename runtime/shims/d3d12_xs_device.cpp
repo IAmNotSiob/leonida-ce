@@ -912,23 +912,6 @@ void xs_capture_frame(ID3D12CommandQueue* queue, ID3D12Resource* texture, std::u
     dev->Release();
 }
 
-// agA31: a title-memory copy that survives the pages vanishing. clang (no -fasync-exceptions) only protects CALLS that
-// may unwind inside __try; memcpy is nounwind (a direct call / tail call left no SEH scope: rt32), so the copy goes
-// through an opaque function pointer and the result is set after the call.
-using XsMemcpyFn = void* (*)(void*, const void*, std::size_t);
-XsMemcpyFn volatile g_xs_memcpy = &std::memcpy;
-__declspec(noinline) bool xs_title_copy(void* dst, const void* src, std::size_t n) {
-    volatile bool ok = false;
-    __try {
-        const XsMemcpyFn f = g_xs_memcpy;
-        f(dst, src, n);
-        ok = true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        ok = false;
-    }
-    return ok;
-}
-
 // HACK (Leonida CE boot): see set_console_arena.
 std::uint8_t* g_arena_mapped = nullptr;
 std::uint64_t g_arena_size = 0, g_ring_cpu = 0, g_ring_va = 0, g_ring_size = 0;
@@ -1086,8 +1069,9 @@ std::uint64_t xs_cbv_shadow(ID3D12Device* dev, std::uint64_t title, std::uint32_
         e = &g_cbv.back();
     }
     // Copy now as well: the first use may come before the next ExecuteCommandLists refresh.
-    // agA31: a released title page fails the copy instead of an AV; keep the previous (or zero) contents
-    if (!xs_title_copy(e->last.data(), reinterpret_cast<const void*>(title), size)) return e->va;
+    SIZE_T got = 0;  // agA31: ReadProcessMemory (a released title page reads as a failure, not an AV)
+    if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(title), e->last.data(), size, &got) || got != size)
+        return e->va;  // keep the previous (or zero) contents
     std::memcpy(g_arena_mapped + e->va, e->last.data(), size);
     return e->va;
 }
@@ -1115,14 +1099,15 @@ void xs_cbv_shadow_refresh() {
     if (!g_cbv_pool) return;
     std::uint64_t bytes = 0, views = 0;
     for (XsCbvShadow& e : g_cbv) {
-        // agA31: copy into a scratch buffer with xs_title_copy (SEH that works) instead of memcmp on title memory: rt34
-        // died in that memcmp (VCRUNTIME, read of 0xbf3d9fd00) on CB pages the title released after xs_readable (whose
-        // positive answers are cached for 200 ms) said yes. A failed copy = released title memory: keep the last contents.
+        // agA31: one ReadProcessMemory into a scratch copy instead of xs_readable + memcmp on title memory: rt34 died
+        // in that memcmp (VCRUNTIME, read of 0xbf3d9fd00) on CB pages the title released between the check and the read.
+        // A failed read = released title memory: keep the last contents.
         static thread_local std::vector<std::uint8_t> scratch;
         if (scratch.size() < e.size) scratch.resize(e.size);
-        const auto* src = reinterpret_cast<const std::uint8_t*>(e.title);
-        if (!xs_readable(src, e.size)) continue;  // released title memory: keep the last contents
-        if (!xs_title_copy(scratch.data(), src, e.size)) continue;
+        SIZE_T got = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(e.title), scratch.data(), e.size, &got) ||
+            got != e.size)
+            continue;
         if (std::memcmp(e.last.data(), scratch.data(), e.size) == 0) continue;
         std::memcpy(e.last.data(), scratch.data(), e.size);
         std::memcpy(g_arena_mapped + e.va, e.last.data(), e.size);
@@ -1472,34 +1457,20 @@ bool xs_copy_title_seh(void* dst, std::uint64_t va, std::uint64_t len) {
     return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(va), dst, static_cast<SIZE_T>(len), &got) && got == len;
 }
 bool xs_hash_title_seh(std::uint64_t va, std::uint64_t len, std::uint64_t stride, std::uint64_t* hash, std::uint64_t* nonzero) {
-    // agA31: the reads go through xs_title_copy (the inlined loads in a __try were not protected: no
-    // -fasync-exceptions). Dense strides copy 64 KiB chunks into a scratch buffer, sparse ones 8 bytes per sample.
-    std::uint64_t h = *hash, nz = *nonzero;
-    if (stride < 512) {
-        static thread_local std::vector<std::uint8_t> chunk;
-        constexpr std::uint64_t kChunk = 64 * 1024;  // a multiple of every stride below 512 that is a power of two
-        if (chunk.size() < kChunk) chunk.resize(kChunk);
-        for (std::uint64_t base = 0; base + 8 <= len; base += kChunk) {
-            const std::uint64_t n = (std::min)(kChunk, len - base);
-            if (!xs_title_copy(chunk.data(), reinterpret_cast<const void*>(va + base), static_cast<std::size_t>(n))) return false;
-            for (std::uint64_t o = (base + stride - 1) / stride * stride - base; o + 8 <= n; o += stride) {
-                std::uint64_t w = 0;
-                std::memcpy(&w, chunk.data() + o, 8);
-                h = (h ^ w) * 1099511628211ull;
-                nz |= w;
-            }
-        }
-    } else {
+    __try {
+        std::uint64_t h = *hash, nz = *nonzero;
         for (std::uint64_t o = 0; o + 8 <= len; o += stride) {
             std::uint64_t w = 0;
-            if (!xs_title_copy(&w, reinterpret_cast<const void*>(va + o), 8)) return false;
+            std::memcpy(&w, reinterpret_cast<const void*>(va + o), 8);
             h = (h ^ w) * 1099511628211ull;
             nz |= w;
         }
+        *hash = h;
+        *nonzero = nz;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
     }
-    *hash = h;
-    *nonzero = nz;
-    return true;
 }
 
 void xs_upload_placed_texture(ID3D12Device* dev, const D3D12_RESOURCE_DESC& console_desc, ID3D12Resource* tex,
