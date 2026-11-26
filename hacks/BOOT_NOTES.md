@@ -2414,3 +2414,48 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   names of the last full-screen draws before the UI; DIAG_TEX on the 64x64 2D-array SRVs too); (2) the late crawl past
   frame ~5800 (HANG_SAMPLE with gta6rt-131.pdb); (3) glyph cache (help text glyphs missing); (4) stand-in / bindless
   leak (entries never freed while g_placed holds every stand-in).
+
+## agA32 (sender gen 32, 2026-11-26 early morning)
+- Receiver = the main session. Builds 132+. Work files /root/a32 (edit scripts edit13N.py, commit messages, tile.py,
+  census.py = HANG_SAMPLE census of non-waiting stacks). Symbolize: copy gta6rt-N.exe/.pdb as gta6rt.exe/.pdb into one
+  folder (/root/a32/sym131) and run llvm-symbolizer --obj=gta6rt.exe 0x100000<rva> (ImageBase 0x10000000000).
+- NOISE ANALYSIS (rt36/rt37/rt38 frames): the 64x64 tile has EXACTLY 2048 texels in one class and 1877 + 171 in the
+  other, and B is a ramp that takes 171 distinct values once each (0,1,3,4,...,253) => out = saturate(S + g*(2n-1)) with
+  n a 64x64 noise of 4096 distinct levels (16-bit / float), S ~ 0 (black scene), g per channel: B ~ +12 in all three runs
+  (identical B histograms), R/G = +-huge or ~0 and different per run (rt36 R,G = -big; rt38 G = +big, R ~ 0) (Definite for
+  the arithmetic). Static across frames (layer index not changing, or the same garbage).
+- THE PASS (Likely): PS_TAA2_SpatialUpscaleWithDithering_08f754c8 (2560x1440 -> output upscale):
+  out.rgb = bicubic(scene T# at table s9+0x0) / w + CB[0xc0], CB[0xc4], CB[0xc8] * (2 * image_load(x&63, y&63,
+  CB[0xbc]&31, 2D_ARRAY unorm, T# at s8+0x2a0) - 1); CB V# at s9+0x20. Exactly the observed form: the per-channel dither
+  gains CB+0xc0..0xc8 are garbage (should be ~1/255-ish), the scene term is ~0.
+- CBV_SHADOW POOL: "CBV_SHADOW: pool full (~205k views)" in rt36 (after frame 3300), rt37 (~3000), rt38 (~5800): later
+  CBVs fall back to the one-time ring snapshot (clobbered when the ring wraps). Coincides with the noise onset (rt38),
+  close to it in rt36 (noise already at 3250) (Plausible as the gain source).
+- LATE CRAWL ROOT CAUSE (Likely): rt38 HANG_SAMPLE frames >= 5800 (90 samples, gta6rt-131.pdb): title threads in
+  proxy_slot<17> (CreateConstantBufferView) -> xs_cbv_shadow waiting on g_cbv_mu (37), the submit thread in
+  xs_cbv_shadow_refresh (28) <- child_slot<0,35>; the rest is nvgpucomp (pipeline compiles for gameplay). The refresh does
+  one ReadProcessMemory + memcmp per shadow per ExecuteCommandLists: 205k per sync by then ("16384 syncs, 205530 views").
+- GLYPHS: not lost, LATE: rt38v s14 (05:37) shows "M .. d / M .. th", s16 (05:41) "Move around / Move the camera".
+  The 2048x2048 A8 glyph cache (0x400000 bytes, fully hashed) is refreshed every 30 presents = ~60 s at the crawl's pace.
+- Build 132 (156e03e1e): LEONIDA_CE_FRAME_TRACE=<f>[,<a>-<b>] (every replayed list of those frames, pipelines in order),
+  RTDIAG per-target pipeline names ("[rtdiag]     pipe xN"), LEONIDA_CE_RTDIAG_DUMP_FROM, RGBA16F target dumps,
+  LEONIDA_CE_BINDLESS_1D=<n> (the 256-entry 1D table filled in rt36-rt38, "dimension 3").
+- Build 133 (59e062195): LEONIDA_CE_DRAW_PEEK=name:off:cboff:len (CB bytes a draw reads: arena and title view, CBV_SHADOW
+  source).
+- Build 134 (7ca9d790a): LEONIDA_CE_CBV_SHADOW_CHUNK=1 (default off): shadows per 64 KiB title chunk shared by every CBV
+  over those bytes; refresh = one read per chunk, changed 4 KiB pages written. Use with CBV_SHADOW_MB=256.
+- rt39 (build 132 + rt39.env, cold compile): "bindless set: ... 16384 1D", NO "array is full; dimension 3" (1D fixed).
+  CBV_SHADOW pool full again (204909 views). Intro reached only at frame ~7800 (cold compile shifted frame numbers, so the
+  FRAME_TRACE frames 5000-6101 were a 3-draw loading screen). Noise STILL there (purple, VM shot 06:26) => the 1D table
+  is not the cause. DEVICE LOST at frame 7916 (Aftermath "Hung", direct checkpoint VS/PS_DistantWindowEmissivesDeferred_
+  58ac1373 - loop-free VS/PS, like rt36's DistantWindowEmissives hang), then title AVs (VCRUNTIME memcpy write from
+  game+0x4e5b4b8; game+0x43adfb0 read 0x40). rtdiag 7800: the presented image is written only by sga_dr_vs_pos_color_tex +
+  default_ps_tex (a blit of a 3840x2160 image); 18k draws still pending-pso then.
+- rt40 (build 134 + rt40.env = rt39.env + CBV_SHADOW_CHUNK=1, CBV_SHADOW_MB=256, FRAME_TRACE 7600..10000, DUMP from 7200,
+  DRAW_PEEK on SpatialUpscaleWithDithering) was QUEUED when agA32 stopped; results not analysed.
+- NEXT (agA33): (1) read rt40: "CBV_SHADOW_CHUNK:" chunk count / no "pool full", pace past the intro, DRAW_PEEK lines (the
+  dither gains at CB+0xc0..0xc8 as the GPU sees them, their source: CBV_SHADOW chunk/view or ring) and whether the noise
+  is gone. If the gains are garbage in the arena but sane in title memory -> a CB sync problem; if title memory is also
+  garbage -> wrong V# (table offset / root layout). (2) The scene term is ~0 (black) even where the noise is not: check
+  the dumps' 2560x1440 targets. (3) Device hang in DistantWindowEmissives(Deferred) VS (rt36, rt39). (4) Glyphs: refresh
+  glyph caches more often than every 30 presents (or fix the crawl).
