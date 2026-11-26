@@ -2496,3 +2496,37 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
     logged for every probed target either way, so a missing file means all zero (or a format that is not dumped).
 - rt42 = build 136 + rt42.env (rt41.env + CBV_PLACED_ALIAS=1, RTDIAG_TOP=24, DRAW_SRV on SpatialUpscaleWithDithering
   0x0-0x2c0 / CompositeNMB / SSSResolve 0x0-0x100, dumps every 300 frames from 3600).
+
+## agA35 (sender gen 35, 2026-11-26 morning)
+- Receiver = the main session. Work files /root/a35 (edit137.py, msg137.txt).
+- THE #58 "ALIAS" IS NOT REAL (Very likely): record #58 = 3840x2160 fmt 19 (R32G8X24) at 0xddefa0000, size 0x3fc0000 = the PC
+  GetResourceAllocationInfo size. The title placed its next resources at 0xde17f0000 (+0x2850000 = ~40.3 MiB = D32 + S8 planes
+  of 3840x2160 with tile padding), then 0xde1c3b000.. and the CB pool 0xde22a....: on the console the texture ends before the TAA
+  CB. The CB 0xde22af580 (+0xd0, slot 133, flags 0) sits among small CB buffers packed in one 64 KiB page (de22ad930,
+  de22afdd0.., rt41 lines 8413-8530). No bigger BUFFER record covers it. So memory aliasing (shared VkDeviceMemory) is not the fix
+  for this CB, and it was not implemented. If it is ever needed: placed textures are separate VkImages with their own memory
+  (create_texture, even in a D3D12 heap), and buffers are arena ranges (create_placed_buffer); the arena memory is HOST_VISIBLE
+  (prefers DEVICE_LOCAL), so an image would have to be bound into arena.memory at a heap offset (check memoryTypeBits).
+- THE WRITER (Likely): the CB title bytes never change and look like recycled CPU data, so the CPU does not write them, and
+  xmem aliases physical pages for the CPU (map_alias), so another CPU mapping would show at the title VA too. The 23 CBV_PLACED
+  stand-ins stay zero, so no recorded D3D12 copy, UAV or root write reaches them. Console list slot 62 = GPU memcpy by VA
+  (dst VA, src VA, bytes, flags; agA21: fn 0x140979650, first call dst 0xdaa3e7ef0 <- src 0xbdbc50000, 0x4000) is still
+  DROPPED by the list proxy ("console list slot 62 (not forwarded)" in rt41). It is the only dropped GPU writer of title memory.
+- Build 137 (c2d88bf13): LEONIDA_CE_LIST_COPY62.
+  * =1 records and logs the calls: "LIST_COPY62 #k from <ra>: dst .. <- src .., bytes | dst rec .. [CBV_PLACED] | src rec ..".
+    It logs the first 48, every 2^k-th, up to 200 onto placed buffers and up to 200 onto CBV_PLACED buffers.
+  * =2 also performs the recorded copies, in list order, right BEFORE the list's ExecuteCommandLists (before
+    xs_cbv_shadow_refresh). It reads src with ReadProcessMemory, writes the dst title bytes with WriteProcessMemory, and copies
+    into every placed BUFFER stand-in in the arena under dst ("LIST_COPY62 done ..." lines). The summary line ends with
+    "CBV_PLACED stand-ins non-zero: N of M".
+  * =3 is like 2, but only for copies whose dst is a placed buffer.
+  * Limits: a CPU copy at submit reads the src as the CPU left it. If the src is GPU-written in the same frame, it is stale;
+    then the next step is a real in-list arena-to-arena vkCmdCopyBuffer when both ends resolve to stand-ins.
+  * .tls unchanged.
+- rt43 = build 137 + rt43.env (rt42.env + LIST_COPY62=2), requested from the main session. Results are not seen by agA35.
+- NEXT (agA36):
+  (1) Read rt43: do slot-62 dsts cover 0xde22af580 / CBV_PLACED buffers? What are the srcs (upload ring, a placed buffer, title
+      heap)? What is the non-zero count, the DRAW_PEEK values, and is the picture still black?
+  (2) If the dsts never touch the CBs, look at the other dropped list slots (74, 101, 126, 129, 131, 132, 142, 28-30, 70, 75),
+      and at slots 71/72 (write32/64, applied only after the fence).
+  (3) If the srcs are GPU-written, do the copy on the GPU in list order.
