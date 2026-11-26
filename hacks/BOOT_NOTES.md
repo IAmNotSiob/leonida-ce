@@ -2581,3 +2581,27 @@ Where it stands:
   start. That is the next cheap check: if the screen stops being black, the data is right and only the GPU copy path is wrong.
 - Device losses are back: rt42 (713 s), rt43 (558 s), rt46 (446 s); rt41 and rt44 were clean. Unexplained.
 - Runs/logs: /root/rb/rt41..rt46.err.log; envs /root/handoff/rt41..rt47.env; builds /root/handoff/gta6rt-135..140.exe.
+
+## agA36 (sender gen 36, 2026-11-26 afternoon)
+- Receiver = the main session. Work files /root/a36 (edit141.py, edit141b.py, msg141.txt).
+- rt46 IS INCONCLUSIVE about the COPY_SRC_SYNC=1 GPU copy (Very likely): it died (AV at 0x0, after fence mirrors went UINT64_MAX)
+  at ~frame 3730, right after gameplay started. Only 2 frames of TAA copies ([watch] dst #4 and #8); the summary
+  "CBV_PLACED stand-ins non-zero: 1 of 23" was printed at submit 128, BEFORE any TAA copy (submit 256 never came); the one
+  DRAW_PEEK (frame 3729) is from replaying the first TAA frame. So "the synced copy doesn't land" was never measured.
+- Ruled out by reading the code + rt46 (Likely to Very likely):
+  * dst VA mismatch: the CB's CBV (device CBV #1), CBV_PLACED, the copy's dst ([watch] list CopyBufferRegion dst) and DRAW_PEEK's
+    V# all name stand-in 0xffdc9f00 (rt46). The record is placed once (slot 133 placed #2), not re-placed per frame.
+  * "CBV_SHADOW 0xffdc9f00 = title ..." in DRAW_PEEK is just cbv_title_fn's label for the range, not a different binding.
+  * placed buffers = arena ranges: binding.buffer = arena.buffer, buffer_offset = va_ = GetGPUVirtualAddress, so
+    g_arena_mapped + sg is exactly what the replay's vkCmdCopyBuffer reads. Buffer copies are not rejected in rt44/rt46 (the
+    only "[copy] rejected" lines are line 1944, a texture path).
+  * Apply order at ExecuteCommandListsX (slot 35): refresh placed buffers -> xs_lc62_apply (src sync) -> CBV refresh -> real
+    ExecuteCommandLists. List extras are erased at ResetX (slot 139); recorded ~= done in rt46, so no list is left out.
+  * Open: DRAW_PEEK reads the arena on the CPU while the draw is replayed, before that submit's copy runs. It shows an earlier
+    frame's copy only once the GPU has finished it.
+- Build 141 (c673281b6): LEONIDA_CE_COPY_SRC_TRACE=1 (needs WATCH_RANGE): CSS_TRACE rec / apply (dst stand-in BEFORE, src
+  words) / gpu (after a runtime fence behind the submit: LANDED / ZERO / DIFFERENT) / unapplied lines for copies into the
+  watch range. xs_queue_signal factored out of xs_schedule_list_writes. LEONIDA_CE_COPY_SRC_SYNC=3 = 2 + the forwarded GPU
+  copy dropped for buffer-stand-in destinations (A/B). .tls 0x1459. Built with agA37's uncommitted WIP in the tree (SKIP_GFX,
+  LOOP_CAP "pattern:N"); both inert under rt48/rt49.env.
+- rt48 = build 141 + rt48.env (rt47.env, COPY_SRC_SYNC=1, COPY_SRC_TRACE=1); rt49 = rt48.env with COPY_SRC_SYNC=3.
