@@ -12490,6 +12490,32 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         std::fprintf(stderr, "[hack] NV checkpoints: %s\n", want_checkpoints ? "on" : "off");
         if (want_checkpoints) device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
     }
+    // HACK (agA31): LEONIDA_CE_NV_DIAG=<flags> -> VK_NV_device_diagnostics_config, so an Aftermath dump carries more
+    // than "Hung": 0x1 SHADER_DEBUG_INFO (driver debug info; changes compiled shaders = cold pipeline cache),
+    // 0x2 RESOURCE_TRACKING, 0x4 AUTOMATIC_CHECKPOINTS (driver markers, slower), 0x8 SHADER_ERROR_REPORTING.
+    // Default off. Needs the Aftermath monitor on the machine to collect the dump.
+    static VkPhysicalDeviceDiagnosticsConfigFeaturesNV diag_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DIAGNOSTICS_CONFIG_FEATURES_NV};
+    static VkDeviceDiagnosticsConfigCreateInfoNV diag_info{VK_STRUCTURE_TYPE_DEVICE_DIAGNOSTICS_CONFIG_CREATE_INFO_NV};
+    {
+        char dv[16] = {};
+        std::size_t dl = 0;
+        const std::uint32_t flags = getenv_s(&dl, dv, "LEONIDA_CE_NV_DIAG") == 0 && dl > 1
+            ? std::uint32_t(std::strtoul(dv, nullptr, 0)) & 0xFu : 0u;
+        const bool have = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+            return std::strcmp(e.extensionName, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME) == 0;
+        });
+        if (flags) {
+            std::fprintf(stderr, "[hack] NV_DIAG: flags 0x%x %s\n", flags, have ? "on" : "(extension missing: off)");
+            if (have) {
+                device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
+                diag_features.diagnosticsConfig = VK_TRUE;
+                diag_features.pNext = const_cast<void*>(device_info.pNext);
+                diag_info.flags = flags;
+                diag_info.pNext = &diag_features;
+                device_info.pNext = &diag_info;
+            }
+        }
+    }
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
