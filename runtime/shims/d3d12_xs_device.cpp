@@ -1129,7 +1129,7 @@ void xs_cbv_shadow_refresh() {
 // views of them (slots 70/71: (resource desc, view desc, handle), the PC view description followed by the title
 // address at +40). The resources are stand-ins not backed by the title's memory yet.
 // magic code, don't wanna deal with hours of plumbing with what these conjured devils of the souls of gpt 6 astra did.. jeez
-struct XsPlaced { std::uint64_t va, size; ID3D12Resource* resource; D3D12_RESOURCE_DESC desc; int refs = 0; };
+struct XsPlaced { std::uint64_t va, size; ID3D12Resource* resource; D3D12_RESOURCE_DESC desc; int refs = 0; bool owned = false; };
 std::mutex g_placed_mu;
 std::deque<XsPlaced> g_placed;  // agA5: deque, so xs_find_placed pointers survive push_back
 // HACK (agA13): LEONIDA_CE_PLACED_EVICT=1. The arena never released a buffer (re28/re29: 57344 allocations, 0
@@ -1208,7 +1208,7 @@ void xs_record_placed(std::uint64_t va, std::uint64_t size, ID3D12Resource* reso
             }
         }
         g_placed.push_back({va, size ? size : 1, resource, console_desc ? *console_desc : resource->GetDesc(),
-                            (keep ? 1 : 0) + ((owned && evict) ? 1 : 0)});
+                            (keep ? 1 : 0) + ((owned && evict) ? 1 : 0), owned});
         if (evict) g_placed_live[va] = g_placed.size() - 1;
         if (!evict) {  // agA31: indexes (cheap; kept even with PLACED_INDEX=0 so the switch costs nothing to flip)
             const std::size_t idx = g_placed.size() - 1;
@@ -1439,6 +1439,14 @@ leonida::xg::Error xs_detile_seh(const leonida::xg::Layout& lay, const std::uint
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         *faulted = true;
         return leonida::xg::Error::TooSmall;
+    }
+}
+bool xs_copy_title_seh(void* dst, std::uint64_t va, std::uint64_t len) {  // agA31 STANDIN_UPLOAD
+    __try {
+        std::memcpy(dst, reinterpret_cast<const void*>(va), len);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
     }
 }
 bool xs_hash_title_seh(std::uint64_t va, std::uint64_t len, std::uint64_t stride, std::uint64_t* hash, std::uint64_t* nonzero) {
@@ -5425,6 +5433,32 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             }
         }
         if (!placed) placed = restand_from;  // agA31
+        // HACK (agA31, LEONIDA_CE_STANDIN_UPLOAD=1, default off): a BUFFER stand-in this slot made (fresh VA, CreateCommitted-
+        // Resource) never got the title's bytes: nothing copies them (BUFFER_SYNC is off, the ring sync writes arena[title
+        // VA], not the stand-in). Each view made over such a stand-in copies the title bytes of the whole stand-in into
+        // it (arena memory, CPU-visible through g_arena_mapped), so vertex / structured data read through the SRV is the
+        // title's at view time. Up to 16 MiB per copy.
+        if (placed && placed->owned && placed->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && g_arena_mapped) {
+            static const bool up = [] { const char* e = std::getenv("LEONIDA_CE_STANDIN_UPLOAD"); return e && e[0] == '1'; }();
+            const std::uint64_t gpu = up && placed->resource ? placed->resource->GetGPUVirtualAddress() : 0;
+            const std::uint64_t len = placed->size;
+            if (gpu && len && len <= (16ull << 20) && gpu < g_arena_size && len <= g_arena_size - gpu) {
+                rt::xmem::commit_physical_range(reinterpret_cast<const void*>(placed->va), len);
+                static std::atomic<std::uint64_t> ok{0}, bad{0}, bytes{0};
+                if (xs_readable(reinterpret_cast<const void*>(placed->va), static_cast<UINT_PTR>(len)) &&
+                    xs_copy_title_seh(g_arena_mapped + gpu, placed->va, len)) {
+                    ++ok;
+                    bytes += len;
+                } else {
+                    ++bad;
+                }
+                const std::uint64_t k = ok + bad;
+                if ((k & (k - 1)) == 0)
+                    std::fprintf(stderr, "[hack] STANDIN_UPLOAD: %llu copies (%llu MiB), %llu unreadable; last va %llx +0x%llx -> arena 0x%llx\n",
+                                 (unsigned long long)ok.load(), (unsigned long long)(bytes.load() >> 20), (unsigned long long)bad.load(),
+                                 (unsigned long long)placed->va, (unsigned long long)len, (unsigned long long)gpu);
+            }
+        }
         static std::atomic<int> logged{0};
         if (logged++ < 8) {
             std::fprintf(stderr, "[hack] placed %s: va=%llx dim=%d %llux%u fmt=%d -> %s\n", Slot == 70 ? "SRV" : "UAV",
