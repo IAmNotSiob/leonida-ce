@@ -2605,3 +2605,33 @@ Where it stands:
   copy dropped for buffer-stand-in destinations (A/B). .tls 0x1459. Built with agA37's uncommitted WIP in the tree (SKIP_GFX,
   LOOP_CAP "pattern:N"); both inert under rt48/rt49.env.
 - rt48 = build 141 + rt48.env (rt47.env, COPY_SRC_SYNC=1, COPY_SRC_TRACE=1); rt49 = rt48.env with COPY_SRC_SYNC=3.
+
+## agA37 (sender gen 37, 2026-11-27) - the returning GPU losses
+- Work files /root/a37 (edit141.py, msg143.txt, capt.cpp = offline LOOP_CAP + spirv-val over the compute corpus).
+- All four new losses are HANGS (TDR; vkGetDeviceFaultInfo 0 addresses; rt47 Aftermath "Hung", 2.9 KB, no warps).
+- rt46 + rt47 (Definite for the log facts): compute queue 4 never completed its FIRST submission ("sem queue 4 current 0
+  max-signal 6"; rt47 marks it "awaited, signal submitted but not reached"); its checkpoint top AND bottom =
+  cs_22383ee2; the direct queue waits on queue 4 => the whole GPU stalls. rt41/rt44 (clean): queue 4 completed 8502 / 731.
+  cs_22383ee2 (64 threads, 1 group): s10 = CB[0x4] (CB V# at table+0x40), loop s12 = 0 .. ceil(s10/64) with a buffer
+  load + subgroup sum + LDS atomic per iteration => a garbage count (e.g. 0x40b5ac30) = ~2^24-2^26 iterations = TDR.
+  Cause of the hang (Likely): that loop with a bad count. Why the count is bad is open (CB source: CBV_PLACED stand-in,
+  ring, or GPU-written). rt47 had 0 TAA copies and only 16 COPY_SRC_SYNC copies, so COPY_SRC_SYNC is not the trigger.
+- rt42 / rt43 (ALIAS runs): direct queue checkpoint in VS/PS_DistantWindowEmissives_4eb040bb (top+bottom = its marker
+  in rt42; rt43 top already at the next cs_87436348). Same pipeline as the rt36 hang, Deferred variant in rt39. Both
+  shaders are loop-free (forward branches only; the VS global_load_dwordx3 reads an s_getpc constant table). Queue 4 was
+  also behind in both (1579/1585, 575/581), so cs_22383ee2 may be the real culprit there too (Plausible).
+  DWE theory (Trust me bro): garbage CB matrices / instance data give screen-sized quads x many instances. In
+  rt41/rt44 the CBV_PLACED stand-ins are zero => all positions 0 => degenerate => cheap.
+- Build 143 (e60ac2155; 141/142 belong to agA36):
+  * LEONIDA_CE_LOOP_CAP items take "pattern:N" (own inner cap; first match wins). Recommended:
+    LOOP_CAP=cs_d5613de2,cs_d94af257,cs_f33ac9e9,1:0x80000 (every compute program, 2^19 iterations per loop per
+    invocation; counters are cumulative per invocation, so nested loops share the budget). Offline: 1396 of 1536
+    fspx_game modules gain a cap, 1396/1396 spirv-val clean. Cold compute compile once.
+  * LEONIDA_CE_SKIP_GFX=sub1,.. (default off): draws of pipelines with a matching stage name are left out (after
+    DRAW_PEEK/DRAW_SRV); "[hack] SKIP_GFX #k" logs count/instances/indirect. Bisect knob for DistantWindowEmissives.
+  * .tls 0x1459.
+- rt50 = build 143 + rt50.env (= rt47.env + the LOOP_CAP line above), requested from the main session.
+- NEXT: if rt50 still loses the device in DWE -> a run with SKIP_GFX=DistantWindowEmissives and
+  DRAW_PEEK=DistantWindowEmissives:0x140:0x160:0x40,DistantWindowEmissives:0x120:0x58:0x10 (VS camera matrix / counts).
+  If cs_22383ee2 stops hanging, find its CB (table+0x40, +0x4): probably a per-frame count written through the same
+  upload ring -> CopyBufferRegion path as the TAA CB (the agA36 COPY_SRC work).
