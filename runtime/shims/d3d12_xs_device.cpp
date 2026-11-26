@@ -1472,20 +1472,34 @@ bool xs_copy_title_seh(void* dst, std::uint64_t va, std::uint64_t len) {
     return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(va), dst, static_cast<SIZE_T>(len), &got) && got == len;
 }
 bool xs_hash_title_seh(std::uint64_t va, std::uint64_t len, std::uint64_t stride, std::uint64_t* hash, std::uint64_t* nonzero) {
-    __try {
-        std::uint64_t h = *hash, nz = *nonzero;
+    // agA31: the reads go through xs_title_copy (the inlined loads in a __try were not protected: no
+    // -fasync-exceptions). Dense strides copy 64 KiB chunks into a scratch buffer, sparse ones 8 bytes per sample.
+    std::uint64_t h = *hash, nz = *nonzero;
+    if (stride < 512) {
+        static thread_local std::vector<std::uint8_t> chunk;
+        constexpr std::uint64_t kChunk = 64 * 1024;  // a multiple of every stride below 512 that is a power of two
+        if (chunk.size() < kChunk) chunk.resize(kChunk);
+        for (std::uint64_t base = 0; base + 8 <= len; base += kChunk) {
+            const std::uint64_t n = (std::min)(kChunk, len - base);
+            if (!xs_title_copy(chunk.data(), reinterpret_cast<const void*>(va + base), static_cast<std::size_t>(n))) return false;
+            for (std::uint64_t o = (base + stride - 1) / stride * stride - base; o + 8 <= n; o += stride) {
+                std::uint64_t w = 0;
+                std::memcpy(&w, chunk.data() + o, 8);
+                h = (h ^ w) * 1099511628211ull;
+                nz |= w;
+            }
+        }
+    } else {
         for (std::uint64_t o = 0; o + 8 <= len; o += stride) {
             std::uint64_t w = 0;
-            std::memcpy(&w, reinterpret_cast<const void*>(va + o), 8);
+            if (!xs_title_copy(&w, reinterpret_cast<const void*>(va + o), 8)) return false;
             h = (h ^ w) * 1099511628211ull;
             nz |= w;
         }
-        *hash = h;
-        *nonzero = nz;
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
     }
+    *hash = h;
+    *nonzero = nz;
+    return true;
 }
 
 void xs_upload_placed_texture(ID3D12Device* dev, const D3D12_RESOURCE_DESC& console_desc, ID3D12Resource* tex,
