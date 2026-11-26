@@ -486,6 +486,11 @@ std::map<const void*, std::uint64_t> g_list_pso;
 std::map<const void*, XsListExtras> g_list_extras;  // keyed by the console list proxy
 struct XsPendingWrites { ID3D12Fence* fence; std::uint64_t value; std::vector<XsDeferredWrite> writes; };
 std::vector<XsPendingWrites> g_pending_writes;      // under g_fence_mirror_mu
+// agA36 LEONIDA_CE_COPY_SRC_TRACE: COPY_SRC_SYNC copies into WATCH_RANGE, checked once the queue's fence passes the submit.
+struct XsCssCheck { std::uint64_t k, src, dst, src_gpu, dst_gpu, bytes; std::uint32_t want[4]; };
+struct XsCssPending { ID3D12Fence* fence; std::uint64_t value; std::vector<XsCssCheck> checks; };
+std::vector<XsCssPending> g_css_pending;            // under g_fence_mirror_mu
+void xs_css_check_done(const XsCssCheck& c);
 
 void xs_do_write(const XsDeferredWrite& w) {
     std::uint64_t v = w.value;
@@ -551,6 +556,15 @@ DWORD WINAPI xs_fence_mirror_thread(void*) {
                     ++it;
                 }
             }
+            for (auto it = g_css_pending.begin(); it != g_css_pending.end();) {  // agA36 COPY_SRC_TRACE
+                const std::uint64_t cv = it->fence->GetCompletedValue();
+                if (cv >= it->value) {
+                    for (const auto& c : it->checks) xs_css_check_done(c);
+                    it = g_css_pending.erase(it);
+                } else {
+                    ++it;
+                }
+            }
         }
         Sleep(1);
     }
@@ -563,6 +577,7 @@ void xs_start_mirror_thread() {
     (void)started;
 }
 
+bool xs_queue_signal(ID3D12CommandQueue* queue, ID3D12Fence*& fence, std::uint64_t& value);
 // After the queue has taken `lists` (console list proxies): their bottom-of-pipe writes happen once the work is done.
 void xs_schedule_list_writes(ID3D12CommandQueue* queue, UINT count, const std::uint64_t* lists) {
     std::vector<XsDeferredWrite> writes;
@@ -575,29 +590,34 @@ void xs_schedule_list_writes(ID3D12CommandQueue* queue, UINT count, const std::u
         }
     }
     if (writes.empty()) return;
-    static std::mutex fences_mu;
-    static std::map<ID3D12CommandQueue*, std::pair<ID3D12Fence*, std::uint64_t>> fences;
     ID3D12Fence* fence = nullptr;
     std::uint64_t value = 0;
+    if (!xs_queue_signal(queue, fence, value)) return;
+    std::lock_guard lock(g_fence_mirror_mu);
+    g_pending_writes.push_back({fence, value, std::move(writes)});
+    xs_start_mirror_thread();
+}
+// A runtime-owned fence per queue, signalled after what the queue has taken so far (agA36: shared with COPY_SRC_TRACE).
+bool xs_queue_signal(ID3D12CommandQueue* queue, ID3D12Fence*& fence, std::uint64_t& value) {
+    static std::mutex fences_mu;
+    static std::map<ID3D12CommandQueue*, std::pair<ID3D12Fence*, std::uint64_t>> fences;
     {
         std::lock_guard lock(fences_mu);
         auto& slot = fences[queue];
         if (!slot.first) {
             ID3D12Device* device = nullptr;
-            if (FAILED(queue->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&device))) || !device) return;
+            if (FAILED(queue->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&device))) || !device) return false;
             // The queue answers with the device proxy, whose fences are proxies the real queue cannot signal.
             ID3D12Device* real = device_proxy_real_device(device);
             (real ? real : device)->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&slot.first));
             device->Release();
-            if (!slot.first) return;
+            if (!slot.first) return false;
         }
         fence = slot.first;
         value = ++slot.second;
     }
     queue->Signal(fence, value);
-    std::lock_guard lock(g_fence_mirror_mu);
-    g_pending_writes.push_back({fence, value, std::move(writes)});
-    xs_start_mirror_thread();
+    return true;
 }
 volatile std::uint64_t* xs_fence_value_address(const void* proxy, ID3D12Fence* real) {
     std::lock_guard lock(g_fence_mirror_mu);
@@ -1828,23 +1848,60 @@ void xs_lc62_record(const void* list, std::uint64_t dst, std::uint64_t src, std:
 // whose SOURCE is a title placed buffer (<= 1 MiB) is remembered; right before the list's ExecuteCommandLists its title
 // source bytes are written into the source stand-in (arena, at the copy's own source GPU VA), so the forwarded GPU copy
 // moves the title's constants, in list order. =2: also writes them into the destination stand-in and the destination's
-// title memory on the CPU (as the console copy would leave them).
+// title memory on the CPU (as the console copy would leave them). =3 (agA36): like 2, and the forwarded GPU copy is DROPPED for
+// copies whose destination is a buffer stand-in, so only the CPU write at submit reaches it.
 int xs_copy_src_sync_mode() {
     static const int m = [] { const char* v = std::getenv("LEONIDA_CE_COPY_SRC_SYNC"); return v ? std::atoi(v) : 0; }();
     return m;
 }
+// agA36 LEONIDA_CE_COPY_SRC_TRACE=1 (needs WATCH_RANGE; default off): every COPY_SRC_SYNC CopyBufferRegion whose destination
+// title range is in WATCH_RANGE (the TAA CB 0xde22af580 and its neighbours) is traced at each step: "CSS_TRACE rec" (recorded,
+// with the list proxy and both stand-ins, or why it was skipped), "CSS_TRACE apply" (at the list's ExecuteCommandLists: title
+// source words, source stand-in after the sync, destination stand-in BEFORE = what earlier GPU copies left), and "CSS_TRACE gpu"
+// (once a fence signalled after that ExecuteCommandLists has passed: source + destination stand-in words, LANDED / ZERO /
+// DIFFERENT against the synced bytes). Answers whether the forwarded GPU copy reaches the stand-in the CBV binds.
+// "CSS_TRACE unapplied" lists recorded watch copies whose list was reset without an ExecuteCommandLists seeing them.
+bool xs_watch_hit(std::uint64_t va, std::uint64_t bytes);
+bool xs_css_trace_on() {
+    static const bool on = [] { const char* v = std::getenv("LEONIDA_CE_COPY_SRC_TRACE"); return v && *v && *v != '0'; }();
+    return on;
+}
+std::atomic<std::uint64_t> g_css_trace_lines{0};
+bool xs_css_trace_say(std::uint64_t k) {  // first 48 per kind, then every 64th, 1500 lines in all
+    return (k <= 48 || (k & 63) == 0) && g_css_trace_lines.fetch_add(1) < 1500;
+}
 std::atomic<std::uint64_t> g_css_recorded{0}, g_css_done{0}, g_css_bytes{0}, g_css_skip{0};
-void xs_css_record(const void* list, std::uint64_t dst_res, std::uint64_t dst_off, std::uint64_t src_res, std::uint64_t src_off,
+std::atomic<std::uint64_t> g_css_trace_rec{0}, g_css_trace_apply{0}, g_css_trace_gpu{0}, g_css_trace_landed{0}, g_css_trace_zero{0},
+    g_css_trace_diff{0}, g_css_trace_unapplied{0};
+void xs_css_trace_skip(const char* why, std::uint64_t dst_res, std::uint64_t dst_off, std::uint64_t src_res, std::uint64_t src_off,
+                       std::uint64_t bytes) {
+    if (!xs_css_trace_on()) return;
+    XsPlaced dp{};
+    if (!dst_res || !xs_placed_by_resource(reinterpret_cast<const void*>(dst_res), dp) || !xs_watch_hit(dp.va + dst_off, bytes)) return;
+    const std::uint64_t k = ++g_css_trace_rec;
+    if (!xs_css_trace_say(k)) return;
+    std::fprintf(stderr, "[hack] CSS_TRACE rec #%llu SKIPPED (%s): dst title 0x%llx +0x%llx <- src res %llx +0x%llx\n", (unsigned long long)k, why,
+                 (unsigned long long)(dp.va + dst_off), (unsigned long long)bytes, (unsigned long long)src_res, (unsigned long long)src_off);
+    std::fflush(stderr);
+}
+// Returns true when the forwarded GPU copy is to be dropped (COPY_SRC_SYNC=3: the CPU writes the destination stand-in at
+// submit instead; an A/B against =2 for a GPU copy that lands wrong or late).
+bool xs_css_record(const void* list, std::uint64_t dst_res, std::uint64_t dst_off, std::uint64_t src_res, std::uint64_t src_off,
                    std::uint64_t bytes) {
-    if (!src_res || !bytes || bytes > (1ull << 20)) return;
+    if (!src_res || !bytes || bytes > (1ull << 20)) { xs_css_trace_skip("no source / size", dst_res, dst_off, src_res, src_off, bytes); return false; }
     XsPlaced sp{}, dp{};
     if (!xs_placed_by_resource(reinterpret_cast<const void*>(src_res), sp) || sp.desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
         src_off + bytes > sp.size) {
         ++g_css_skip;
-        return;
+        xs_css_trace_skip("source not a placed buffer / range", dst_res, dst_off, src_res, src_off, bytes);
+        return false;
     }
     const std::uint64_t sg = reinterpret_cast<ID3D12Resource*>(src_res)->GetGPUVirtualAddress();
-    if (!sg || !g_arena_mapped || sg + src_off + bytes > g_arena_size) { ++g_css_skip; return; }
+    if (!sg || !g_arena_mapped || sg + src_off + bytes > g_arena_size) {
+        ++g_css_skip;
+        xs_css_trace_skip("source GPU VA outside the arena", dst_res, dst_off, src_res, src_off, bytes);
+        return false;
+    }
     XsListCopy c{};
     c.kind = 1;
     c.src = sp.va + src_off;
@@ -1857,6 +1914,17 @@ void xs_css_record(const void* list, std::uint64_t dst_res, std::uint64_t dst_of
         if (dg && dg + dst_off + bytes <= g_arena_size) c.dst_gpu = dg + dst_off;
     }
     const std::uint64_t k = ++g_css_recorded;
+    if (xs_css_trace_on() && c.dst && xs_watch_hit(c.dst, bytes)) {
+        c.flags = 1;  // traced
+        const std::uint64_t t = ++g_css_trace_rec;
+        if (xs_css_trace_say(t)) {
+            std::fprintf(stderr, "[hack] CSS_TRACE rec #%llu (copy #%llu) list %p: dst title 0x%llx stand-in 0x%llx <- src title 0x%llx stand-in 0x%llx "
+                         "(src res %llx gpu 0x%llx +0x%llx), 0x%llx bytes\n", (unsigned long long)t, (unsigned long long)k, list,
+                         (unsigned long long)c.dst, (unsigned long long)c.dst_gpu, (unsigned long long)c.src, (unsigned long long)c.src_gpu,
+                         (unsigned long long)src_res, (unsigned long long)sg, (unsigned long long)src_off, (unsigned long long)bytes);
+            std::fflush(stderr);
+        }
+    }
     if (k <= 8 || (k & (k - 1)) == 0) {
         std::fprintf(stderr, "[hack] COPY_SRC_SYNC #%llu: CopyBufferRegion src title 0x%llx (stand-in 0x%llx) -> dst title 0x%llx (stand-in 0x%llx), "
                      "0x%llx bytes; %llu skipped (source not a title placed buffer in the arena)\n", (unsigned long long)k,
@@ -1866,6 +1934,44 @@ void xs_css_record(const void* list, std::uint64_t dst_res, std::uint64_t dst_of
     }
     std::lock_guard lock(g_list_extras_mu);
     g_list_extras[list].copies.push_back(c);
+    return xs_copy_src_sync_mode() >= 3 && c.dst_gpu != 0;
+}
+std::mutex g_css_staged_mu;
+std::vector<XsCssCheck> g_css_staged;  // traced copies applied at the current ExecuteCommandLists, until xs_css_schedule
+void xs_css_check_done(const XsCssCheck& c) {  // mirror thread, under g_fence_mirror_mu
+    if (!g_arena_mapped) return;
+    std::uint32_t s[4] = {}, d[4] = {};
+    const std::size_t n = static_cast<std::size_t>(c.bytes < 16 ? c.bytes : 16);
+    std::memcpy(s, g_arena_mapped + c.src_gpu, n);
+    if (c.dst_gpu) std::memcpy(d, g_arena_mapped + c.dst_gpu, n);
+    const bool zero = !(d[0] | d[1] | d[2] | d[3]);
+    const bool landed = !std::memcmp(d, c.want, n);
+    (landed ? g_css_trace_landed : zero ? g_css_trace_zero : g_css_trace_diff)++;
+    const std::uint64_t g = ++g_css_trace_gpu;
+    if (!xs_css_trace_say(g) && !(zero && g_css_trace_zero.load() <= 16)) return;
+    std::fprintf(stderr, "[hack] CSS_TRACE gpu #%llu (apply #%llu): dst title 0x%llx stand-in 0x%llx = %08x %08x %08x %08x | src stand-in 0x%llx = %08x %08x "
+                 "%08x %08x | synced %08x %08x %08x %08x -> %s (landed %llu, zero %llu, different %llu)\n", (unsigned long long)g,
+                 (unsigned long long)c.k, (unsigned long long)c.dst, (unsigned long long)c.dst_gpu, d[0], d[1], d[2], d[3],
+                 (unsigned long long)c.src_gpu, s[0], s[1], s[2], s[3], c.want[0], c.want[1], c.want[2], c.want[3],
+                 landed ? "LANDED" : zero ? "ZERO" : "DIFFERENT", (unsigned long long)g_css_trace_landed.load(),
+                 (unsigned long long)g_css_trace_zero.load(), (unsigned long long)g_css_trace_diff.load());
+    std::fflush(stderr);
+}
+// After the real ExecuteCommandLists: the traced copies just applied are checked once the queue gets past them.
+void xs_css_schedule(ID3D12CommandQueue* queue) {
+    if (!xs_css_trace_on()) return;
+    std::vector<XsCssCheck> checks;
+    {
+        std::lock_guard l(g_css_staged_mu);
+        checks.swap(g_css_staged);
+    }
+    if (checks.empty()) return;
+    ID3D12Fence* fence = nullptr;
+    std::uint64_t value = 0;
+    if (!xs_queue_signal(queue, fence, value)) return;
+    std::lock_guard lock(g_fence_mirror_mu);
+    if (g_css_pending.size() < 4096) g_css_pending.push_back({fence, value, std::move(checks)});
+    xs_start_mirror_thread();
 }
 void xs_lc62_apply(UINT count, const std::uint64_t* lists) {
     if ((xs_list_copy62_mode() < 2 && xs_copy_src_sync_mode() < 1) || !lists) return;
@@ -1874,7 +1980,10 @@ void xs_lc62_apply(UINT count, const std::uint64_t* lists) {
         std::lock_guard lock(g_list_extras_mu);
         for (UINT i = 0; i < count; ++i) {
             auto it = g_list_extras.find(reinterpret_cast<const void*>(lists[i]));
-            if (it != g_list_extras.end()) copies.insert(copies.end(), it->second.copies.begin(), it->second.copies.end());
+            if (it != g_list_extras.end()) {
+                copies.insert(copies.end(), it->second.copies.begin(), it->second.copies.end());
+                for (XsListCopy& c : it->second.copies) if (c.flags == 1) c.flags = 2;  // agA36: traced and applied
+            }
         }
     }
     if (copies.empty()) return;
@@ -1890,7 +1999,27 @@ void xs_lc62_apply(UINT count, const std::uint64_t* lists) {
                 ++g_css_skip;
                 continue;
             }
+            std::uint32_t before[4] = {};
+            if (c.flags == 1 && c.dst_gpu) std::memcpy(before, g_arena_mapped + c.dst_gpu, static_cast<std::size_t>(c.bytes < 16 ? c.bytes : 16));
             std::memcpy(g_arena_mapped + c.src_gpu, buf.data(), static_cast<std::size_t>(c.bytes));
+            if (c.flags == 1) {  // agA36 COPY_SRC_TRACE
+                XsCssCheck ck{};
+                ck.k = ++g_css_trace_apply;
+                ck.src = c.src; ck.dst = c.dst; ck.src_gpu = c.src_gpu; ck.dst_gpu = c.dst_gpu; ck.bytes = c.bytes;
+                std::memcpy(ck.want, buf.data(), static_cast<std::size_t>(c.bytes < 16 ? c.bytes : 16));
+                const std::uint32_t* sw = reinterpret_cast<const std::uint32_t*>(g_arena_mapped + c.src_gpu);
+                if (xs_css_trace_say(ck.k)) {
+                    std::fprintf(stderr, "[hack] CSS_TRACE apply #%llu: dst title 0x%llx stand-in 0x%llx BEFORE %08x %08x %08x %08x | src title 0x%llx "
+                                 "words %08x %08x %08x %08x -> src stand-in 0x%llx now %08x %08x %08x %08x, 0x%llx bytes, frame %llu\n",
+                                 (unsigned long long)ck.k, (unsigned long long)c.dst, (unsigned long long)c.dst_gpu, before[0], before[1],
+                                 before[2], before[3], (unsigned long long)c.src, ck.want[0], ck.want[1], ck.want[2], ck.want[3],
+                                 (unsigned long long)c.src_gpu, sw[0], sw[1], sw[2], sw[3], (unsigned long long)c.bytes,
+                                 (unsigned long long)::leonida::ce::present_frame().load(std::memory_order_relaxed));
+                    std::fflush(stderr);
+                }
+                std::lock_guard l(g_css_staged_mu);
+                if (g_css_staged.size() < 4096) g_css_staged.push_back(ck);
+            }
             if (xs_copy_src_sync_mode() >= 2) {
                 if (c.dst_gpu) std::memcpy(g_arena_mapped + c.dst_gpu, buf.data(), static_cast<std::size_t>(c.bytes));
                 SIZE_T put = 0;
@@ -4045,6 +4174,20 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
         if constexpr (Slot == 139) {  // ResetX(allocator, pipeline, flags)
             {
                 std::lock_guard lock(g_list_extras_mu);
+                if (xs_css_trace_on()) {  // agA36 COPY_SRC_TRACE: traced copies whose list never reached an ExecuteCommandLists
+                    auto it = g_list_extras.find(self);
+                    if (it != g_list_extras.end())
+                        for (const XsListCopy& c : it->second.copies)
+                            if (c.kind == 1 && c.flags == 1) {
+                                const std::uint64_t u = ++g_css_trace_unapplied;
+                                if (xs_css_trace_say(u)) {
+                                    std::fprintf(stderr, "[hack] CSS_TRACE unapplied #%llu: list %p reset; dst title 0x%llx <- src title 0x%llx +0x%llx "
+                                                 "was never submitted\n", (unsigned long long)u, (const void*)self, (unsigned long long)c.dst,
+                                                 (unsigned long long)c.src, (unsigned long long)c.bytes);
+                                    std::fflush(stderr);
+                                }
+                            }
+                }
                 g_list_extras.erase(self);
             }
             if (auto* real_alloc = allocator_proxy_real_allocator(reinterpret_cast<void*>(a1)))
@@ -4123,8 +4266,9 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 return 0;
             }
         }
+        bool css_drop = false;  // agA36 COPY_SRC_SYNC=3
         if constexpr (Slot == 15) {  // agA35 COPY_SRC_SYNC
-            if (xs_copy_src_sync_mode() > 0) xs_css_record(self, unwrap_object(a1), a2, unwrap_object(a3), a4, a5);
+            if (xs_copy_src_sync_mode() > 0) css_drop = xs_css_record(self, unwrap_object(a1), a2, unwrap_object(a3), a4, a5);
         }
         if constexpr (Slot == 15 || Slot == 17) {  // agA35 WATCH_RANGE: CopyBufferRegion(dst, doff, src, soff, n) / CopyResource(dst, src)
             std::uint64_t ds = 0, ss = 0;
@@ -4138,6 +4282,7 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                          "dst title 0x%llx (res %llx) bytes 0x%llx from %p", (unsigned long long)dv, (unsigned long long)a1,
                          (unsigned long long)n, _ReturnAddress());
         }
+        if constexpr (Slot == 15) if (css_drop) return 0;  // agA36 COPY_SRC_SYNC=3: the CPU wrote the destination stand-in at submit
         constexpr unsigned pc = console_to_pc_list_slot(Slot);
         if constexpr (pc == kListNotForwarded) {
             {   // HACK diagnostic: every console-only list slot, once, with its arguments and caller
@@ -4701,6 +4846,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             if (n && lists) xs_lc62_apply(n, reinterpret_cast<const std::uint64_t*>(lists));  // agA35, before the CBV refresh
             if (n) xs_cbv_shadow_refresh();  // fspx CB analysis: every queue (the fspx passes also run on compute)
             if (n && real_lists) q->ExecuteCommandLists(n, real_lists);
+            if (n) xs_css_schedule(q);  // agA36 COPY_SRC_TRACE
             if (n && lists) xs_schedule_list_writes(q, n, reinterpret_cast<const std::uint64_t*>(lists));
             return 0;
         }
