@@ -2009,3 +2009,54 @@ Continues `docs/retail_boot_chain.md` (stops 1-13). Slots are 0-based vtable ind
   Fix: the unheld path retires the pin with the submission ticket. Default ON (LEONIDA_CE_FENCE_PIN=0 = old). Logs FENCE_PIN
   (a pin dropped the last reference of a fence = the title released it with work in flight) and FENCE_EARLY (destroyed with a
   queued signal still pending).
+- rt1 (build 94 + VA_REPORT): GPU HANG 252 s after 13->0 (Aftermath "Hung", Executing marker = cs_d80e80ca on the direct
+  queue, bottom cs_d5613de2 = the agA22 blur pair). VA_REPORT works: obj types 8 memory / 9 buffer / 10 image; NVIDIA reports
+  no driver-internal (i) binds; images are never unbound; ~27k memory binds / 7.6k memory unbinds per run.
+- rt3 (build 95, fence pin): FENCE_PIN 128+ (the title DOES release fences with signals in flight: a real bug, fixed), but
+  still the CE write fault: VA 0x12be820000 == EXACTLY the end of a live 15 MiB image mapping, next bind after a 64 KiB gap.
+- rt2 INVALID (COPY_ON_DIRECT compared cv[0] with 1, not '1': my ssh-quoted edit ate the quotes; fixed in 96). It hung ~261 s.
+- Build 96 (467ee2fd5): LEONIDA_CE_IMG_CHECK=1|2 (src/ce_image_check.h) - image registry, region bounds checks (mip, layers,
+  extent) on CopyBufferToImage / ImageToBuffer / CopyImage / ResolveImage / Clear*, =2 drops misses; IMG lines in the VA file.
+- rt4 (build 96, IMG_CHECK=2): 0 region misses, CE fault again at the end of a 15 MiB image (0x12b6220000). VA file names it:
+  VK_FORMAT_D32_SFLOAT 2560x1440, 1 mip, MUTABLE_FORMAT, usage TRANSFER_SRC|DST|SAMPLED|DEPTH_STENCIL_ATTACHMENT. Its dedicated
+  VkDeviceMemory (0xF00000) is bound at one VA and the IMAGE has its own second VA mapping right after it (NVIDIA depth page
+  kind; colour images share their memory VA). The fault is at the end of the depth image mapping (Definite).
+- Build 97 (4f5cdced9): IMG_CHECK also checks aspects, BIND-SHORT (requirements.size vs allocation at vkBindImageMemory) and
+  DS-ON-TRANSFER (DEPTH/STENCIL aspect copies on the transfer-only family; Vulkan forbids them for buffer<->image copies,
+  VUID-vkCmdCopyBufferToImage-commandBuffer-07739).
+- rt5 (build 96 + COPY_ON_DIRECT=1, really on): NO CE fault; the run lived to 252 s after 13->0 (every CE-fault run died at
+  178-197 s) and then hung like rt1/rt2 (SYNC_DUMP: direct + 2 compute queues stalled inside cmdbufs, all waits satisfied).
+- ROOT CAUSE of the CE fault (Likely): D3D12 COPY queues ran on NVIDIA's transfer-only family; depth copies there are invalid
+  Vulkan and the Copy Engine overruns the depth image's mapping. Build 98 (00cfc0615) = THE FIX: COPY queues go to the
+  graphics family when the copy family has no GRAPHICS bit (default on; LEONIDA_CE_COPY_ON_DIRECT=0 = old). Cost: no async
+  copy engine for title copies (perf only).
+- Remaining wall: the ~250 s GPU hang (rt1/rt2/rt5). rt7 = build 98 + LOOP_CAP on cs_d5613de2,cs_d94af257,cs_f33ac9e9.
+- CORRECTION (rt9): build 98 is NOT the fix. rt9 (build 99, COPY queues on the graphics family) lost the device ~120 s after
+  13->0 to the same CE WRITE "failed to translate" fault (0x123BA20000). rt5 surviving the window was luck/timing (1 run).
+  NVIDIA evidently runs some graphics-queue copies on a Copy Engine too. Build 98's routing stays (it is still correct
+  Vulkan: DEPTH/STENCIL buffer<->image copies are not allowed on a family without GRAPHICS) but does not stop the loss.
+- rt6 / rt8 died on the CPU ~25 s after 13->0 at host 0x7ff85eee2023 (CRT memcpy; the title itself passes 0x7ff85eee27c2 as
+  an argument, so a host CRT module, not the driver) reading title memory 0xbf46../0xbf56.. right after "[refresh] re-upload"
+  of placed textures nearby: xs_readable() then the title decommits the pages (TOCTOU). Build 99 (91b8882ca): the refresh hash
+  and the upload detile run in __try frames ("[hack] TITLE_READ_FAULT"). rt9: no early AV (0 TITLE_READ_FAULT lines).
+- rt7 (build 98 + LOOP_CAP on the 3 blur shaders, POOL_GPU=2): CE READ of VA 0 (device_fault agrees, precision 0x1000),
+  ~150 s after 13->0. rt8 (POOL_GPU=1) died early on the CPU AV above. Open.
+- Build 100 (c77932698): IMG_CHECK logs every copy/clear touching a DEPTH/STENCIL aspect on any queue ("DS-COPY").
+- rt10 (build 100, DS-COPY log + VA report): CE WRITE at 0x123B950000 = end of image 0x22e83fb0e60 (D32_SFLOAT 2560x1440).
+  The ONLY D32S8 -> D32 depth copy of the run: t=302.381 vkCmdCopyImage src fmt 130 (D32_SFLOAT_S8_UINT 2560x1440) aspect
+  DEPTH -> dst that image; device lost at t=302.444. ROOT CAUSE of the CE fault (Very likely): a depth copy between DIFFERENT
+  depth formats (Vulkan allows depth/stencil vkCmdCopyImage only between identical formats, VUID-vkCmdCopyImage-srcImage-01548);
+  NVIDIA lays D32S8 and D32 out differently and the Copy Engine overruns the D32 image's own VA mapping. It is a one-off ~120-200 s
+  after the landing (the first gameplay frames), which is why the loss time varied run to run.
+- Build 101 (079995e58): LEONIDA_CE_UPLOAD_DS (placed depth/stencil textures not uploaded from title memory; default skip, =1
+  old). Not needed for the fault; untested (rt11+ ran with =1).
+- Build 102 (e06a90e71) = THE CE FIX: depth/stencil copies between different formats take the existing depth<->colour staging
+  path (image -> copy scratch -> image). LEONIDA_CE_DS_XFMT_STAGE (default on, =0 old). "[hack] DS_XFMT_STAGE ..." log.
+- rt11 (build 102): early CPU AV again (0x7ff85eee2023, read 0xbf469f800; build 99 guard not on that path). 0xbf4.. is inside the
+  texture-pool CPU window [0x1800e0000, 0xd800e0000). Build 103 (8e6ae7fd9): the crash report prints the faulting thread stack.
+- rt12 (build 103): DS_XFMT_STAGE fired (fmt 130 -> 126, 2x); NO CE fault; the device lived to t=321.6 (137 s after 13->0, past
+  rt10's loss point). NEW loss: Graphics / ROP READ page fault 48 KiB past an R16_SFLOAT 640x360 colour target (bound 0x78000,
+  fault +0x8C000, non-mutable image). Theory (Plausible): attachment views use the PSO's RTV/DSV format, not the image's;
+  a bigger texel size makes the ROP address a bigger surface.
+- Build 104 (622848832): RT_FMT_GUARD (draws whose PSO attachment format differs in texel size / depth aspects from the image
+  are left out; default on, =0 old) + draw scissor clamped to the render area. rt13 = its test.
