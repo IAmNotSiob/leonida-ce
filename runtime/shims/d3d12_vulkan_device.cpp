@@ -5147,7 +5147,13 @@ public:
             // faulted warp) in PS_MIRROR_PBR_MATERIAL_CLEARCOAT/STANDARD_5f34c83e (17 / 13 loops). Only the matched
             // modules change, so only their pipelines recompile.
             if (ce_name_list_match("LEONIDA_CE_LOOP_CAP_GFX", stage.entry->name)) {
-                static const std::uint32_t inner = [] { const char* v = std::getenv("LEONIDA_CE_LOOP_CAP_INNER"); return std::uint32_t(v ? std::strtoul(v, nullptr, 0) : (1u << 22)); }();
+                // LEONIDA_CE_LOOP_CAP_GFX_INNER (agA29): the graphics cap, else LOOP_CAP_INNER. rt22: the capped mirror PS
+                // ran to 16384 blocks per pixel every frame (5 s / frame), so graphics wants a much lower cap.
+                static const std::uint32_t inner = [] {
+                    const char* g = std::getenv("LEONIDA_CE_LOOP_CAP_GFX_INNER");
+                    const char* v = g ? g : std::getenv("LEONIDA_CE_LOOP_CAP_INNER");
+                    return std::uint32_t(v ? std::strtoul(v, nullptr, 0) : (1u << 22));
+                }();
                 static const std::uint32_t outer = [] { const char* v = std::getenv("LEONIDA_CE_LOOP_CAP_OUTER"); return std::uint32_t(v ? std::strtoul(v, nullptr, 0) : (1u << 18)); }();
                 const int n = leonida::spirv_cap_loops(stage.words, inner, outer);
                 static std::atomic<int> told{0};
