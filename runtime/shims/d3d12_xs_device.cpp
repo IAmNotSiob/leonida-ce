@@ -1012,11 +1012,25 @@ int xs_cbv_placed_watch_mode() {
     static const int m = [] { const char* v = std::getenv("LEONIDA_CE_CBV_PLACED_WATCH"); return v ? std::atoi(v) : 0; }();
     return m;
 }
-struct XsCbvPlacedSeen { std::uint64_t title = 0, va = 0; std::uint32_t size = 0; bool watch = false; std::vector<std::uint8_t> last; };
+struct XsAliasProbe { std::uint64_t va = 0, rec = 0; std::uint32_t len = 0; std::uint64_t hash = 0; int idx = -1; };  // agA34
+struct XsCbvPlacedSeen { std::uint64_t title = 0, va = 0; std::uint32_t size = 0; bool watch = false; std::vector<std::uint8_t> last;
+                         std::uint64_t alias = 0; std::vector<XsAliasProbe> probes; };
 std::map<std::uint64_t, std::size_t> g_cbv_placed_index;  // placed record title va -> g_cbv_placed slot (under g_cbv_mu)
 std::map<std::uint64_t, std::size_t> g_cbv_placed_by_va;  // stand-in VA -> g_cbv_placed slot (diagnostics)
 std::deque<XsCbvPlacedSeen> g_cbv_placed;
 std::atomic<std::uint64_t> g_cbv_placed_views{0}, g_cbv_placed_granules{0};
+// agA34 LEONIDA_CE_CBV_PLACED_ALIAS=1 (default off): rt41 bound the TAA CB's stand-in (all zeros, never written) and the
+// title bytes at 0xde22af580 are static CPU data (pointers; 150 identical DRAW_PEEK reads), so neither holds the constants.
+// Theory (Plausible): the memory is ALIASED - an older, bigger placed buffer covers it and the GPU writes the constants
+// through that one; every record has its own stand-in here, so those writes never reach the newest record's. =1: a CBV /
+// root view in a placed buffer names the OLDEST buffer record that contains it (its stand-in at the same offset).
+// Diagnostics (always with CBV_PLACED): each new CBV_PLACED buffer lists the records overlapping it, and the refresh
+// watches the bytes of every such stand-in at that range ("CBV_PLACED probe ... CHANGED" = something wrote it).
+int xs_cbv_placed_alias_mode() {
+    static const int m = [] { const char* v = std::getenv("LEONIDA_CE_CBV_PLACED_ALIAS"); return v ? std::atoi(v) : 0; }();
+    return m;
+}
+std::atomic<std::uint64_t> g_alias_rebinds{0}, g_alias_root_rebinds{0}, g_alias_scans{0};
 
 // agA32 LEONIDA_CE_CBV_SHADOW_CHUNK=1 (default off; needs CBV_SHADOW >= 1): rt38 made 205k shadows (one per (title,
 // size)) - the title creates CBVs over and over on the same reused CB memory - so the 64 MiB pool filled (later CBVs fell
@@ -1233,6 +1247,30 @@ std::uint64_t xs_cbv_shadow_root(std::uint64_t title) {
 void xs_cbv_shadow_refresh() {
     if (xs_cbv_shadow_mode() <= 0) return;
     std::lock_guard lock(g_cbv_mu);
+    if (g_arena_mapped && !g_cbv_placed.empty()) {  // agA34: which stand-in of an aliased CB range does anything write?
+        static std::uint64_t calls = 0;
+        static int told = 0;
+        if ((++calls & 255) == 1 && told < 400) {
+            for (std::size_t wi = 0; wi < g_cbv_placed.size(); ++wi)
+                for (XsAliasProbe& pr : g_cbv_placed[wi].probes) {
+                    const std::uint8_t* b = g_arena_mapped + pr.va;
+                    std::uint64_t h = 1469598103934665603ull;
+                    bool nz = false;
+                    for (std::uint32_t i = 0; i < pr.len; ++i) { h = (h ^ b[i]) * 1099511628211ull; nz |= b[i] != 0; }
+                    if (h == pr.hash) continue;
+                    pr.hash = h;
+                    if (told >= 400) continue;
+                    ++told;
+                    std::uint32_t d[8] = {};
+                    std::memcpy(d, b, (std::min)(pr.len, 32u));
+                    std::fprintf(stderr, "[hack] CBV_PLACED probe #%zu (title 0x%llx) record %d @0x%llx stand-in 0x%llx CHANGED%s (sync %llu): "
+                                 "%08x %08x %08x %08x %08x %08x %08x %08x\n", wi, (unsigned long long)g_cbv_placed[wi].title, pr.idx,
+                                 (unsigned long long)pr.rec, (unsigned long long)pr.va, nz ? "" : " (zero)", (unsigned long long)calls,
+                                 d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
+                    std::fflush(stderr);
+                }
+        }
+    }
     if (xs_cbv_placed_watch_mode() > 0 && g_arena_mapped) {  // agA33 CBV_PLACED_WATCH
         static std::vector<std::uint8_t> wscratch;  // plain static under g_cbv_mu (no thread_local)
         for (XsCbvPlacedSeen& w : g_cbv_placed) {
@@ -1542,12 +1580,84 @@ bool xs_cbv_fix_on() {
     static const bool on = [] { const char* v = std::getenv("LEONIDA_CE_CBV_FIX"); return v && v[0] == '1'; }();
     return on;
 }
+std::uint64_t xs_placed_alias_va(const XsPlaced* p, std::uint64_t va);  // agA34
 std::uint64_t xs_placed_buffer_va(std::uint64_t va, std::uint64_t bytes) {
     const XsPlaced* p = xs_find_placed(va);
     if (!p || !p->resource || p->desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return 0;
     if (bytes && va - p->va + bytes > p->size) return 0;
+    if (xs_cbv_placed_alias_mode() > 0) {  // agA34 CBV_PLACED_ALIAS: the oldest containing buffer's stand-in
+        if (const std::uint64_t a = xs_placed_alias_va(p, va)) {
+            const std::uint64_t k = ++g_alias_root_rebinds;
+            if ((k & (k - 1)) == 0 || (k & 65535) == 0) {
+                std::fprintf(stderr, "[hack] CBV_PLACED_ALIAS: %llu root/fix rebinds (last 0x%llx -> 0x%llx)\n", (unsigned long long)k,
+                             (unsigned long long)va, (unsigned long long)a);
+                std::fflush(stderr);
+            }
+            return a;
+        }
+    }
     const std::uint64_t gpu = p->resource->GetGPUVirtualAddress();
     return gpu ? gpu + (va - p->va) : 0;
+}
+// agA34: the records overlapping [va, va + size) (logged for the first 48 calls with log), probes for the stand-ins of
+// the BUFFER records that contain it, and the oldest such record other than `self` (nullptr if none). One g_placed scan.
+const XsPlaced* xs_placed_alias_scan(const XsPlaced* self, std::uint64_t va, std::uint64_t size, std::vector<XsAliasProbe>* probes,
+                                     bool log) {
+    ++g_alias_scans;
+    const XsPlaced* oldest = nullptr;
+    static std::atomic<int> told{0};
+    const bool say = log && told++ < 48;
+    int listed = 0, overlaps = 0;
+    std::string out;
+    char buf[320];
+    std::lock_guard lock(g_placed_mu);
+    for (std::size_t i = 0; i < g_placed.size(); ++i) {
+        const XsPlaced& r = g_placed[i];
+        if (!r.resource || !r.size || r.va >= va + size || r.va + r.size <= va) continue;
+        ++overlaps;
+        const bool buffer = r.desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+        const bool contains = r.va <= va && va + size <= r.va + r.size;
+        const std::uint64_t gpu = buffer ? r.resource->GetGPUVirtualAddress() : 0;
+        if (buffer && contains && gpu && &r != self && !oldest) oldest = &r;
+        if (probes && buffer && contains && gpu && probes->size() < 8) {
+            const std::uint64_t at = gpu + (va - r.va);
+            const std::uint32_t len = static_cast<std::uint32_t>((std::min<std::uint64_t>)(size, 256));
+            if (g_arena_mapped && at < g_arena_size && len <= g_arena_size - at)
+                probes->push_back({at, r.va, len, 0, int(i)});
+        }
+        if (say && listed < 12) {
+            ++listed;
+            std::snprintf(buf, sizeof buf, "\n[hack]   #%zu%s @0x%llx +0x%llx dim %d %llux%u fmt %d%s%s gpu 0x%llx", i, &r == self ? " (newest)" : "",
+                          (unsigned long long)r.va, (unsigned long long)r.size, int(r.desc.Dimension), (unsigned long long)r.desc.Width,
+                          r.desc.Height, int(r.desc.Format), r.owned ? " owned" : "", contains ? " CONTAINS" : "", (unsigned long long)gpu);
+            out += buf;
+        }
+    }
+    if (say) {
+        std::fprintf(stderr, "[hack] CBV_PLACED aliases of 0x%llx +0x%llx: %d overlapping record(s); oldest containing buffer %s%s\n",
+                     (unsigned long long)va, (unsigned long long)size, overlaps, oldest ? "found" : "none", out.c_str());
+        std::fflush(stderr);
+    }
+    return oldest;
+}
+// agA34 CBV_PLACED_ALIAS for root views (xs_placed_buffer_va): cached per record (capped scans).
+std::uint64_t xs_placed_alias_va(const XsPlaced* p, std::uint64_t va) {
+    static std::mutex mu;
+    static std::unordered_map<const XsPlaced*, std::uint64_t> cache;  // record -> alias GPU base for p->va (0 = none)
+    std::uint64_t base = 0;
+    {
+        std::lock_guard l(mu);
+        auto it = cache.find(p);
+        if (it != cache.end()) base = it->second;
+        else if (cache.size() >= 8192) return 0;
+        else {
+            const XsPlaced* a = xs_placed_alias_scan(p, p->va, p->size, nullptr, true);
+            const std::uint64_t g = a ? a->resource->GetGPUVirtualAddress() : 0;
+            base = g ? g + (p->va - a->va) : 0;
+            cache.emplace(p, base);
+        }
+    }
+    return base ? base + (va - p->va) : 0;
 }
 // agA33 LEONIDA_CE_CBV_PLACED (see xs_cbv_placed_mode): the stand-in VA for a CBV on [title, title + size), or 0.
 std::uint64_t xs_cbv_placed(std::uint64_t title, std::uint32_t size) {
@@ -1562,9 +1672,23 @@ std::uint64_t xs_cbv_placed(std::uint64_t title, std::uint32_t size) {
     const std::uint64_t rec_va = p->va, rec_size = p->size;
     const bool in_arena = g_arena_mapped && base < g_arena_size && rec_size <= g_arena_size - base;
     const std::uint64_t k = ++g_cbv_placed_views;
+    bool fresh;
+    {
+        std::lock_guard lock(g_cbv_mu);
+        fresh = !g_cbv_placed_index.count(rec_va);
+    }
+    std::vector<XsAliasProbe> probes;  // agA34
+    std::uint64_t alias = 0;
+    if (fresh) {
+        const XsPlaced* a = xs_placed_alias_scan(p, rec_va, rec_size, &probes, true);
+        const std::uint64_t g = a ? a->resource->GetGPUVirtualAddress() : 0;
+        alias = g ? g + (rec_va - a->va) : 0;
+    }
     std::lock_guard lock(g_cbv_mu);
     if (!g_cbv_placed_index.count(rec_va)) {
         XsCbvPlacedSeen s;
+        s.alias = alias;
+        s.probes = std::move(probes);
         s.title = rec_va;
         s.va = base;
         s.size = static_cast<std::uint32_t>((std::min)(rec_size, std::uint64_t(64) << 10));
@@ -1596,9 +1720,19 @@ std::uint64_t xs_cbv_placed(std::uint64_t title, std::uint32_t size) {
         g_cbv_placed.push_back(std::move(s));
     }
     if ((k & (k - 1)) == 0 || (k & 65535) == 0) {
-        std::fprintf(stderr, "[hack] CBV_PLACED: %llu CBVs retargeted, %zu placed buffers, %llu granules written by the watch\n",
-                     (unsigned long long)k, g_cbv_placed.size(), (unsigned long long)g_cbv_placed_granules.load());
+        std::fprintf(stderr, "[hack] CBV_PLACED: %llu CBVs retargeted, %zu placed buffers, %llu granules written by the watch; "
+                     "ALIAS %llu CBV + %llu root rebinds, %llu scans\n",
+                     (unsigned long long)k, g_cbv_placed.size(), (unsigned long long)g_cbv_placed_granules.load(),
+                     (unsigned long long)g_alias_rebinds.load(), (unsigned long long)g_alias_root_rebinds.load(),
+                     (unsigned long long)g_alias_scans.load());
         std::fflush(stderr);
+    }
+    if (xs_cbv_placed_alias_mode() > 0) {  // agA34
+        const auto it = g_cbv_placed_index.find(rec_va);
+        if (it != g_cbv_placed_index.end() && g_cbv_placed[it->second].alias) {
+            ++g_alias_rebinds;
+            return g_cbv_placed[it->second].alias + (title - rec_va);
+        }
     }
     return base + (title - rec_va);
 }

@@ -176,9 +176,18 @@ inline void at_present(ID3D12CommandQueue* queue, ID3D12Resource* presented, std
     struct Rel { ID3D12Device* d; ~Rel() { d->Release(); } } rel{dev};
     if (presented) probe_resource(dev, queue, presented, f, "presented");
     char tag[32];
-    for (std::size_t i = 0; i < top.size() && i < 8; ++i) {
+    static const std::size_t ntop = [] {  // agA34: LEONIDA_CE_RTDIAG_TOP = how many of the busiest targets (default 8, <= 24)
+        char v[16] = {};
+        const std::size_t n = GetEnvironmentVariableA("LEONIDA_CE_RTDIAG_TOP", v, sizeof(v)) > 0 ? std::strtoull(v, nullptr, 10) : 8;
+        return n > 24 ? std::size_t(24) : n;
+    }();
+    for (std::size_t i = 0; i < top.size() && i < ntop; ++i) {
         std::snprintf(tag, sizeof tag, "target%zu", i);
         probe_resource(dev, queue, reinterpret_cast<ID3D12Resource*>(top[i]), f, tag);
+    }
+    for (const auto& [a, wtag] : wanted()) {  // agA34 LEONIDA_CE_DRAW_SRV: textures the named draws read
+        if (const std::uintptr_t id = id_for_address(a))
+            probe_resource(dev, queue, reinterpret_cast<ID3D12Resource*>(id), f, wtag.c_str());
     }
     char addr[32] = {};
     if (GetEnvironmentVariableA("LEONIDA_CE_RTDIAG_ADDR", addr, sizeof(addr)) > 0) {

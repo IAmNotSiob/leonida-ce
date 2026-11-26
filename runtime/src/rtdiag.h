@@ -8,6 +8,7 @@
 #include <cstring>
 #include <iterator>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -34,6 +35,7 @@ struct State {
     std::uint64_t draws = 0, pending = 0, variant = 0, no_target = 0, lists_ok = 0, lists_failed = 0, dispatches = 0;
     std::uint64_t fail[16] = {};
     std::uint64_t draw_fail[16] = {};
+    std::vector<std::pair<std::uint64_t, std::string>> want;  // agA34 DRAW_SRV: T# addresses to probe at the dump
 };
 inline State& state() {
     static State s;
@@ -76,6 +78,27 @@ inline bool tdiag_match(std::uint64_t address) {
         return std::pair<std::uint64_t, std::uint64_t>{lo, hi};
     }();
     return address && address >= r.first && address <= r.second;
+}
+// agA34 LEONIDA_CE_DRAW_SRV: remember a texture a named draw reads (probed and dumped at the next RTDIAG dump). True if new.
+inline bool want_address(std::uint64_t address, const std::string& tag) {
+    std::lock_guard l(state().m);
+    if (!state().by_address.count(address)) return false;
+    for (const auto& w : state().want)
+        if (w.first == address) return false;
+    if (state().want.size() >= 32) return false;
+    state().want.push_back({address, tag});
+    return true;
+}
+inline std::vector<std::pair<std::uint64_t, std::string>> wanted() {
+    std::lock_guard l(state().m);
+    return state().want;
+}
+inline ImageInfo info_for_address(std::uint64_t address) {
+    std::lock_guard l(state().m);
+    auto it = state().by_address.find(address);
+    if (it == state().by_address.end()) return {};
+    auto im = state().images.find(it->second);
+    return im == state().images.end() ? ImageInfo{} : im->second;
 }
 inline std::uint64_t address_for_id(std::uintptr_t id) {
     std::lock_guard l(state().m);

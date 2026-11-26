@@ -34,6 +34,7 @@
 #include "depth24.h"
 #include "uav_clear.h"
 #include "rtdiag.h"
+#include "gfx10_descriptors.h"  // agA34 DRAW_SRV
 
 #include <vulkan/vulkan.h>
 #include "vulkan_predicate.h"
@@ -2456,6 +2457,80 @@ inline void draw_peek(const Draw& draw, std::uint64_t pipe) {
         std::fflush(stderr);
     }
 }
+// agA34 LEONIDA_CE_DRAW_SRV=name:lo-hi[,..] (needs CHECKPOINTS for the names, RTDIAG_DUMP for the dumps): for a draw whose
+// pipeline name contains <name>, every user-data word that looks like a table address W is scanned at W + lo .. W + hi
+// (16-byte steps) for T#s naming a known image; each new one is logged with its table slot and probed / dumped (tag
+// "srv_<name>_<ud>_<off>") at every later RTDIAG dump. For the black scene: PS_TAA2_SpatialUpscaleWithDithering's scene
+// colour (s9+0x0), the dither array (s8+0x2a0), and whatever the lighting / tonemap passes read.
+inline void draw_srv(const Draw& draw, std::uint64_t pipe) {
+    struct Want { std::string name; std::uint32_t lo, hi; };
+    static const std::vector<Want> wants = [] {
+        std::vector<Want> r;
+        const char* e = std::getenv("LEONIDA_CE_DRAW_SRV");
+        if (!e) return r;
+        const std::string t = e;
+        std::size_t p = 0;
+        while (p < t.size()) {
+            std::size_t q = t.find(',', p);
+            if (q == std::string::npos) q = t.size();
+            const std::string one = t.substr(p, q - p);
+            const std::size_t a = one.find(':');
+            if (a != std::string::npos) {
+                char* end = nullptr;
+                const std::uint32_t lo = std::uint32_t(std::strtoul(one.c_str() + a + 1, &end, 0));
+                const std::uint32_t hi = (end && *end == 0x2d) ? std::uint32_t(std::strtoul(end + 1, nullptr, 0)) : lo;
+                r.push_back({one.substr(0, a), lo, std::min<std::uint32_t>(hi, lo + 0x1000)});
+            }
+            p = q + 1;
+        }
+        std::fprintf(stderr, "[hack] DRAW_SRV: %zu target(s)\n", r.size());
+        return r;
+    }();
+    if (wants.empty() || !pipe || !rtdiag::on()) return;
+    static std::mutex mu;
+    static std::unordered_map<std::uint64_t, std::vector<int>> which;
+    static std::unordered_map<std::uint64_t, int> seen_draws;
+    std::lock_guard lock(mu);
+    auto it = which.find(pipe);
+    if (it == which.end()) {
+        const std::string nm = ::leonida::ce::pipeline_name(pipe);
+        std::vector<int> w;
+        for (std::size_t i = 0; i < wants.size(); ++i)
+            if (nm.find(wants[i].name) != std::string::npos) w.push_back(int(i));
+        it = which.emplace(pipe, std::move(w)).first;
+    }
+    if (it->second.empty()) return;
+    if (++seen_draws[pipe] > 64 && (seen_draws[pipe] & 255) != 0) return;  // first 64 draws, then every 256th
+    std::uint8_t* const arena = ::leonida::ce::arena_host().load(std::memory_order_relaxed);
+    const std::uint64_t arena_n = ::leonida::ce::arena_bytes().load(std::memory_order_relaxed);
+    if (!arena) return;
+    for (const int wi : it->second) {
+        const Want& w = wants[std::size_t(wi)];
+        for (std::size_t k = 0; k < draw.user_data.size(); ++k) {
+            const std::uint32_t word = draw.user_data[k];
+            if (word < 0x10000) continue;
+            for (std::uint32_t off = w.lo; off <= w.hi; off += 16) {
+                const std::uint64_t at = std::uint64_t(word) + off;
+                if (at + 32 > arena_n) break;
+                gfx10::ImageWords d{};
+                std::memcpy(d.data(), arena + at, 32);
+                if (!gfx10::is_image(d)) continue;
+                const std::uint64_t addr = ((std::uint64_t(d[1] & 0xff) << 32) | d[0]) << 8;
+                if (!addr) continue;
+                char tag[64];
+                std::snprintf(tag, sizeof tag, "srv_%.16s_ud%zu_%x", w.name.c_str(), k, off);
+                if (rtdiag::want_address(addr, tag)) {
+                    const rtdiag::ImageInfo ii = rtdiag::info_for_address(addr);
+                    std::fprintf(stderr, "[hack] DRAW_SRV %s ud[%zu]=%x +0x%x: T# [%08x %08x %08x %08x %08x %08x %08x %08x] addr 0x%llx "
+                                 "-> image %ux%u fmt %u flags %x (type %u) frame %llu\n", w.name.c_str(), k, word, off, d[0], d[1], d[2],
+                                 d[3], d[4], d[5], d[6], d[7], (unsigned long long)addr, ii.w, ii.h, ii.fmt, ii.flags, d[3] >> 28,
+                                 (unsigned long long)::leonida::ce::present_frame().load(std::memory_order_relaxed));
+                    std::fflush(stderr);
+                }
+            }
+        }
+    }
+}
 template<typename Resolve>
 ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunctions& vk, PreparedDraw& p) {
     if (!vk.graphics_pipeline || !vk.buffer_at || !vk.image_view || !vk.begin_rendering || !vk.end_rendering ||
@@ -2568,6 +2643,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     }
     rtdiag::count_draw(p.colors, p.depth.id, 0, reinterpret_cast<std::uint64_t>(p.pipeline));
     draw_peek(draw, reinterpret_cast<std::uint64_t>(p.pipeline));  // agA32
+    draw_srv(draw, reinterpret_cast<std::uint64_t>(p.pipeline));  // agA34
 
     // HACK (Leonida CE): the shaders read the title's per-draw data (root arguments point into its upload ring) at
     // heap_base + VA, but the title writes it in its own memory; copy a window around each such address into the arena.
