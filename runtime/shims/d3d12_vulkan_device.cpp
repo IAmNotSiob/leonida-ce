@@ -2575,6 +2575,24 @@ struct DeviceState {
         }
         const auto existing = image_entries.find(words);
         if (existing != image_entries.end() && (existing->second.storage || !storage)) return true;
+        // DIAGNOSTIC (agA31, LEONIDA_CE_DIAG_TEX=WxH): every new view of an image of that size (rt31: the intro's
+        // noise is a 64x64 tile added to R and B at full scale = a dither / blue-noise texture read at the wrong scale).
+        {
+            static const std::pair<std::uint32_t, std::uint32_t> want = [] {
+                const char* e = std::getenv("LEONIDA_CE_DIAG_TEX");
+                unsigned w = 0, h = 0;
+                if (e && std::sscanf(e, "%ux%u", &w, &h) == 2) return std::make_pair(std::uint32_t(w), std::uint32_t(h));
+                return std::make_pair(0u, 0u);
+            }();
+            static std::atomic<int> told{0};
+            if (want.first && image.width == want.first && image.height == want.second && told++ < 200)
+                std::fprintf(stderr, "[diag] TEX %ux%u %s at %llx: type %d gfx10 fmt %u -> image fmt %d (uint_backed %d) depth %u layers %u+%u "
+                             "mips %u+%u swz %d%d%d%d words %08x %08x %08x %08x\n", image.width, image.height,
+                             storage ? "UAV" : "SRV", (unsigned long long)image.address, int(image.type), image.format, int(image_format),
+                             int(uint_backed), image.depth, image.first_layer, image.layer_count, image.first_mip, image.mip_count,
+                             int(image.swizzle[0]), int(image.swizzle[1]), int(image.swizzle[2]), int(image.swizzle[3]), words[0], words[1],
+                             words[2], words[3]);
+        }
 
         leonida::ImageDimension dimension;
         switch (image.type) {
