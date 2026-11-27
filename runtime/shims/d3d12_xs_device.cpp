@@ -477,7 +477,10 @@ std::map<const void*, XsFenceMirror*> g_fence_mirrors;
 struct XsDeferredWrite { std::uint64_t address, value; unsigned bytes, what; };  // what: 0 value, 1 GPU ts, 2 system ts
 std::atomic<IUnknown*> g_placeholder_pso{nullptr};  // slot 57 stand-in (see the HACK there)
 struct XsListCopy { std::uint64_t dst, src, bytes, flags, ra;  // agA35 console list slot 62 (GPU memcpy by VA)
-                    int kind = 0; std::uint64_t src_gpu = 0, dst_gpu = 0; };  // kind 1: CopyBufferRegion source sync (COPY_SRC_SYNC)
+                    int kind = 0; std::uint64_t src_gpu = 0, dst_gpu = 0;  // kind 1: CopyBufferRegion source sync (COPY_SRC_SYNC)
+                    std::uint64_t stage_gpu = 0;      // agA36 CSS_STAGE: private arena slot the forwarded copy reads instead
+                    bool staged_at_record = false;    // agA36 CSS_STAGE_AT=record: the slot was filled when the copy was recorded
+                    bool has_rec = false; std::uint32_t rec_w[4] = {}; };  // agA36 trace: title source words at record time
 struct XsListExtras { std::vector<XsDeferredWrite> writes; std::vector<std::unique_ptr<std::uint8_t[]>> uploads;
                       std::vector<XsListCopy> copies; };
 std::mutex g_list_extras_mu;
@@ -1884,10 +1887,79 @@ void xs_css_trace_skip(const char* why, std::uint64_t dst_res, std::uint64_t dst
                  (unsigned long long)(dp.va + dst_off), (unsigned long long)bytes, (unsigned long long)src_res, (unsigned long long)src_off);
     std::fflush(stderr);
 }
+// agA36 LEONIDA_CE_CSS_STAGE_MB=N (default 0 = off; with COPY_SRC_SYNC=1): the source stand-in over the title's upload ring is
+// ONE buffer for every lap of the ring (rt51: the TAA source moves ~9.4 MiB per frame through a ~20 MiB ring, a lap every
+// ~2 frames). The submit-time sync of lap n+1 writes over the bytes lap n's GPU copy has not read yet when the GPU runs
+// >= 1 lap behind, so that copy moves another frame's (or unrelated) bytes: Plausible source of garbage loop counts
+// (agA37: cs_d8b54205 plane count CB+0x1c4). With STAGE_MB, each synced copy gets its own 256-byte aligned slot of an N MiB
+// arena DEFAULT buffer (a ring, never reused before N MiB of later copies), the forwarded CopyBufferRegion reads from that
+// slot, and the sync writes the title bytes there. LEONIDA_CE_CSS_STAGE_AT=record fills the slot when the title records the
+// copy (ReadProcessMemory then) instead of at ExecuteCommandLists. "CSS_STAGE:" lines report the pool and wraps.
+std::uint64_t xs_css_stage_mb() {
+    static const std::uint64_t v = [] { const char* e = std::getenv("LEONIDA_CE_CSS_STAGE_MB"); return e ? std::strtoull(e, nullptr, 0) : 0ull; }();
+    return v;
+}
+bool xs_css_stage_at_record() {
+    static const bool v = [] { const char* e = std::getenv("LEONIDA_CE_CSS_STAGE_AT"); return e && (e[0] == 'r' || e[0] == 'R'); }();
+    return v;
+}
+std::mutex g_css_stage_mu;
+ID3D12Resource* g_css_stage = nullptr;
+std::uint64_t g_css_stage_va = 0, g_css_stage_size = 0, g_css_stage_cursor = 0, g_css_stage_wraps = 0;
+bool g_css_stage_failed = false;
+// Slot for `bytes` in the staging pool: its offset in the pool (and *gpu = its arena VA), or ~0 when off / failed.
+std::uint64_t xs_css_stage_alloc(ID3D12GraphicsCommandList* list, std::uint64_t bytes, std::uint64_t* gpu) {
+    if (!xs_css_stage_mb() || !g_arena_mapped) return ~0ull;
+    std::lock_guard l(g_css_stage_mu);
+    if (!g_css_stage && !g_css_stage_failed) {
+        ID3D12Device* dev = nullptr;
+        if (list) list->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&dev));
+        if (dev) {
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC d{};
+            d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            d.Width = std::min<std::uint64_t>(xs_css_stage_mb(), 1024) << 20;
+            d.Height = 1; d.DepthOrArraySize = 1; d.MipLevels = 1; d.SampleDesc.Count = 1;
+            d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            ID3D12Resource* r = nullptr;
+            const HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                            __uuidof(ID3D12Resource), reinterpret_cast<void**>(&r));
+            const std::uint64_t va = SUCCEEDED(hr) && r ? r->GetGPUVirtualAddress() : 0;
+            if (va && va + d.Width <= g_arena_size) {
+                g_css_stage = r;  // held for the life of the process
+                g_css_stage_va = va;
+                g_css_stage_size = d.Width;
+            } else if (r) {
+                r->Release();
+            }
+            dev->Release();
+            std::fprintf(stderr, "[hack] CSS_STAGE: pool %llu MiB at arena VA 0x%llx (hr 0x%08lx)%s\n", (unsigned long long)(d.Width >> 20),
+                         (unsigned long long)va, (unsigned long)hr, g_css_stage ? "" : " - FAILED, copies read the ring stand-in");
+            std::fflush(stderr);
+        }
+        if (!g_css_stage) g_css_stage_failed = true;
+    }
+    if (!g_css_stage || bytes > g_css_stage_size / 8) return ~0ull;
+    std::uint64_t at = (g_css_stage_cursor + 255) & ~255ull;
+    if (at + bytes > g_css_stage_size) {
+        at = 0;
+        const std::uint64_t w = ++g_css_stage_wraps;
+        if (w <= 4 || (w & (w - 1)) == 0) {
+            std::fprintf(stderr, "[hack] CSS_STAGE: wrap #%llu\n", (unsigned long long)w);
+            std::fflush(stderr);
+        }
+    }
+    g_css_stage_cursor = at + bytes;
+    *gpu = g_css_stage_va + at;
+    return at;
+}
 // Returns true when the forwarded GPU copy is to be dropped (COPY_SRC_SYNC=3: the CPU writes the destination stand-in at
 // submit instead; an A/B against =2 for a GPU copy that lands wrong or late).
+// *redirect_res / *redirect_off (CSS_STAGE): when set, the forwarded copy is to read from the staging pool there instead.
 bool xs_css_record(const void* list, std::uint64_t dst_res, std::uint64_t dst_off, std::uint64_t src_res, std::uint64_t src_off,
-                   std::uint64_t bytes) {
+                   std::uint64_t bytes, ID3D12GraphicsCommandList* real_list = nullptr, std::uint64_t* redirect_res = nullptr,
+                   std::uint64_t* redirect_off = nullptr) {
     if (!src_res || !bytes || bytes > (1ull << 20)) { xs_css_trace_skip("no source / size", dst_res, dst_off, src_res, src_off, bytes); return false; }
     XsPlaced sp{}, dp{};
     if (!xs_placed_by_resource(reinterpret_cast<const void*>(src_res), sp) || sp.desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
@@ -1913,15 +1985,33 @@ bool xs_css_record(const void* list, std::uint64_t dst_res, std::uint64_t dst_of
         const std::uint64_t dg = reinterpret_cast<ID3D12Resource*>(dst_res)->GetGPUVirtualAddress();
         if (dg && dg + dst_off + bytes <= g_arena_size) c.dst_gpu = dg + dst_off;
     }
+    if (redirect_res && xs_copy_src_sync_mode() < 3) {  // agA36 CSS_STAGE
+        std::uint64_t sgpu = 0;
+        const std::uint64_t at = xs_css_stage_alloc(real_list, bytes, &sgpu);
+        if (at != ~0ull) {
+            c.stage_gpu = sgpu;
+            *redirect_res = reinterpret_cast<std::uint64_t>(g_css_stage);
+            *redirect_off = at;
+            if (xs_css_stage_at_record()) {
+                SIZE_T got = 0;
+                c.staged_at_record = ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(c.src), g_arena_mapped + sgpu,
+                                                       static_cast<SIZE_T>(bytes), &got) && got == bytes;
+            }
+        }
+    }
     const std::uint64_t k = ++g_css_recorded;
     if (xs_css_trace_on() && c.dst && xs_watch_hit(c.dst, bytes)) {
         c.flags = 1;  // traced
+        SIZE_T got = 0;
+        c.has_rec = ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(c.src), c.rec_w,
+                                      static_cast<SIZE_T>(bytes < 16 ? bytes : 16), &got) && got;
         const std::uint64_t t = ++g_css_trace_rec;
         if (xs_css_trace_say(t)) {
             std::fprintf(stderr, "[hack] CSS_TRACE rec #%llu (copy #%llu) list %p: dst title 0x%llx stand-in 0x%llx <- src title 0x%llx stand-in 0x%llx "
-                         "(src res %llx gpu 0x%llx +0x%llx), 0x%llx bytes\n", (unsigned long long)t, (unsigned long long)k, list,
+                         "(src res %llx gpu 0x%llx +0x%llx), 0x%llx bytes; staged 0x%llx%s\n", (unsigned long long)t, (unsigned long long)k, list,
                          (unsigned long long)c.dst, (unsigned long long)c.dst_gpu, (unsigned long long)c.src, (unsigned long long)c.src_gpu,
-                         (unsigned long long)src_res, (unsigned long long)sg, (unsigned long long)src_off, (unsigned long long)bytes);
+                         (unsigned long long)src_res, (unsigned long long)sg, (unsigned long long)src_off, (unsigned long long)bytes,
+                         (unsigned long long)c.stage_gpu, c.staged_at_record ? " (filled at record)" : "");
             std::fflush(stderr);
         }
     }
@@ -1994,27 +2084,39 @@ void xs_lc62_apply(UINT count, const std::uint64_t* lists) {
         if (buf.size() < c.bytes) buf.resize(static_cast<std::size_t>(c.bytes));
         if (c.kind == 1) {  // COPY_SRC_SYNC
             SIZE_T got = 0;
-            if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(c.src), buf.data(), static_cast<SIZE_T>(c.bytes), &got) ||
+            const std::uint64_t to = c.stage_gpu ? c.stage_gpu : c.src_gpu;  // agA36 CSS_STAGE: the private slot
+            if (c.staged_at_record) {
+                std::memcpy(buf.data(), g_arena_mapped + to, static_cast<std::size_t>(c.bytes));
+            } else if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(c.src), buf.data(), static_cast<SIZE_T>(c.bytes), &got) ||
                 got != c.bytes) {
                 ++g_css_skip;
                 continue;
             }
             std::uint32_t before[4] = {};
             if (c.flags == 1 && c.dst_gpu) std::memcpy(before, g_arena_mapped + c.dst_gpu, static_cast<std::size_t>(c.bytes < 16 ? c.bytes : 16));
-            std::memcpy(g_arena_mapped + c.src_gpu, buf.data(), static_cast<std::size_t>(c.bytes));
+            if (!c.staged_at_record) std::memcpy(g_arena_mapped + to, buf.data(), static_cast<std::size_t>(c.bytes));
             if (c.flags == 1) {  // agA36 COPY_SRC_TRACE
                 XsCssCheck ck{};
                 ck.k = ++g_css_trace_apply;
-                ck.src = c.src; ck.dst = c.dst; ck.src_gpu = c.src_gpu; ck.dst_gpu = c.dst_gpu; ck.bytes = c.bytes;
+                ck.src = c.src; ck.dst = c.dst; ck.src_gpu = to; ck.dst_gpu = c.dst_gpu; ck.bytes = c.bytes;
                 std::memcpy(ck.want, buf.data(), static_cast<std::size_t>(c.bytes < 16 ? c.bytes : 16));
-                const std::uint32_t* sw = reinterpret_cast<const std::uint32_t*>(g_arena_mapped + c.src_gpu);
-                if (xs_css_trace_say(ck.k)) {
+                const std::uint32_t* sw = reinterpret_cast<const std::uint32_t*>(g_arena_mapped + to);
+                std::uint32_t now_w[4] = {};
+                SIZE_T g2 = 0;
+                ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(c.src), now_w, static_cast<SIZE_T>(c.bytes < 16 ? c.bytes : 16), &g2);
+                const bool changed = c.has_rec && std::memcmp(now_w, c.rec_w, static_cast<std::size_t>(c.bytes < 16 ? c.bytes : 16)) != 0;
+                static std::atomic<std::uint64_t> n_changed{0};
+                if (changed) ++n_changed;
+                if (xs_css_trace_say(ck.k) || (changed && n_changed.load() <= 32)) {
                     std::fprintf(stderr, "[hack] CSS_TRACE apply #%llu: dst title 0x%llx stand-in 0x%llx BEFORE %08x %08x %08x %08x | src title 0x%llx "
-                                 "words %08x %08x %08x %08x -> src stand-in 0x%llx now %08x %08x %08x %08x, 0x%llx bytes, frame %llu\n",
+                                 "words %08x %08x %08x %08x -> src %s 0x%llx now %08x %08x %08x %08x, 0x%llx bytes, frame %llu; title since record: %s "
+                                 "(at record %08x %08x %08x %08x; %llu changed so far)\n",
                                  (unsigned long long)ck.k, (unsigned long long)c.dst, (unsigned long long)c.dst_gpu, before[0], before[1],
                                  before[2], before[3], (unsigned long long)c.src, ck.want[0], ck.want[1], ck.want[2], ck.want[3],
-                                 (unsigned long long)c.src_gpu, sw[0], sw[1], sw[2], sw[3], (unsigned long long)c.bytes,
-                                 (unsigned long long)::leonida::ce::present_frame().load(std::memory_order_relaxed));
+                                 c.stage_gpu ? "stage" : "stand-in", (unsigned long long)to, sw[0], sw[1], sw[2], sw[3], (unsigned long long)c.bytes,
+                                 (unsigned long long)::leonida::ce::present_frame().load(std::memory_order_relaxed),
+                                 !c.has_rec ? "?" : changed ? "CHANGED" : "same", c.rec_w[0], c.rec_w[1], c.rec_w[2], c.rec_w[3],
+                                 (unsigned long long)n_changed.load());
                     std::fflush(stderr);
                 }
                 std::lock_guard l(g_css_staged_mu);
@@ -4267,8 +4369,11 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
             }
         }
         bool css_drop = false;  // agA36 COPY_SRC_SYNC=3
+        std::uint64_t css_res = 0, css_off = 0;  // agA36 CSS_STAGE: the forwarded copy's new source
         if constexpr (Slot == 15) {  // agA35 COPY_SRC_SYNC
-            if (xs_copy_src_sync_mode() > 0) css_drop = xs_css_record(self, unwrap_object(a1), a2, unwrap_object(a3), a4, a5);
+            if (xs_copy_src_sync_mode() > 0)
+                css_drop = xs_css_record(self, unwrap_object(a1), a2, unwrap_object(a3), a4, a5, static_cast<ID3D12GraphicsCommandList*>(self->real),
+                                         &css_res, &css_off);
         }
         if constexpr (Slot == 15 || Slot == 17) {  // agA35 WATCH_RANGE: CopyBufferRegion(dst, doff, src, soff, n) / CopyResource(dst, src)
             std::uint64_t ds = 0, ss = 0;
@@ -4283,6 +4388,7 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                          (unsigned long long)n, _ReturnAddress());
         }
         if constexpr (Slot == 15) if (css_drop) return 0;  // agA36 COPY_SRC_SYNC=3: the CPU wrote the destination stand-in at submit
+        if constexpr (Slot == 15) if (css_res) { a3 = css_res; a4 = css_off; }  // agA36 CSS_STAGE (after the [watch] lines)
         constexpr unsigned pc = console_to_pc_list_slot(Slot);
         if constexpr (pc == kListNotForwarded) {
             {   // HACK diagnostic: every console-only list slot, once, with its arguments and caller
