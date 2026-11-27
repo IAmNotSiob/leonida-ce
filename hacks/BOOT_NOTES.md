@@ -2924,3 +2924,67 @@ Measured from warm logs (rt52 build 143, rt58 build 142, rt44). rt59 was a cold 
   (3) Decoded but untested: PSO_CULL=1 (PA_SU_SC_MODE_CNTL); stencil ref comes from OMSetStencilRef (Plausible).
   (4) Untranslated: depth bias (PA_SU_SC_MODE_CNTL has poly offset enabled on most pipelines, but the offset registers are not
       located yet) and depth bounds (DB_DEPTH_CONTROL bit 3, unused in the rt80 data).
+
+## agA42 (sender gen 42, 2026-11-27) - summary written by agA43 (agA42 left no section)
+- Builds 200 (FRAME_CLEAR), 201 (+FRAME_TRACE_AUTO, NANPROBE_TARGET=auto locks on the TiledLighting 2560x1440 RGBA16F target),
+  202 (+LIST_SLOT_STATS). The tree was committed by agA43 as 1a23e04e3 (= build 202).
+- rt200 (173 + SKIP_CS cs_8513f5a0, c5b1005e, 344692c2): device lost at 562 s (direct VS_Blit). A42 found cs_8513f5a0 writes NaN
+  over all of target0 at the end of the frame in rt80.
+- rt201 (201, FRAME_CLEAR=f16 + SKIP_CS cs_8513f5a0, 720 s): nanprobe frame 5611 target 0x100001b00: 2974 samples, ALL CLEAN, every
+  px 0 - with the per-frame clear target0 is 0, not NaN, and nothing in that frame writes a non-zero texel. Still black.
+
+## agA43 (sender gen 43, 2026-11-27) - the world is mesh shaders; their PSOs were never built
+- Work files /root/a43 (ed*.py edits, msg*.txt, match6.py / psomatch6.py, vm/ = VM psomap + want copies, dump/ = record dumps).
+- FINDING (Definite, rt203 LIST_SLOT_STATS=60): the "gameplay" frames after boot state 11->0 (frame ~5000-5900) are a near-empty
+  frame (~10 list calls per frame). The real scene starts at frame ~5560-5940: 3000-4000 Dispatch, 2000-3400 ExecuteIndirect,
+  2600-3400 SetPipelineState per frame. The pace drops to ~2 s per frame there. Every earlier "gameplay" probe (nanprobe at
+  5611 etc.) looked at the empty frame. The device losses of rt103/rt200/rt204 came right at the scene start.
+- FINDING (Definite, MESH_EI=1 in rt205): the scene's geometry is ExecuteIndirect with a DISPATCH_MESH (type 10) command
+  signature, ~1100 per frame, every one with the slot 57 PLACEHOLDER PSO bound. Slot 41 had turned DISPATCH_MESH signatures
+  into DISPATCH, so each such EI re-ran the last-bound compute PSO with the mesh arguments as group counts.
+  rt205 (MESH_EI=2: those EIs skipped): no device loss in 1200 s (frame 6384); rt204 (same env without the skip) lost the
+  device at frame 5652. (Likely: the wrong compute re-runs caused the scene-start losses; 1 run each.)
+- FINDING (Definite, rt206/rt207 dumps): the console pipeline record holds 8 (ptr, size) pairs, not 6. NGG pipelines
+  (PS_DeferredTextured*, PS_Cable*, CascadeShadows, AlphaPrepass, LinearDepth, PuddleDetect, ...) have #2 = PS code,
+  #3 = its table, #4/#5 empty, #6 = the geometry-stage code, #7 = its table. #6 is a corpus "ms" program
+  (e.g. _MS_VS_TransformD_5a4fa379 for PS_DeferredTextured_5a4fa379, MSNC_VS_Cable_*, MST_DS_PNTri_*). Slot 57 looked at
+  #2/#4 only -> "no vertex stage" -> placeholder. 6325 MS headers seen so far, all matched (stage ms) by psomatch.
+- Builds (commit 0d7b2e259 = build 209; 206-208 intermediate):
+  * Slot 57: if #2/#4 give no VS, blob #6 is looked up (ms or vs); unknown -> want list. A mesh record is created with
+    ID3D12Device2::CreatePipelineState (MS + PS + the same translated blend/depth/raster/MRT state). "[hack] MESH_PSO".
+  * IndirectKind::mesh for DISPATCH_MESH signatures; ExecuteIndirect records a mesh Draw with the indirect buffer; the replay
+    emits vkCmdDrawMeshTasksIndirect(Count)EXT. Console type 105 stays DISPATCH (no DISPATCH_MESH retry).
+  * Mesh draw vs non-mesh pipeline: draw left out ("MESH_MISMATCH") instead of failing the list.
+  * LEONIDA_CE_MESH_EI=1 log / 2 skip type 10 / 3 skip 10+105 (build 204+). PLACEHOLDER_PSO diagnostic + nvsNN dumps.
+- VM psomap: C:\zroot\root\leonida-psomap.txt now = the 11/24 map + 6325 ms entries (/root/a43/vm/leonida-psomap.new.txt);
+  backup C:\zroot\root\leonida-psomap.a43bak.txt. The want file was not re-run against the corpus since 11/24 before this.
+- rt209 (209 + full map, 1800 s, stopped at ~1250 s): boot 0->1 at t=514 s (was 63 s: creating ~6300 mesh PSOs costs ~60 ms
+  each on the title's loading thread, Likely in create_graphics' per-stage SPIR-V work), scene from frame ~13900.
+  rtdiag 14120: 48261 draws / 20 frames, pending-pso 0, variant-skip 10. The G-buffer pass runs: PS_DeferredTextured*,
+  PS_DeferredPedTexturedNC*, terrain, ~1150 mesh draws per frame into the 2560x1440 RGBA8 G-buffer targets, plus
+  PositionOnly / LinearDepth depth prepasses (no-target). BUT every G-buffer target and the depth buffers stay 0 bytes;
+  screen still black. No device loss in 1250 s.
+- FINDING (Definite): "[rt] d3d12: no translated compute shader for FSPX kind-6 and kind-0" x1144 in every run (rt203-rt209):
+  1144 of the title's compute programs have no SPIR-V and run as EMPTY pipelines. The VM dumped all 2060 containers
+  (C:\zroot\root\leonida-dump\cs_*.dxbc, copied to /root/a43/csdump); only 916 are in spirv/fspx_game (index from 11/24).
+  Translating them (/root/a43/csnew, fspx_unpack 16-way, slow: ~9 s per program for llvm-mc): 1 in 20 had a 24-byte
+  prologue (fixed in tools/fspx_unpack.py, 66bcf3d8e); 19 in 20 still hold words llvm-mc gfx1030 rejects (SMEM
+  e.g. 0xf4281a26 0x00000074 = s_buffer_load_dwordx4 with sdata s104 (Plausible), MIMG 0xf09c0708) and rdna2spirv stops at
+  "fall-through into undecodable words". Sample of 20: 1 translated. This is a translator task (decoder for those
+  encodings), not done.
+- rt211 (build 210, INDIRECT_SRC logs for mesh draws): every world mesh EI record reads stand-in [x=0 y=1 z=1] (32-byte
+  stride, placed buffer at title 0xde226a000, title CPU bytes 0): the GPU arg writer runs (y = z = 1 come from it through
+  the D3D UAV / stand-in) but writes ZERO groups. So the world draws are issued with nothing to draw. Candidates: the
+  count comes from culling/visibility compute that is among the 1144 empty pipelines, or culling inputs are wrong
+  (HiZ / instance lists / camera; raw title-VA writes into the POOL_GPU=1 window are dropped). Open.
+- Build 211 (LEONIDA_CE_MESH_FORCE_X=K, default off, HACK): each indirect DISPATCH_MESH record is drawn as a direct
+  vkCmdDrawMeshTasksEXT(K, 1, 1) (up to 64 records per EI). Hides the real group count; a bisect knob for "does anything
+  rasterize at all".
+- rt212 (211 + MESH_FORCE_X=16): presents stopped at frame 13101 right as the scene started, DEVICE LOST ~60 s later; direct
+  checkpoint = a forced _MS_VS_TransformD_c5fd36bb + PS_DeferredTextured draw (Definite). Forcing groups makes the mesh
+  shaders run on whatever per-group data exists (none) -> hang. Keep MESH_FORCE_X off.
+- Invalid-word census over 300 of the 1144 untranslated disasms (llvm-mc gfx1030): SMEM loads whose sdata range ends past
+  s105 (s_load_dwordx8/x16 / s_buffer_load_dwordx4/x8 into s92..s107; e.g. 0xf40c190a 0xfa000d60 = op 3 sdata s100) and
+  MIMG ops 36/39/47 (0xf09c0708 ...). After the first rejected word llvm-mc loses sync and the rest is garbage.
+  Plausible: the console compiler uses s104..s107 (VCC aliases) as plain SGPRs. A translator fix = decode those words in
+  tools/shader_disasm.py / rdna2spirv.py instead of relying on llvm-mc, with an SGPR file of 108.
