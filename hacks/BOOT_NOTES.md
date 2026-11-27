@@ -2905,3 +2905,22 @@ Measured from warm logs (rt52 build 143, rt58 build 142, rt44). rt59 was a cold 
   /root/a40-git-empty, experimental was reset to d352c6e58, and the work was committed again as 5414f8ef1. Two stale reflog
   lines still name 9e38f054e.
 - Warm 0->1 is not compile-bound: all 1313 background compute PSOs finish before 0->1 (p50 16 ms, p99 6.5 s = the bvh ones).
+- rt103 (main session: build 173 = 180 + agA40, rt103.env): gameplay at t=309 s, frame ~5880. Frame 5900: "dsv-bound 17201,
+  depth-attached 16194, depth-off 1007, depth-dropped 0, mrt-dropped 102". target0 is STILL all NaN (7fff7fff, 2764800/2764800).
+  DEVICE LOST right after frame 5900. Every vkGetDeviceFaultInfo address is type 4 (instruction pointer unknown = a
+  timeout-like loss, not a page fault). Checkpoints: direct queue TexturedUnlit_IM, compute cs_c5b1005e / cs_344692c2 (rt52
+  had the same bystander). Then a 0xc0000005 at game+0x5562369. rt80 (no PSO_DEPTH) ran to frame 10200 with no loss, so depth
+  is a suspect (Plausible: real depth lets HiZ/GPU culling produce non-zero instance counts, so far more work per frame), but
+  A40 build-173 changes are also in the build.
+- IMPORTANT: in rt103 target0 moved to T# 0x100001c00 (it was 0x100001b00 in rt59/rt80/rt93). The default
+  LEONIDA_CE_NANPROBE_TARGET (b00) would probe nothing there. /root/a41/nanprobe-auto-target.patch (NOT built or committed)
+  adds NANPROBE_TARGET=auto: it locks onto the first 2560x1440 RGBA16F target drawn into from <min frame> on.
+- HANDOFF / what agA41 would try next:
+  (1) A/B the device loss: build 173+ with rt103.env vs the same with LEONIDA_CE_PSO_DEPTH=0. If only depth loses the device,
+      bisect with LEONIDA_CE_PSO_STENCIL=0, then DEPTH_FUNC overrides, then SKIP_GFX on the heavy depth-tested pipelines.
+  (2) The NaN: NANPROBE=auto:5850:100 with NANPROBE_TARGET=0x100001c00 (or apply the auto patch) so it arms in the first
+      gameplay frames, before the loss (~frame 5900+). The rt80 probe said NaN from the first command (carried over), so a
+      clear of target0 at frame start (or of the TAA/history buffers) is the next A/B: it shows whether a pass regenerates the NaN.
+  (3) Decoded but untested: PSO_CULL=1 (PA_SU_SC_MODE_CNTL); stencil ref comes from OMSetStencilRef (Plausible).
+  (4) Untranslated: depth bias (PA_SU_SC_MODE_CNTL has poly offset enabled on most pipelines, but the offset registers are not
+      located yet) and depth bounds (DB_DEPTH_CONTROL bit 3, unused in the rt80 data).
