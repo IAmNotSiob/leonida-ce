@@ -1430,7 +1430,9 @@ private:
     void run() {
         std::unique_lock<std::mutex> lock(mutex_);
         while (!stopping_) {
-            if (wake_.wait_for(lock, std::chrono::seconds(60), [this] { return stopping_; })) return;
+            // agA46 LEONIDA_PIPELINE_CACHE_SAVE_SEC (default 60): the blob is GBs now, each save rewrites it all.
+            static const long every = [] { const char* e = std::getenv("LEONIDA_PIPELINE_CACHE_SAVE_SEC"); const long v = e ? std::strtol(e, nullptr, 0) : 60; return v > 0 ? v : 60; }();
+            if (wake_.wait_for(lock, std::chrono::seconds(every), [this] { return stopping_; })) return;
             lock.unlock();
             save_now();
             lock.lock();
@@ -1440,7 +1442,13 @@ private:
     void save_if_grown() {
         std::size_t size = query_size();
         if (size <= last_size_) return;
-        std::vector<std::uint8_t> blob(size);
+        // agA46: rt231 died here with std::bad_array_new_length (the blob was already 7.1 GB): never throw from the saver.
+        std::vector<std::uint8_t> blob;
+        try { blob.resize(size); } catch (...) {
+            std::fprintf(stderr, "[rt] d3d12: pipeline cache save skipped (%zu bytes)\n", size);
+            last_size_ = size;
+            return;
+        }
         if (get_(device_, cache_, &size, blob.data()) != VK_SUCCESS || size == 0) return;  // VK_INCOMPLETE: retry
         blob.resize(size);
 
@@ -6566,15 +6574,19 @@ public:
         return 0;
     }
 public:
-    void kick_lazy() const {
-        if (!lazy_job_ || lazy_kicked_.exchange(true)) return;
-        static std::atomic<int> kicked{0};
-        if (kicked.load() == 0) {  // agA46 LEONIDA_CE_LAZY_TRACE=N: FRAME_TRACE_AUTO traces the frame N after the first lazy bind
+    void kick_lazy(bool bind = false) const {
+        if (!lazy_job_) return;
+        static std::atomic<bool> traced{false};
+        if (bind && !traced.exchange(true)) {  // agA46 LEONIDA_CE_LAZY_TRACE=N: FRAME_TRACE_AUTO traces the frame N after the first lazy bind
             static const long tr = [] { const char* e = std::getenv("LEONIDA_CE_LAZY_TRACE"); return e ? std::strtol(e, nullptr, 0) : -1L; }();
-            if (tr >= 0)
-                leonida::ce::auto_trace_frame().store(leonida::ce::present_frame().load(std::memory_order_relaxed) + std::uint64_t(tr),
-                                                      std::memory_order_relaxed);
+            if (tr >= 0) {
+                const std::uint64_t at = leonida::ce::present_frame().load(std::memory_order_relaxed) + std::uint64_t(tr);
+                leonida::ce::auto_trace_frame().store(at, std::memory_order_relaxed);
+                std::fprintf(stderr, "[hack] LAZY_TRACE: tracing frame %llu\n", (unsigned long long)at);
+            }
         }
+        if (lazy_kicked_.exchange(true)) return;
+        static std::atomic<int> kicked{0};
         std::fprintf(stderr, "[hack] LAZY_CS first bind #%d %s frame %llu\n", ++kicked, lazy_job_->name.c_str(),
                      (unsigned long long)leonida::ce::present_frame().load(std::memory_order_relaxed));
         std::fflush(stderr);
@@ -12195,7 +12207,7 @@ const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature) 
 
 std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline) {
     const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
-    if (p && p->compute()) p->kick_lazy();  // agA46 SKIP_CS_LAZY
+    if (p && p->compute()) p->kick_lazy(true);  // agA46 SKIP_CS_LAZY
     return p && p->compute() ? p->id() : 0;
 }
 
