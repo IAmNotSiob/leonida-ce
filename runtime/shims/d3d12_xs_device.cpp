@@ -606,6 +606,10 @@ struct XsListExtras { std::vector<XsDeferredWrite> writes; std::vector<std::uniq
 std::mutex g_list_extras_mu;
 std::mutex g_list_pso_mu;                          // agA21: last SetPipelineState per console list proxy
 std::map<const void*, std::uint64_t> g_list_pso;
+// agA43 LEONIDA_CE_MESH_EI: console command signatures whose draw argument was DISPATCH_MESH (10) or the console-only 105,
+// both turned into DISPATCH by slot 41 (keyed by the signature pointer the title gets back).
+std::mutex g_sig_mu;
+std::map<std::uint64_t, int> g_sig_console_type;
 std::map<const void*, XsListExtras> g_list_extras;  // keyed by the console list proxy
 struct XsPendingWrites { ID3D12Fence* fence; std::uint64_t value; std::vector<XsDeferredWrite> writes; };
 std::vector<XsPendingWrites> g_pending_writes;      // under g_fence_mirror_mu
@@ -4620,6 +4624,33 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 return 0;
             }
         }
+        if constexpr (Slot == 61) {
+            // HACK (agA43, LEONIDA_CE_MESH_EI=1 log | 2 skip type-10 (DISPATCH_MESH) EIs | 3 skip type 10 and 105): slot 41
+            // creates DISPATCH_MESH / 105 signatures as DISPATCH, so such an ExecuteIndirect re-runs whatever compute PSO was
+            // last bound with the mesh arguments as group counts (wrong work, possibly NaN writes or hangs).
+            static const int mesh_ei = [] { const char* e = std::getenv("LEONIDA_CE_MESH_EI"); return e ? std::atoi(e) : 0; }();
+            if (mesh_ei) {
+                int t = 0;
+                { std::lock_guard l(g_sig_mu); auto it = g_sig_console_type.find(a1); if (it != g_sig_console_type.end()) t = it->second; }
+                if (t) {
+                    static std::atomic<std::uint64_t> n10{0}, n105{0};
+                    const std::uint64_t k = (t == 10 ? n10 : n105).fetch_add(1, std::memory_order_relaxed) + 1;
+                    if ((k & (k - 1)) == 0) {
+                        std::uint64_t pso = 0;
+                        { std::lock_guard pl(g_list_pso_mu); auto it = g_list_pso.find(self); if (it != g_list_pso.end()) pso = it->second; }
+                        std::string name = "(not from slot 57)";
+                        if (pso && reinterpret_cast<IUnknown*>(pso) == g_placeholder_pso.load()) name = "(slot 57 placeholder)";
+                        else { std::lock_guard nl(g_pso_names_mu); auto it = g_pso_names.find(reinterpret_cast<const void*>(pso)); if (it != g_pso_names.end()) name = it->second; }
+                        std::fprintf(stderr, "[hack] MESH_EI: type %d EI #%llu max %llu (args %llx +0x%llx count %llx) last PSO %llx %s%s\n", t,
+                                     (unsigned long long)k, (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)a4,
+                                     (unsigned long long)a5, (unsigned long long)pso, name.c_str(),
+                                     (mesh_ei >= 3 || (mesh_ei == 2 && t == 10)) ? " -> skipped" : "");
+                        std::fflush(stderr);
+                    }
+                    if (mesh_ei >= 3 || (mesh_ei == 2 && t == 10)) return 0;
+                }
+            }
+        }
         if constexpr (Slot == 25) {  // HACK diagnostic: which pipelines the title sets (first 12 distinct)
             { std::lock_guard pl(g_list_pso_mu); g_list_pso[self] = a1; }  // agA21 (slot 80 thread dims)
             static std::mutex m;
@@ -6276,6 +6307,10 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                 std::fprintf(stderr, "[hack]   retry with type %d -> 0x%08lx\n", (int)replacement, (unsigned long)hr);
                 if (SUCCEEDED(hr)) break;
             }
+        }
+        if (SUCCEEDED(hr) && out && *out && desc->NumArgumentDescs) {  // agA43 MESH_EI
+            const int t0 = static_cast<int>(desc->pArgumentDescs[desc->NumArgumentDescs - 1].Type);
+            if (t0 == 10 || t0 >= 100) { std::lock_guard l(g_sig_mu); g_sig_console_type[reinterpret_cast<std::uint64_t>(*out)] = t0 == 10 ? 10 : t0; }
         }
         std::fprintf(stderr, "[hack] CreateCommandSignature(stride=%u, n=%u, root=%p) -> 0x%08lx; args:", desc->ByteStride,
                      desc->NumArgumentDescs, (void*)root, (unsigned long)hr);
