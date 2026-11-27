@@ -34,6 +34,7 @@
 #include "depth24.h"
 #include "uav_clear.h"
 #include "rtdiag.h"
+#include "ce_nanprobe.h"  // agA39
 #include "gfx10_descriptors.h"  // agA34 DRAW_SRV
 
 #include <vulkan/vulkan.h>
@@ -2643,6 +2644,13 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         }
     }
     rtdiag::count_draw(p.colors, p.depth.id, 0, reinterpret_cast<std::uint64_t>(p.pipeline));
+    if (rtdiag::on()) {  // agA39: what this draw binds that its pipeline drops
+        int extra = 0;
+        for (std::size_t slot = p.colors.size(); slot < render_target_count && slot < max_render_targets; ++slot)
+            if (draw.views->render_targets[slot].resource) ++extra;
+        rtdiag::note_binding(reinterpret_cast<std::uint64_t>(p.pipeline), draw.depth.resource != 0,
+                             draw.depth.resource && pipeline->depth_format == VK_FORMAT_UNDEFINED, extra);
+    }
     draw_peek(draw, reinterpret_cast<std::uint64_t>(p.pipeline));  // agA32
     draw_srv(draw, reinterpret_cast<std::uint64_t>(p.pipeline));  // agA34
     if (pipeline->ce_skip) {  // agA37 LEONIDA_CE_SKIP_GFX (after DRAW_PEEK / DRAW_SRV, so those still log)
@@ -3173,6 +3181,216 @@ inline void to_attachment(const ReplayFunctions& vk, VkCommandBuffer command_buf
 }
 
 } // namespace detail
+
+// DIAGNOSTIC (agA39, LEONIDA_CE_NANPROBE, ce_nanprobe.h): per-command samples of one colour target while one frame is
+// built, to name the first command after which it holds NaN.
+namespace detail::nanprobe_rt {
+struct Meta {
+    std::uint64_t frame = 0;
+    std::uint64_t pipe = 0;     // VkPipeline (names via ce::pipeline_name)
+    std::uint32_t list = 0;     // list number within the probe
+    std::uint32_t command = 0;  // command index in its list
+    char kind = '?';            // B list begin, D draw into the target, C dispatch, I ExecuteIndirect, X clear/copy
+    std::uint32_t count = 0, instances = 0;
+    std::uint32_t texel = 0;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    bool sampled = false;       // false: no layout known for the target, nothing copied
+};
+struct State {
+    std::mutex m;
+    std::vector<Meta> meta;
+    ResourceBinding target{};   // cached from a draw into the target
+    ResourceId target_id = 0;
+    bool filled = false, reported = false;
+    std::uint32_t lists = 0;
+};
+inline State& state() { static State s; return s; }
+inline bool probing() {
+    const std::uint64_t a = ::leonida::ce::nanprobe::armed().load(std::memory_order_relaxed);
+    return a && ::leonida::ce::present_frame().load(std::memory_order_relaxed) == a;
+}
+inline bool fp16_bad(std::uint16_t h) { return (h & 0x7c00u) == 0x7c00u; }
+inline bool fp32_bad(std::uint32_t f) { return (f & 0x7f800000u) == 0x7f800000u; }
+// NaN/Inf texels among the sample's 8 (0 for formats that are not float).
+inline int bad_texels(const std::uint8_t* s, VkFormat f, std::uint32_t texel) {
+    int bad = 0;
+    for (std::uint32_t k = 0; k < ::leonida::ce::nanprobe::pixels; ++k) {
+        const std::uint8_t* t = s + k * 16;
+        bool b = false;
+        if (f == VK_FORMAT_R16G16B16A16_SFLOAT || f == VK_FORMAT_R16G16_SFLOAT || f == VK_FORMAT_R16_SFLOAT) {
+            for (std::uint32_t c = 0; c + 2 <= texel; c += 2) { std::uint16_t h; std::memcpy(&h, t + c, 2); b = b || fp16_bad(h); }
+        } else if (f == VK_FORMAT_R32G32B32A32_SFLOAT || f == VK_FORMAT_R32G32_SFLOAT || f == VK_FORMAT_R32_SFLOAT) {
+            for (std::uint32_t c = 0; c + 4 <= texel; c += 4) { std::uint32_t u; std::memcpy(&u, t + c, 4); b = b || fp32_bad(u); }
+        }
+        bad += b ? 1 : 0;
+    }
+    return bad;
+}
+// Prints the samples once the GPU has long finished the frame (12 presents later).
+inline void report_if_due() {
+    const auto& c = ::leonida::ce::nanprobe::config();
+    const std::uint64_t armed = ::leonida::ce::nanprobe::armed().load(std::memory_order_relaxed);
+    if (!armed || ::leonida::ce::present_frame().load(std::memory_order_relaxed) < armed + 12) return;
+    State& s = state();
+    std::lock_guard l(s.m);
+    if (s.reported) return;
+    s.reported = true;
+    std::uint8_t* const arena = ::leonida::ce::arena_host().load(std::memory_order_relaxed);
+    const std::uint64_t base = ::leonida::ce::nanprobe::region().load(std::memory_order_relaxed);
+    std::fprintf(stderr, "[nanprobe] frame %llu target 0x%llx: %zu samples in %u lists (region 0x%llx)\n",
+                 (unsigned long long)armed, (unsigned long long)c.target, s.meta.size(), s.lists, (unsigned long long)base);
+    if (!arena || !base) { std::fflush(stderr); return; }
+    int prev_bad = -1;
+    std::uint32_t prev_px[4] = {~0u, ~0u, ~0u, ~0u};
+    int lines = 0, first_bad = -1, first_good_after = -1;
+    std::uint32_t counts[5] = {};  // samples: unsampled, not landed, all bad, some bad, clean
+    for (std::size_t i = 0; i < s.meta.size(); ++i) {
+        const Meta& m = s.meta[i];
+        const std::uint8_t* p = arena + base + i * ::leonida::ce::nanprobe::slot_bytes;
+        bool landed = false;
+        for (std::uint32_t k = 0; k < ::leonida::ce::nanprobe::slot_bytes; ++k) landed = landed || p[k] != 0xA5;
+        int bad = -2;
+        if (!m.sampled) { ++counts[0]; bad = -2; }
+        else if (!landed) { ++counts[1]; bad = -3; }
+        else {
+            bad = bad_texels(p, m.format, m.texel);
+            ++counts[bad == int(::leonida::ce::nanprobe::pixels) ? 2 : bad ? 3 : 4];
+            if (bad > 0 && first_bad < 0) first_bad = int(i);
+            if (bad == 0 && first_bad >= 0 && first_good_after < 0) first_good_after = int(i);
+        }
+        std::uint32_t px[4] = {};
+        std::memcpy(px, p, 16);
+        const bool changed = bad != prev_bad || std::memcmp(px, prev_px, sizeof px) != 0;
+        if ((changed || i < 16 || m.kind == 'B') && lines < 1500) {
+            ++lines;
+            char what[24] = "-";
+            if (m.kind == 'X') std::snprintf(what, sizeof what, "command-type %llu", (unsigned long long)m.pipe);
+            std::fprintf(stderr, "[nanprobe] #%zu list %u cmd %u %c %s count %u inst %u: %s%d/8 bad | px0 %08x %08x %08x %08x\n", i, m.list,
+                         m.command, m.kind, (m.pipe && m.kind != 'X') ? ::leonida::ce::pipeline_name(m.pipe).c_str() : what, m.count, m.instances,
+                         bad == -2 ? "UNSAMPLED " : bad == -3 ? "NOT-LANDED " : "", bad < 0 ? 0 : bad, px[0], px[1], px[2], px[3]);
+        }
+        prev_bad = bad;
+        std::memcpy(prev_px, px, sizeof px);
+    }
+    std::fprintf(stderr, "[nanprobe] summary: unsampled %u, not landed %u, all-bad %u, some-bad %u, clean %u; first bad #%d, first clean after it #%d\n",
+                 counts[0], counts[1], counts[2], counts[3], counts[4], first_bad, first_good_after);
+    std::fflush(stderr);
+}
+// Copies 8 texels of the target into the next slot.
+inline void sample(VkCommandBuffer cb, const ReplayFunctions& vk, LayoutTracker* tracker, char kind, std::uint64_t pipe,
+                   std::uint32_t list, std::uint32_t command, std::uint32_t count = 0, std::uint32_t instances = 0) {
+    State& s = state();
+    const VkBuffer buf = ::leonida::ce::nanprobe::buffer().load(std::memory_order_relaxed);
+    const std::uint64_t base = ::leonida::ce::nanprobe::region().load(std::memory_order_relaxed);
+    std::uint8_t* const arena = ::leonida::ce::arena_host().load(std::memory_order_relaxed);
+    if (!buf || !base || !arena || !vk.copy_image_to_buffer || !vk.pipeline_barrier) return;
+    ResourceBinding t;
+    ResourceId id;
+    std::size_t slot;
+    {
+        std::lock_guard l(s.m);
+        if (!s.target_id || s.meta.size() >= ::leonida::ce::nanprobe::config().max) return;
+        if (!s.filled) {
+            s.filled = true;
+            std::memset(arena + base, 0xA5, ::leonida::ce::nanprobe::region_bytes);
+        }
+        t = s.target;
+        id = s.target_id;
+        slot = s.meta.size();
+        Meta m;
+        m.frame = ::leonida::ce::present_frame().load(std::memory_order_relaxed);
+        m.pipe = pipe; m.list = list; m.command = command; m.kind = kind; m.count = count; m.instances = instances;
+        m.format = t.format;
+        m.texel = block_format(t.format, VK_IMAGE_ASPECT_COLOR_BIT).bytes;
+        s.meta.push_back(m);
+    }
+    const std::uint32_t texel = block_format(t.format, VK_IMAGE_ASPECT_COLOR_BIT).bytes;
+    if (!texel || texel > 16 || t.samples != 1 || !t.image || !tracker) return;
+    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    LayoutPieces pieces;
+    if (!tracker->pieces(id, range, pieces) || pieces.empty()) return;
+    const VkImageLayout layout = pieces[0].layout;
+    if (layout == VK_IMAGE_LAYOUT_UNDEFINED) return;
+    const bool general = layout == VK_IMAGE_LAYOUT_GENERAL;
+    const VkImageLayout copy_layout = general ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    if (general)
+        memory_barrier(vk, cb, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT);
+    else
+        image_barrier(vk, cb, t, range, layout, copy_layout, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                      VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkBufferImageCopy regions[::leonida::ce::nanprobe::pixels]{};
+    for (std::uint32_t k = 0; k < ::leonida::ce::nanprobe::pixels; ++k) {
+        VkBufferImageCopy& r = regions[k];
+        r.bufferOffset = base + slot * ::leonida::ce::nanprobe::slot_bytes + k * 16;
+        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        r.imageOffset = {std::int32_t(std::uint64_t(t.width) * (2 * k + 1) / 16),
+                         std::int32_t(std::uint64_t(t.height) * (2 * ((k * 3) % 8) + 1) / 16), 0};
+        r.imageExtent = {1, 1, 1};
+    }
+    vk.copy_image_to_buffer(cb, t.image, copy_layout, buf, ::leonida::ce::nanprobe::pixels, regions);
+    if (general)
+        memory_barrier(vk, cb, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    else
+        image_barrier(vk, cb, t, range, copy_layout, layout, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    std::lock_guard l(s.m);
+    if (slot < s.meta.size()) s.meta[slot].sampled = true;
+}
+// Remembers the target's binding when a draw renders into it (from 40 frames before the probe on).
+inline bool note_draw(const PreparedDraw& d) {
+    const auto& c = ::leonida::ce::nanprobe::config();
+    const std::uint64_t f = ::leonida::ce::present_frame().load(std::memory_order_relaxed);
+    const std::uint64_t armed = ::leonida::ce::nanprobe::armed().load(std::memory_order_relaxed);
+    if (armed ? (f + 40 < armed || f > armed) : !c.automatic) return false;
+    for (const auto& a : d.colors) {
+        if (!a.id || rtdiag::address_for_id(a.id) != c.target) continue;
+        ::leonida::ce::nanprobe::count_target_draw(f);
+        State& s = state();
+        std::lock_guard l(s.m);
+        s.target = a.binding;
+        s.target_id = a.id;
+        return true;
+    }
+    return false;
+}
+// After command i of a list (at the head of the next iteration, outside any rendering scope).
+template<typename List, typename Commands>
+inline void after(const List& prepared, const Commands& commands, std::size_t i, VkCommandBuffer cb,
+                  const ReplayFunctions& vk, LayoutTracker* tracker, std::uint32_t list) {
+    const auto& command = commands[i];
+    const auto& p = prepared.commands[i];
+    const bool live = probing();
+    if (const auto* draw = std::get_if<Draw>(&command)) {
+        const PreparedDraw& d = prepared.draws[p.draw];
+        if (d.skip || !note_draw(d) || !live) return;
+        sample(cb, vk, tracker, 'D', reinterpret_cast<std::uint64_t>(d.pipeline), list, std::uint32_t(i), draw->count, draw->instances);
+    } else if (!live) {
+        return;
+    } else if (std::holds_alternative<Dispatch>(command)) {
+        sample(cb, vk, tracker, 'C', reinterpret_cast<std::uint64_t>(p.pipeline.pipeline), list, std::uint32_t(i));
+    } else if (std::holds_alternative<ExecuteIndirect>(command)) {
+        sample(cb, vk, tracker, 'I', 0, list, std::uint32_t(i));
+    } else {
+        ResourceId tid;
+        { std::lock_guard l(state().m); tid = state().target_id; }
+        if (!tid) return;
+        const auto [dst, src] = std::visit(
+            [](const auto& c) -> std::pair<ResourceId, ResourceId> {
+                using T = std::decay_t<decltype(c)>;
+                if constexpr (std::is_same_v<T, ClearRenderTarget>) return {c.target.resource, 0};
+                else if constexpr (std::is_same_v<T, ClearUnorderedAccess>) return {c.view.resource, 0};
+                else if constexpr (std::is_same_v<T, CopyTexture>) return {c.dst.resource, c.src.resource};
+                else if constexpr (std::is_same_v<T, CopyResource> || std::is_same_v<T, ResolveSubresource>) return {c.dst, c.src};
+                else return {0, 0};
+            },
+            command);
+        (void)src;
+        if (dst == tid) sample(cb, vk, tracker, 'X', std::uint64_t(command.index()), list, std::uint32_t(i));
+    }
+}
+}  // namespace detail::nanprobe_rt
 
 // Destination and source of a copy or resolve command.
 inline std::pair<ResourceId, ResourceId> copy_ids(const Command& command) {
@@ -4611,9 +4829,26 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
     };
 
     ::leonida::ce::checkpoint(command_buffer, 0xCE00000000000000ull | commands.size());
+    // agA39 LEONIDA_CE_NANPROBE (ce_nanprobe.h): samples of one colour target after each command while one frame is built.
+    std::uint32_t np_list = 0;
+    bool np_window = false;
+    if (::leonida::ce::nanprobe::on()) {
+        detail::nanprobe_rt::report_if_due();
+        const std::uint64_t f = ::leonida::ce::present_frame().load(std::memory_order_relaxed);
+        const std::uint64_t armed = ::leonida::ce::nanprobe::armed().load(std::memory_order_relaxed);
+        np_window = armed ? (f + 40 >= armed && f <= armed) : ::leonida::ce::nanprobe::config().automatic;
+        if (detail::nanprobe_rt::probing()) {
+            {
+                std::lock_guard l(detail::nanprobe_rt::state().m);
+                np_list = ++detail::nanprobe_rt::state().lists;
+            }
+            detail::nanprobe_rt::sample(command_buffer, vk, tracker, 'B', 0, np_list, 0);
+        }
+    }
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
         const auto& p = prepared.commands[i];
+        if (np_window && i > 0) detail::nanprobe_rt::after(prepared, commands, i - 1, command_buffer, vk, tracker, np_list);
         // agA22 LEONIDA_CE_CP_FINE=1: a checkpoint before EVERY command: 0xCE03 | variant index << 32 | command index,
         // so the device-lost checkpoint dump names the command the queue is stuck in (not only the last pipeline).
         static const bool cp_fine = [] { const char* e = std::getenv("LEONIDA_CE_CP_FINE"); return e && e[0] == '1'; }();
@@ -5628,6 +5863,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.end_rendering(command_buffer);
         }
     }
+    if (np_window && !commands.empty())  // agA39 NANPROBE: after the last command
+        detail::nanprobe_rt::after(prepared, commands, commands.size() - 1, command_buffer, vk, tracker, np_list);
     // Predication does not carry over to the next command list.
     if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
     if (!open_labels) close_labels(command_buffer, vk, own_labels);

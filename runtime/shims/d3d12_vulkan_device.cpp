@@ -17,6 +17,7 @@
 #include "page_alias.h"
 #include "dxgi_com.h"
 #include "../src/ce_checkpoints.h"
+#include "../src/ce_nanprobe.h"  // agA39
 #include "../src/ce_va_report.h"  // agA28: LEONIDA_CE_VA_REPORT
 #include "../src/ce_image_check.h"  // agA28: LEONIDA_CE_IMG_CHECK
 #include "../src/arena_size.h"
@@ -8454,6 +8455,18 @@ public:
         if (arena.mapped) {  // agA20: also without the ring sync (mirror poke, INDIRECT_SRC)
             leonida::ce::arena_bytes().store(arena.size);
             leonida::ce::arena_host().store(arena.mapped);
+            if (leonida::ce::nanprobe::on()) {  // agA39 LEONIDA_CE_NANPROBE: the sample region
+                VkDeviceSize off = 0;
+                if (state_.arena_allocate(leonida::ce::nanprobe::region_bytes, 256, off, DeviceState::arena_buffer)) {
+                    leonida::ce::nanprobe::region().store(off);
+                    leonida::ce::nanprobe::buffer().store(arena.buffer);
+                }
+                std::fprintf(stderr, "[nanprobe] frame %llu (auto %d from %llu, %u draws) target 0x%llx max %u: region at arena 0x%llx\n",
+                             (unsigned long long)leonida::ce::nanprobe::config().frame, int(leonida::ce::nanprobe::config().automatic),
+                             (unsigned long long)leonida::ce::nanprobe::config().min_frame, leonida::ce::nanprobe::config().threshold,
+                             (unsigned long long)leonida::ce::nanprobe::config().target, leonida::ce::nanprobe::config().max,
+                             (unsigned long long)off);
+            }
         }
         if (arena.mapped && !std::getenv("LEONIDA_CE_NO_RING_SYNC")) {
             std::uint8_t* const host = arena.mapped;

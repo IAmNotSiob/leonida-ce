@@ -36,6 +36,10 @@ struct State {
     std::uint64_t fail[16] = {};
     std::uint64_t draw_fail[16] = {};
     std::vector<std::pair<std::uint64_t, std::string>> want;  // agA34 DRAW_SRV: T# addresses to probe at the dump
+    // agA39: drawn draws that bind a DSV, of those the ones whose pipeline has no depth format (the DSV is dropped),
+    // draws that bind more render targets than their pipeline has (the extra ones are dropped), and per pipeline.
+    std::uint64_t dsv_bound = 0, depth_dropped = 0, mrt_dropped = 0;
+    std::unordered_map<std::uint64_t, std::uint64_t> notarget_pipes, depthdrop_pipes, mrtdrop_pipes;
 };
 inline State& state() {
     static State s;
@@ -134,6 +138,24 @@ inline std::vector<std::uintptr_t> dump(std::uintptr_t presented, std::uint64_t 
     for (int i = 0; i < 16; ++i)
         if (s.draw_fail[i]) std::fprintf(stderr, " %d:%llu", i, (unsigned long long)s.draw_fail[i]);
     std::fprintf(stderr, "\n");
+    // agA39: dropped bindings and the pipelines of draws without a colour target.
+    std::fprintf(stderr, "[rtdiag]   bindings: dsv-bound %llu, depth-dropped %llu (pipeline has no depth format), mrt-dropped %llu "
+                 "(more targets bound than the pipeline has)\n", (unsigned long long)s.dsv_bound, (unsigned long long)s.depth_dropped,
+                 (unsigned long long)s.mrt_dropped);
+    {
+        const std::pair<const char*, std::unordered_map<std::uint64_t, std::uint64_t>*> maps[] = {
+            {"no-target", &s.notarget_pipes}, {"depth-dropped", &s.depthdrop_pipes}, {"mrt-dropped", &s.mrtdrop_pipes}};
+        for (const auto& [label, m] : maps) {
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> pv;
+            for (const auto& [pipe, n] : *m) pv.push_back({n, pipe});
+            std::sort(pv.rbegin(), pv.rend());
+            for (std::size_t k = 0; k < pv.size() && k < 8; ++k)
+                std::fprintf(stderr, "[rtdiag]   %s pipe x%llu %s\n", label, (unsigned long long)pv[k].first,
+                             ::leonida::ce::pipeline_name(pv[k].second).c_str());
+            m->clear();
+        }
+        s.dsv_bound = s.depth_dropped = s.mrt_dropped = 0;
+    }
     for (int pass = 0; pass < 2; ++pass) {
         auto& m = pass ? s.depth_draws : s.target_draws;
         std::vector<std::pair<std::uint64_t, std::uintptr_t>> v;
@@ -180,7 +202,16 @@ inline void count_draw(const Colors& colors, std::uintptr_t depth, int how, std:
     for (const auto& a : colors)
         if (a.id) { ++s.target_draws[a.id]; any = true; if (pipe) ++s.target_pipes[a.id][pipe]; }
     if (depth) ++s.depth_draws[depth];
-    if (!any) ++s.no_target;
+    if (!any) { ++s.no_target; if (pipe) ++s.notarget_pipes[pipe]; }
+}
+// agA39: what a drawn draw binds that its pipeline cannot use (counted with the draw).
+inline void note_binding(std::uint64_t pipe, bool dsv, bool depth_dropped, int extra_rts) {
+    if (!on()) return;
+    auto& s = state();
+    std::lock_guard l(s.m);
+    if (dsv) ++s.dsv_bound;
+    if (depth_dropped) { ++s.depth_dropped; if (pipe) ++s.depthdrop_pipes[pipe]; }
+    if (extra_rts > 0) { ++s.mrt_dropped; if (pipe) ++s.mrtdrop_pipes[pipe]; }
 }
 inline void count_list(int result, bool draw_fail) {
     if (!on()) return;

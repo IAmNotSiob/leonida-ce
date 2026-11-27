@@ -6,6 +6,7 @@
 #include <vector>
 #include <deque>
 #include <mutex>
+#include <unordered_set>  // agA39 PSO_STATE_LOG
 #include <intrin.h>
 // Xbox-ABI proxy around a PC ID3D12Device. See d3d12_xs_device.h for the measured slots and the limits.
 //
@@ -6267,6 +6268,37 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                         if (pso_blend && ok) g.BlendState.RenderTarget[0] = d;
                         if (pso_wmask) g.BlendState.RenderTarget[0].RenderTargetWriteMask = static_cast<UINT8>(tmask & 0xf);
                         std::snprintf(psostate, sizeof(psostate), " [cb0 %08x tm %x db %x]", cb[0], tmask & 0xf, dbc);
+                        // agA39 LEONIDA_CE_PSO_STATE_LOG=<file>: every distinct (shader pair, blob #0) as one text line
+                        // "<vs> + <ps> | <len> | <blob #0 as hex dwords>", for decoding the depth/stencil/MRT state offline.
+                        static const char* const state_log = std::getenv("LEONIDA_CE_PSO_STATE_LOG");
+                        if (state_log && *state_log) {
+                            static std::mutex sl_mu;
+                            static std::unordered_set<std::uint64_t> sl_seen;
+                            static FILE* sl_file = nullptr;
+                            std::uint64_t h = 1469598103934665603ull;
+                            const auto mix = [&h](const void* d, std::size_t n) {
+                                const auto* b = static_cast<const std::uint8_t*>(d);
+                                for (std::size_t k = 0; k < n; ++k) { h ^= b[k]; h *= 1099511628211ull; }
+                            };
+                            mix(b0, std::size_t(b0len));
+                            mix(vs->name.data(), vs->name.size());
+                            if (ps) mix(ps->name.data(), ps->name.size());
+                            std::lock_guard sl(sl_mu);
+                            if (sl_seen.size() < 20000 && sl_seen.insert(h).second) {
+                                if (!sl_file) sl_file = std::fopen(state_log, "a");
+                                if (sl_file) {
+                                    std::fprintf(sl_file, "%s + %s | %llx |", vs->name.c_str(), ps ? ps->name.c_str() : "(no PS)",
+                                                 (unsigned long long)b0len);
+                                    for (std::uint64_t k = 0; k + 4 <= b0len; k += 4) {
+                                        std::uint32_t v;
+                                        std::memcpy(&v, b0 + k, 4);
+                                        std::fprintf(sl_file, " %08x", v);
+                                    }
+                                    std::fprintf(sl_file, "\n");
+                                    if ((sl_seen.size() & 255) == 0) std::fflush(sl_file);
+                                }
+                            }
+                        }
                         static std::atomic<int> dec_logged{0};
                         const bool sf = vs->name.find("Cxform") != std::string::npos || vs->name.find("TexTG") != std::string::npos;
                         if (dec_logged++ < 40 || (sf && dec_logged < 4000)) {
