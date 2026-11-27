@@ -6404,6 +6404,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                 }
                 char psostate[64] = "";
                 UINT ce_rts = 1;  // agA39 PSO_MRT
+                D3D12_CULL_MODE ce_cull = D3D12_CULL_MODE_NONE;  // agA41 PSO_CULL
+                BOOL ce_ccw = FALSE;
                 // HACK (agA4, LEONIDA_CE_PSO_BLEND, default on, =0 off): blob #0 of the console record (0x17c/0x184 bytes)
                 // carries GCN context registers at fixed offsets. +0xd0..+0xef = CB_BLEND0..7_CONTROL (0x80000000 =
                 // blend off + DISABLE_ROP3; 0xe5040504 = SRC_ALPHA/INV_SRC_ALPHA, separate alpha, enable), +0xcc =
@@ -6519,34 +6521,82 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                 }
                             }
                         }
-                        // agA39 LEONIDA_CE_PSO_DEPTH=1: depth state from blob #0 +0x3c (Plausible: bit 1 = depth test, bit 2 =
-                        // depth write; 0x10 off, 0x12 test, 0x14 write) and from the PS (SV_Depth: write); compare op from
-                        // LEONIDA_CE_PSO_DEPTH_FUNC (ge default = reversed Z; le, gt, lt, always). =2: test + write on every
-                        // pipeline (bisect knob). The DSV format follows the depth buffer a draw binds (replay variant).
+                        // agA41 LEONIDA_CE_PSO_DEPTH=1: depth/stencil state from the GCN context registers in blob #0 (Very likely,
+                        // from 11210 rt80 blobs vs pass names; agA39's +0x3c is SPI_SHADER_PGM_RSRC2 = the user-SGPR count, not depth):
+                        //   +0xb8 DB_DEPTH_CONTROL (bit0 stencil, bit1 Z test, bit2 Z write, bits4-6 ZFUNC, bit7 backface,
+                        //         bits8-10 STENCILFUNC, bits20-22 STENCILFUNC_BF; func 0 never .. 7 always = D3D12 func - 1)
+                        //         blits/UI/Scaleform 0x007007f0 (off), G/VBuffer 0x007007e7 (GE + write + stencil), VfxVBuffer
+                        //         0x007007e2 (GE test-only), TiledLighting 0x007007a2 (EQUAL test-only, material-depth passes),
+                        //         ps_generate_material_mask / DownsampleMinDepth / Copy_SRV_To_Depth 0x7007f6/7 (ALWAYS + write),
+                        //         CSM shadows 0x007007b6 (LE + write: forward Z).
+                        //   +0xbc DB_STENCIL_CONTROL (fail/zpass/zfail, then the _BF set, 4 bits each)
+                        //   +0xc0 / +0xc4 DB_STENCILREFMASK(_BF) (testval 0-7, mask 8-15, writemask 16-23, opval 24-31)
+                        //   +0xa0 PA_SU_SC_MODE_CNTL (bit0 cull front, bit1 cull back, bit2 FACE = CW front) -> LEONIDA_CE_PSO_CULL=1
+                        // LEONIDA_CE_PSO_DEPTH_FUNC=ge|le|gt|lt|always overrides the compare op of every Z-tested pipeline
+                        // (old A/B knob; default = the register). =2: test + write on every pipeline (bisect knob).
+                        // LEONIDA_CE_PSO_STENCIL=0 leaves stencil off. The DSV format follows the depth buffer the draw binds.
                         static const int pso_depth = [] { const char* v = std::getenv("LEONIDA_CE_PSO_DEPTH"); return v ? std::atoi(v) : 0; }();
-                        if (pso_depth) {
-                            static const D3D12_COMPARISON_FUNC zfunc = [] {
+                        if (pso_depth && b0len >= 0xc8) {
+                            static const int zfunc_over = [] {
                                 const char* v = std::getenv("LEONIDA_CE_PSO_DEPTH_FUNC");
-                                const std::string f = v ? v : "ge";
-                                return f == "le" ? D3D12_COMPARISON_FUNC_LESS_EQUAL : f == "gt" ? D3D12_COMPARISON_FUNC_GREATER
-                                     : f == "lt" ? D3D12_COMPARISON_FUNC_LESS : f == "always" ? D3D12_COMPARISON_FUNC_ALWAYS
-                                     : D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+                                const std::string f = v ? v : "";
+                                return f == "ge" ? int(D3D12_COMPARISON_FUNC_GREATER_EQUAL) : f == "le" ? int(D3D12_COMPARISON_FUNC_LESS_EQUAL)
+                                     : f == "gt" ? int(D3D12_COMPARISON_FUNC_GREATER) : f == "lt" ? int(D3D12_COMPARISON_FUNC_LESS)
+                                     : f == "always" ? int(D3D12_COMPARISON_FUNC_ALWAYS) : 0;
                             }();
+                            static const bool pso_stencil = [] { const char* v = std::getenv("LEONIDA_CE_PSO_STENCIL"); return !v || *v != '0'; }();
+                            std::uint32_t dctl, sctl, srm, srm_bf;
+                            std::memcpy(&dctl, b0 + 0xb8, 4);
+                            std::memcpy(&sctl, b0 + 0xbc, 4);
+                            std::memcpy(&srm, b0 + 0xc0, 4);
+                            std::memcpy(&srm_bf, b0 + 0xc4, 4);
+                            const auto cmp = [](std::uint32_t f) { return D3D12_COMPARISON_FUNC((f & 7) + 1); };
+                            const auto sop = [](std::uint32_t o) -> D3D12_STENCIL_OP {
+                                switch (o & 15) {
+                                case 0: return D3D12_STENCIL_OP_KEEP; case 1: return D3D12_STENCIL_OP_ZERO;
+                                case 3: case 4: return D3D12_STENCIL_OP_REPLACE;  // REPLACE_TEST / REPLACE_OP (op value)
+                                case 5: return D3D12_STENCIL_OP_INCR_SAT; case 6: return D3D12_STENCIL_OP_DECR_SAT;
+                                case 7: return D3D12_STENCIL_OP_INVERT; case 8: return D3D12_STENCIL_OP_INCR;
+                                case 9: return D3D12_STENCIL_OP_DECR;
+                                default: return D3D12_STENCIL_OP_KEEP;  // ONES and the logic ops have no D3D12 form
+                                }
+                            };
                             const bool ps_depth = ps && xs_ps_outputs(ps->dxbc).depth;
-                            const bool test = pso_depth == 2 || (dbc & 2) != 0;
-                            const bool write = pso_depth == 2 || (dbc & 4) != 0 || ps_depth;
-                            if (test || write) {
-                                g.DepthStencilState.DepthEnable = TRUE;
-                                g.DepthStencilState.DepthWriteMask = write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
-                                g.DepthStencilState.DepthFunc = test ? zfunc : D3D12_COMPARISON_FUNC_ALWAYS;
-                                const D3D12_DEPTH_STENCILOP_DESC keep{D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
-                                                                      D3D12_COMPARISON_FUNC_ALWAYS};
-                                g.DepthStencilState.FrontFace = g.DepthStencilState.BackFace = keep;
-                                static std::atomic<int> told_depth{0};
-                                if (told_depth++ < 24)
-                                    std::fprintf(stderr, "[hack] PSO_DEPTH: %s + %s db %x ps-depth %d -> test %d write %d func %d\n", vs->name.c_str(),
-                                                 ps ? ps->name.c_str() : "(no PS)", dbc, int(ps_depth), int(test), int(write), int(g.DepthStencilState.DepthFunc));
+                            const bool test = pso_depth == 2 || (dctl & 2) != 0;
+                            const bool write = pso_depth == 2 || (test && (dctl & 4) != 0);
+                            const bool stencil = pso_depth != 2 && pso_stencil && (dctl & 1) != 0;
+                            auto& ds = g.DepthStencilState;
+                            if (test) {
+                                ds.DepthEnable = TRUE;
+                                ds.DepthWriteMask = write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+                                ds.DepthFunc = pso_depth == 2 ? D3D12_COMPARISON_FUNC_GREATER_EQUAL : cmp(dctl >> 4);
+                                if (zfunc_over && ds.DepthFunc != D3D12_COMPARISON_FUNC_ALWAYS && ds.DepthFunc != D3D12_COMPARISON_FUNC_EQUAL)
+                                    ds.DepthFunc = D3D12_COMPARISON_FUNC(zfunc_over);
                             }
+                            const D3D12_DEPTH_STENCILOP_DESC keep{D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
+                                                                  D3D12_COMPARISON_FUNC_ALWAYS};
+                            ds.FrontFace = ds.BackFace = keep;
+                            if (stencil) {
+                                ds.StencilEnable = TRUE;
+                                ds.StencilReadMask = UINT8((srm >> 8) & 0xff);
+                                ds.StencilWriteMask = UINT8((srm >> 16) & 0xff);
+                                ds.FrontFace = {sop(sctl), sop(sctl >> 8), sop(sctl >> 4), cmp(dctl >> 8)};
+                                if (dctl & 0x80) ds.BackFace = {sop(sctl >> 12), sop(sctl >> 20), sop(sctl >> 16), cmp(dctl >> 20)};
+                                else ds.BackFace = ds.FrontFace;
+                            }
+                            (void)srm_bf;
+                            static std::atomic<int> told_depth{0};
+                            if ((test || stencil || ps_depth) && told_depth++ < 48)
+                                std::fprintf(stderr, "[hack] PSO_DEPTH: %s + %s dbctl %08x st %08x srm %08x ps-depth %d -> test %d write %d func %d stencil %d\n",
+                                             vs->name.c_str(), ps ? ps->name.c_str() : "(no PS)", dctl, sctl, srm, int(ps_depth), int(test),
+                                             int(write), int(ds.DepthFunc), int(stencil));
+                        }
+                        static const bool pso_cull = [] { const char* v = std::getenv("LEONIDA_CE_PSO_CULL"); return v && *v == '1'; }();
+                        if (pso_cull && b0len >= 0xa4) {
+                            std::uint32_t su;
+                            std::memcpy(&su, b0 + 0xa0, 4);
+                            ce_cull = (su & 3) == 2 ? D3D12_CULL_MODE_BACK : (su & 3) == 1 ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_NONE;
+                            ce_ccw = (su & 4) ? FALSE : TRUE;
                         }
                         std::snprintf(psostate, sizeof(psostate), " [cb0 %08x tm %x db %x]", cb[0], tmask & 0xf, dbc);
                         // agA39 LEONIDA_CE_PSO_STATE_LOG=<file>: every distinct (shader pair, blob #0) as one text line
@@ -6594,7 +6644,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                 }
                 g.SampleMask = UINT_MAX;
                 g.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-                g.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+                g.RasterizerState.CullMode = ce_cull;  // agA41 PSO_CULL (NONE without it)
+                g.RasterizerState.FrontCounterClockwise = ce_ccw;
                 g.RasterizerState.DepthClipEnable = TRUE;
                 g.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
                 g.NumRenderTargets = ce_rts;  // agA39 PSO_MRT (1 without it)

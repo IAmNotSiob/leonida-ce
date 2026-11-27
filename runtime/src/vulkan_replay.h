@@ -2669,8 +2669,12 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         int extra = 0;
         for (std::size_t slot = p.colors.size(); slot < render_target_count && slot < max_render_targets; ++slot)
             if (draw.views->render_targets[slot].resource) ++extra;
+        // agA41: a DSV the draw binds is "dropped" only when the pipeline has depth/stencil state (a DSV format, or
+        // ce_depth_any) and the draw still renders without a depth attachment; "off" = the pipeline has no depth state.
+        const bool wants_depth = pipeline->depth_format != VK_FORMAT_UNDEFINED || pipeline->ce_depth_any;
         rtdiag::note_binding(reinterpret_cast<std::uint64_t>(p.pipeline), draw.depth.resource != 0,
-                             draw.depth.resource && pipeline->depth_format == VK_FORMAT_UNDEFINED, extra);
+                             draw.depth.resource && wants_depth && !p.depth.view, extra,
+                             draw.depth.resource && p.depth.view, draw.depth.resource && !wants_depth);
     }
     draw_peek(draw, reinterpret_cast<std::uint64_t>(p.pipeline));  // agA32
     draw_srv(draw, reinterpret_cast<std::uint64_t>(p.pipeline));  // agA34
