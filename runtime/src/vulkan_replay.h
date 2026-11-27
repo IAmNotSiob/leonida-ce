@@ -5793,6 +5793,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                         &d.vertex_sizes[slot], &d.vertex_strides[slot]);
             }
             ::leonida::ce::checkpoint(command_buffer, reinterpret_cast<std::uint64_t>(d.pipeline));
+            // HACK (agA43, LEONIDA_CE_MESH_FORCE_X=K, default off): emit every indirect DISPATCH_MESH as a direct
+            // vkCmdDrawMeshTasksEXT(K, 1, 1) per record (max_count records). rt211: the GPU-written args read [0 1 1]
+            // (zero groups) - the culling inputs are wrong or missing. Hides the real group count; a bisect knob.
+            static const std::uint32_t mesh_force_x = [] { const char* e = std::getenv("LEONIDA_CE_MESH_FORCE_X"); return e ? std::uint32_t(std::strtoul(e, nullptr, 0)) : 0u; }();
+            if (d.ind_buffer && draw->mesh && mesh_force_x && vk.draw_mesh_tasks) {
+                for (std::uint32_t k = 0; k < draw->ind_max && k < 64; ++k) vk.draw_mesh_tasks(command_buffer, mesh_force_x, 1, 1);
+            } else
             if (d.ind_buffer && draw->mesh) {  // agA43 indirect DISPATCH_MESH
                 if (d.cnt_buffer && vk.draw_mesh_tasks_indirect_count)
                     vk.draw_mesh_tasks_indirect_count(command_buffer, d.ind_buffer, d.ind_offset, d.cnt_buffer, d.cnt_offset, draw->ind_max, draw->ind_stride);
