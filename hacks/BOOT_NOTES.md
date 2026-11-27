@@ -2821,3 +2821,32 @@ Next: read rt72/rt73. If gameplay arrives, re-run with a changed LOOP_CAP (cold 
 list, to measure the case this was built for. Plausible extras: a per-module "slow list" that the prebake never builds
 and that create_compute always gives a placeholder (rt70 + offline: RaytracingResolve), and capping concurrent large
 compiles by memory (offline peak was 250 GB).
+
+## agA40 (sender gen 40, 2026-11-27) - time from launch to gameplay
+Measured from warm logs (rt52 build 143, rt58 build 142, rt44). rt59 was a cold compile (919 s to 11->0).
+
+| phase (boot state) | rt52 t (s) | s | cause |
+|---|---|---|---|
+| pre-init (0) | 0-52.8 | 53 | engine init, shaders.rpf + core_bvh4 (253 MiB DS), ~1300 background compute PSOs (warm cache); frames 0-1080 at ~20 fps. With a cold cache, 0->1 comes at 250-360 s |
+| state 1 | 52.8-83.7 | 31 | the title polls input (~22/s), 2.7 s per 60 frames, DS 253->390 MiB |
+| state 3 = landing, PLAYER (A) | 83.7-93.4 | 10 | ~8 s of it is the script (A@s3+8). In warm runs 3->13 took 8.8-48.8 s (avg ~19) because the first A is often missed and the retry comes 10 s later |
+| state 13 = the load loop (0x1421b7530, NOT the landing) | 93.4-123.0 | 30 | DS 390->585 MiB in ~7 s, then ~20 s at 17 fps. 13->0 does not follow a press (rt45: 6.9 s after the last A) |
+| state 0, post-load | 123-218 | 95 | GPU idle (LIST_TIME: 20-100 ms GPU per 1024 lists), DS idle (626->687 MiB), 4-5 fps, the title reads no input. A stall of 2 s or more on every frame that is 29 mod 30 = the placed-texture refresh pass (below) |
+| save flow 0->10->0->11->0 (or 0->9->10->11->0) | 218-226 | 8 | autosave list/submit |
+| intro + credits, world streaming | 226-~320 | ~95 | DS 687->2756 MiB, 2-4 fps; gameplay frames ~3000-3400. The refresh stalls continue (rt52 SAMPLE 10-28) |
+
+- Ruled out: the timer resolution. SDL_InitTicks calls timeBeginPeriod(1), so the title's Sleep(1) poll loops (one is
+  game+0x1e10183..0x1e101a1, where the main thread sits in the post-load phase) sleep about 1 ms. The diagnostic flags cost
+  nothing measurable between runs (main session's rt40-rt58 table). The DOWN presses land in the load loop (13), where
+  nothing reads them; they are harmless.
+- HOT SPOT (Likely): xs_refresh_placed_textures runs inside every 30th PresentX (d3d12_xs_device.cpp ~4861). In rt52, rt58
+  and rt44, every "[hang] SAMPLE" between 13->0 and the save flow is on a frame that is 29 mod 30 (rt52: 2069, 2099 ... 2309),
+  and every thread is waiting at that moment. From frame ~2040 a pass covers 1253+ textures, with one ReadProcessMemory
+  per 4 KiB sample plus one VirtualQuery per 64 KiB page (commit_physical_range).
+- Build 170 (62d97faa4): hash reads in 64 KiB chunks (LEONIDA_CE_REFRESH_CHUNK_KB, 0 = old; same samples, same hash);
+  commit only when xs_readable fails; "[refresh] pass N: textures, MiB, commits, uploads, ms" at powers of two, for passes
+  over 250 ms, and for every pass with LEONIDA_CE_REFRESH_LOG=1.
+- Press script: PRESS=A@s3+1/3x8,A@s3+30/10x40,DOWN@s3+12/10x3 (rt90.env). It presses PLAYER as soon as the landing is up,
+  retries every 3 s, and keeps the old 10 s A cadence for the rest of the run.
+- Runs requested: rt90 (build 170, rt59.env + the new PRESS) and rt91 (rt90 + NO_PLACED_REFRESH=1 = the upper bound of
+  the refresh cost).
