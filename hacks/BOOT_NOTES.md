@@ -2689,3 +2689,8 @@ Where it stands:
   first TAA copies in rt52) show args [3 0 0 0 0] = InstanceCount 0. Chain: culling CBs zero -> zero instance counts -> no world
   -> empty depth -> TiledLighting/SSSResolve NaN -> black. With COPY_SRC_SYNC the culling kernels get real CBs, which is where
   the new hangs start (cs_d8b54205 etc.). A NaN scrub would only show sky/UI. Check INDIRECT args after gameplay in rt58/rt54.
+- rt58 (142 + CSS_STAGE_MB=64 + STAGE_AT=record + A37 tight caps; warm): CSS_STAGE pool at arena 0x5e630000; CSS_TRACE 184 LANDED,
+  0 ZERO, 61 DIFFERENT (same-dst repeats); all 51 apply lines "title since record: same" => record vs submit timing does not matter
+  (the .sum CHANGED count matches other lines). TAA CB correct. DEVICE LOST ~frame 3100 anyway (direct: DistantWindowEmissives,
+  compute: cs_c5b1005e, queue 4 sem UINT64_MAX), so the lap aliasing is not the (only) loss cause. Shots s09/s10 = Windows desktop
+  after the crash, not a picture. Last logged INDIRECT_SRC args still [3 0 0 0 0] (logging capped early; inconclusive).
