@@ -463,6 +463,90 @@ D3D12_RESOURCE_ALLOCATION_INFO xs_alloc_info(ID3D12Device* real, UINT mask, cons
 // answers itself, AddRef/Release count, every other slot logs once and returns 0.
 struct XsProbe { void** vtable; std::atomic<long> refs{1}; };
 constexpr unsigned kXsProbeSlots = 64;
+// agA40 PROFILER (LEONIDA_CE_PROF=1): QPC time and call count per proxy slot (device, list, heap, queue, fence,
+// allocator), inclusive and summed over all threads. Every LEONIDA_CE_PROF_EVERY presents (default 60) one "[prof]"
+// line gives the wall ms per frame, the present pacing sleep, the placed-texture refresh, and the top slots by ms per frame.
+constexpr unsigned kProfDevice = 0, kProfList = 192, kProfHeap = 352, kProfQueue = 384, kProfFence = 512,
+                   kProfAlloc = 640, kProfN = 768;
+struct XsProfSlot { std::atomic<std::uint64_t> ticks{0}, calls{0}; };
+XsProfSlot g_prof[kProfN];
+std::atomic<std::uint64_t> g_prof_pace{0}, g_prof_refresh{0};
+bool xs_prof_on() {
+    static const bool on = [] { const char* v = std::getenv("LEONIDA_CE_PROF"); return v && v[0] == '1'; }();
+    return on;
+}
+std::uint64_t xs_prof_now() {
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return static_cast<std::uint64_t>(t.QuadPart);
+}
+struct XsProfScope {
+    unsigned i;
+    std::uint64_t t0 = 0;
+    explicit XsProfScope(unsigned idx) : i(idx < kProfN ? idx : kProfN - 1) { if (xs_prof_on()) t0 = xs_prof_now(); }
+    ~XsProfScope() {
+        if (!t0) return;
+        g_prof[i].ticks.fetch_add(xs_prof_now() - t0, std::memory_order_relaxed);
+        g_prof[i].calls.fetch_add(1, std::memory_order_relaxed);
+    }
+};
+const char* xs_prof_table(unsigned i, unsigned* slot) {
+    if (i >= kProfAlloc) { *slot = i - kProfAlloc; return "alloc"; }
+    if (i >= kProfFence) { *slot = i - kProfFence; return "fence"; }
+    if (i >= kProfQueue) { *slot = i - kProfQueue; return "queue"; }
+    if (i >= kProfHeap) { *slot = i - kProfHeap; return "heap"; }
+    if (i >= kProfList) { *slot = i - kProfList; return "list"; }
+    *slot = i;
+    return "device";
+}
+void xs_prof_report(std::uint64_t frame) {
+    if (!xs_prof_on()) return;
+    static const std::uint64_t every = [] {
+        const char* v = std::getenv("LEONIDA_CE_PROF_EVERY");
+        const std::uint64_t n = v ? std::strtoull(v, nullptr, 10) : 60ull;
+        return n ? n : 60ull;
+    }();
+    if (frame == 0 || frame % every) return;
+    static std::uint64_t last_t = 0, last_frame = 0, last_pace = 0, last_refresh = 0;
+    static std::uint64_t last_ticks[kProfN] = {}, last_calls[kProfN] = {};
+    LARGE_INTEGER fq;
+    QueryPerformanceFrequency(&fq);
+    const double ms_per_tick = 1000.0 / double(fq.QuadPart);
+    const std::uint64_t now = xs_prof_now();
+    if (!last_t) {
+        last_t = now; last_frame = frame;
+        last_pace = g_prof_pace.load(); last_refresh = g_prof_refresh.load();
+        for (unsigned i = 0; i < kProfN; ++i) { last_ticks[i] = g_prof[i].ticks.load(); last_calls[i] = g_prof[i].calls.load(); }
+        return;
+    }
+    const double frames = double(frame - last_frame);
+    struct Row { unsigned i; std::uint64_t dt, dc; };
+    std::vector<Row> rows;
+    std::uint64_t total = 0;
+    for (unsigned i = 0; i < kProfN; ++i) {
+        const std::uint64_t t = g_prof[i].ticks.load(), c = g_prof[i].calls.load();
+        const Row r{i, t - last_ticks[i], c - last_calls[i]};
+        last_ticks[i] = t; last_calls[i] = c;
+        if (r.dc) { rows.push_back(r); total += r.dt; }
+    }
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.dt > b.dt; });
+    const std::uint64_t pace = g_prof_pace.load(), refresh = g_prof_refresh.load();
+    char line[2048];
+    int n = std::snprintf(line, sizeof line, "[prof] frames %llu-%llu: wall %.1f ms/f, pace sleep %.1f, refresh %.1f, proxies %.1f ms/f; top:",
+                          (unsigned long long)last_frame, (unsigned long long)frame, double(now - last_t) * ms_per_tick / frames,
+                          double(pace - last_pace) * ms_per_tick / frames, double(refresh - last_refresh) * ms_per_tick / frames,
+                          double(total) * ms_per_tick / frames);
+    for (std::size_t k = 0; k < rows.size() && k < 14 && n > 0 && n < int(sizeof line) - 64; ++k) {
+        unsigned slot = 0;
+        const char* tab = xs_prof_table(rows[k].i, &slot);
+        n += std::snprintf(line + n, sizeof line - n, " %s#%u %.2f ms/f (%.0f calls/f);", tab, slot,
+                           double(rows[k].dt) * ms_per_tick / frames, double(rows[k].dc) / frames);
+    }
+    std::fprintf(stderr, "%s\n", line);
+    std::fflush(stderr);
+    last_t = now; last_frame = frame; last_pace = pace; last_refresh = refresh;
+}
+
 template <unsigned Slot>
 std::uint64_t WINAPI xs_probe_slot(XsProbe* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                    std::uint64_t a4) {
@@ -2423,7 +2507,9 @@ bool xs_hash_title_seh(std::uint64_t va, std::uint64_t len, std::uint64_t stride
     // present from frame ~2040 (1253+ placed textures) = this pass. Same sampled words, so the same hash.
     static const std::uint64_t chunk_bytes = [] {
         const char* v = std::getenv("LEONIDA_CE_REFRESH_CHUNK_KB");
-        const std::uint64_t kb = v ? std::strtoull(v, nullptr, 10) : 64ull;
+        // agA40 rt100: default 0 again. Whole-chunk reads copy every byte, and ReadProcessMemory moved only ~200 MB/s
+        // here (252 MiB of textures = 1.28 s a pass, 4 GiB = 8.4 s), far worse than one 8-byte read per sample.
+        const std::uint64_t kb = v ? std::strtoull(v, nullptr, 10) : 0ull;
         return kb ? std::min<std::uint64_t>(kb, 1024ull) * 1024ull : 4096ull;
     }();
     static const bool chunk_old = [] { const char* v = std::getenv("LEONIDA_CE_REFRESH_CHUNK_KB"); return v && v[0] == '0'; }();
@@ -3301,8 +3387,34 @@ void xs_refresh_placed_textures(ID3D12Device* dev) {
     QueryPerformanceCounter(&rf_t0);
     std::uint64_t rf_bytes = 0, rf_uploads = 0, rf_commits = 0;
     static const bool batch_on = [] { const char* v = std::getenv("LEONIDA_CE_REFRESH_BATCH"); return !(v && v[0] == '0'); }();
+    // agA40: non-glyph textures are sampled one word per LEONIDA_CE_REFRESH_STRIDE_KB (default 64 = one per 64 KiB
+    // physical page: a CopyPageMappings remap or a streamed fill changes whole pages; was 4 KiB). A pass stops after
+    // LEONIDA_CE_REFRESH_BUDGET_MS (default 40; 0 = no limit) and the next pass resumes at that texture (rotating
+    // cursor), so a big texture set no longer stalls one present for seconds (rt100: 1214 textures / 4 GiB = 8.4 s).
+    static const std::uint64_t big_stride = [] {
+        const char* v = std::getenv("LEONIDA_CE_REFRESH_STRIDE_KB");
+        const std::uint64_t kb = v ? std::strtoull(v, nullptr, 10) : 64ull;
+        return std::clamp<std::uint64_t>(kb, 4ull, 4096ull) * 1024ull;
+    }();
+    static const std::uint64_t budget_ticks = [] {
+        const char* v = std::getenv("LEONIDA_CE_REFRESH_BUDGET_MS");
+        const std::uint64_t ms = v ? std::strtoull(v, nullptr, 10) : 40ull;
+        LARGE_INTEGER fq;
+        QueryPerformanceFrequency(&fq);
+        return ms * static_cast<std::uint64_t>(fq.QuadPart) / 1000ull;
+    }();
+    static std::size_t rf_cursor = 0;
+    std::size_t rf_done = 0;
     XsUploadBatch batch;
-    for (const auto& t : textures) {
+    const std::size_t rf_count = textures.size();
+    for (std::size_t rf_k = 0; rf_k < rf_count; ++rf_k) {
+        if (budget_ticks && rf_k) {
+            LARGE_INTEGER tn;
+            QueryPerformanceCounter(&tn);
+            if (static_cast<std::uint64_t>(tn.QuadPart - rf_t0.QuadPart) > budget_ticks) break;
+        }
+        const auto& t = textures[(rf_cursor + rf_k) % rf_count];
+        rf_done = rf_k + 1;
         const std::uint64_t len = t.size;
         if (!len) continue;
         // agA40: commit only when the range is not already committed and readable (commit_physical_range does a
@@ -3324,7 +3436,7 @@ void xs_refresh_placed_textures(ID3D12Device* dev) {
         const DXGI_FORMAT ff = t.desc.Format;
         const bool glyphish = ff == DXGI_FORMAT_A8_UNORM || ff == DXGI_FORMAT_R8_UNORM || ff == DXGI_FORMAT_R8_TYPELESS ||
                               static_cast<int>(ff) == 65 || static_cast<int>(ff) == 61;
-        const std::uint64_t stride = glyphish && len <= full_bytes ? 8 : 4096;
+        const std::uint64_t stride = glyphish && len <= full_bytes ? 8 : big_stride;
         if (!xs_hash_title_seh(t.va, len, stride, &h, &nonzero)) {  // agA28: pages vanished under the read
             xs_note_title_read_fault(reinterpret_cast<const void*>(t.va));
             continue;
@@ -3354,6 +3466,7 @@ void xs_refresh_placed_textures(ID3D12Device* dev) {
         }
     }
     xs_upload_flush(dev, batch);  // agA40: the rest of the pass's uploads, one submission (textures still held)
+    if (rf_count) rf_cursor = (rf_cursor + rf_done) % rf_count;
     {
         LARGE_INTEGER rf_t1{};
         QueryPerformanceCounter(&rf_t1);
@@ -3361,8 +3474,8 @@ void xs_refresh_placed_textures(ID3D12Device* dev) {
         static std::uint64_t rf_pass = 0, rf_slow = 0;
         ++rf_pass;
         if (refresh_log || (rf_pass & (rf_pass - 1)) == 0 || (ms > 250.0 && rf_slow++ < 200)) {
-            std::fprintf(stderr, "[refresh] pass %llu: %zu textures, %llu MiB, %llu commits, %llu uploads, %.1f ms\n",
-                         (unsigned long long)rf_pass, textures.size(), (unsigned long long)(rf_bytes >> 20),
+            std::fprintf(stderr, "[refresh] pass %llu: %zu of %zu textures, %llu MiB, %llu commits, %llu uploads, %.1f ms\n",
+                         (unsigned long long)rf_pass, rf_done, textures.size(), (unsigned long long)(rf_bytes >> 20),
                          (unsigned long long)rf_commits, (unsigned long long)rf_uploads, ms);
             std::fflush(stderr);
         }
@@ -3955,6 +4068,7 @@ std::uint64_t WINAPI heap_slot(HeapProxy* self, std::uint64_t a1, std::uint64_t 
                                std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
                                std::uint64_t a8, std::uint64_t a9, std::uint64_t a10, std::uint64_t a11,
                                std::uint64_t a12, std::uint64_t a13, std::uint64_t a14) {
+    const XsProfScope xs_prof_scope_(kProfHeap + Slot);  // agA40
     if constexpr (Slot == 0) {
         return hr_to_u64(heap_query_interface(self, reinterpret_cast<const IID*>(a1),
                                               reinterpret_cast<void**>(a2)));
@@ -4470,6 +4584,7 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                                std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
                                std::uint64_t a8, std::uint64_t a9, std::uint64_t a10, std::uint64_t a11,
                                std::uint64_t a12, std::uint64_t a13, std::uint64_t a14) {
+    const XsProfScope xs_prof_scope_(kProfList + Slot);  // agA40
     if constexpr (Slot == 0) {
         return hr_to_u64(list_query_interface(self, reinterpret_cast<const IID*>(a1),
                                               reinterpret_cast<void**>(a2)));
@@ -5038,6 +5153,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
                                 std::uint64_t a8, std::uint64_t a9, std::uint64_t a10, std::uint64_t a11,
                                 std::uint64_t a12, std::uint64_t a13, std::uint64_t a14) {
+    const XsProfScope xs_prof_scope_((K == ChildKind::queue ? kProfQueue : K == ChildKind::fence ? kProfFence : kProfAlloc) + Slot);  // agA40
     if constexpr (Slot == 0) {
         d3d12_trace::record(child_trace_name<K>(Slot));
         return hr_to_u64(child_query_interface<K>(self, reinterpret_cast<const IID*>(a1),
@@ -5071,8 +5187,13 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                              res && count ? res[0] : nullptr);
                 std::fflush(stderr);
             }
-            if (f % 30 == 0 && self->device && self->device->real) xs_refresh_placed_textures(self->device->real);
+            if (f % 30 == 0 && self->device && self->device->real) {
+                const std::uint64_t rt0 = xs_prof_on() ? xs_prof_now() : 0;
+                xs_refresh_placed_textures(self->device->real);
+                if (rt0) g_prof_refresh.fetch_add(xs_prof_now() - rt0, std::memory_order_relaxed);
+            }
             xs_trap_tick(f);
+            xs_prof_report(f);  // agA40
             {   // HACK (Leonida CE boot): frame pacing. Presents were uncapped (about 240 per second; the frame events
                 // answer at once), while the title runs at 30 on the console and frees things a set number of frames
                 // later. LEONIDA_CE_FPS (30 by default, 0 for none) spaces presents at least 1/FPS apart.
@@ -5088,9 +5209,11 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                     QueryPerformanceCounter(&now);
                     if (!next.QuadPart || now.QuadPart - next.QuadPart > period * 4) next = now;
                     if (now.QuadPart < next.QuadPart) {
+                        const LONGLONG slept_from = now.QuadPart;
                         const DWORD ms = static_cast<DWORD>((next.QuadPart - now.QuadPart) * 1000 / freq.QuadPart);
                         if (ms) Sleep(ms);
                         do { QueryPerformanceCounter(&now); } while (now.QuadPart < next.QuadPart);
+                        if (xs_prof_on()) g_prof_pace.fetch_add(static_cast<std::uint64_t>(now.QuadPart - slept_from), std::memory_order_relaxed);
                     }
                     next.QuadPart += period;
                 }
@@ -5997,6 +6120,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
                                 std::uint64_t a8, std::uint64_t a9, std::uint64_t a10, std::uint64_t a11,
                                 std::uint64_t a12, std::uint64_t a13, std::uint64_t a14) {
+    const XsProfScope xs_prof_scope_(kProfDevice + Slot);  // agA40
     if constexpr (Slot == 0) {
         return hr_to_u64(proxy_query_interface(self, reinterpret_cast<const IID*>(a1),
                                                reinterpret_cast<void**>(a2)));
