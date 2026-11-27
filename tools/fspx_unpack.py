@@ -29,6 +29,7 @@ corpus uses, so tools/rdna2spirv.py can read it:
 import argparse
 import json
 import os
+import re
 import struct
 import sys
 
@@ -179,11 +180,34 @@ def unpack_payload(payload: bytes):
     return (meta, blob), 0
 
 
+_BRANCH = re.compile(r"^\s+(?:s_branch|s_cbranch_\w+)\s+(-?(?:0x[0-9a-fA-F]+|\d+))\s*;")
+_ENC = re.compile(r"encoding: \[([^\]]*)\]")
+
+
+def max_branch_target(asm: str, start: int) -> int:
+    """The highest branch target (code offset) in a listing whose first instruction is at `start`."""
+    pc, top = start, 0
+    for line in asm.splitlines():
+        m = _ENC.search(line)
+        if not m:
+            continue
+        b = _BRANCH.match(line)
+        if b:
+            v = int(b.group(1), 0) & 0xFFFF
+            top = max(top, pc + 4 + 4 * (v - 0x10000 if v & 0x8000 else v))
+        pc += len(m.group(1).split(","))
+    return top
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Unpack the FSPX compute programs in FidelityFX shader containers.")
     ap.add_argument("files", nargs="+", help="the DLL, .dxbc containers or bare FSPX payloads")
     ap.add_argument("--out", required=True)
     ap.add_argument("--disasm", action="store_true", help="also write disasm/<name>.s (needs llvm-mc, see LLVM_MC)")
+    ap.add_argument("--backend", choices=("llvm-mc", "python"), default="llvm-mc",
+                    help="--disasm decoder: llvm-mc, or tools/rdna2_decode.py (python). agA44: the game's pipeline-library "
+                         "programs need python with --mcpu gfx1013 (v_mad_f32/v_mac_f32, and SGPR tuples that run into "
+                         "vcc_lo/vcc_hi such as s_load_dwordx8 [s100..vcc_hi], which LLVM 21 rejects)")
     ap.add_argument("--mcpu", default="gfx1030",
                     help="llvm-mc CPU for --disasm (default gfx1030: the programs use v_dot4 instructions, which "
                          "gfx1010 and gfx1013 do not decode)")
@@ -258,7 +282,22 @@ def main(argv=None) -> int:
             listing = None
             if disasm and meta["code"]["end"]:
                 start, end = meta["code"]["start"], meta["code"]["end"]
-                asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu)
+                asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu, backend=a.backend,
+                                                  wave32=meta.get("wave32", True))
+                # agA44: long-branch trampolines (s_nop; s_branch back; s_endpgm) sit after the first s_endpgm; grow
+                # the range while a branch targets code past it.
+                while asm.strip():
+                    t = max_branch_target(asm, start)
+                    if t < end:
+                        break
+                    p = blob[6].find(ENDPGM, t)
+                    while p >= 0 and p % 4:
+                        p = blob[6].find(ENDPGM, p + 1)
+                    if p < 0:
+                        break
+                    end = meta["code"]["end"] = p + 4
+                    asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu, backend=a.backend,
+                                                      wave32=meta.get("wave32", True))
                 if not asm.strip():
                     reason = (err.strip().splitlines() or ["no output"])[0]
                     print(f"{name}: {reason}", file=sys.stderr)

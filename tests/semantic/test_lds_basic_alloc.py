@@ -115,9 +115,10 @@ class TestAllocationSize(unittest.TestCase):
 
 
 class TestRefusals(unittest.TestCase):
-    def test_tg_size_en_refused(self):
-        with self.assertRaises(rdna2spirv.Unsupported):
-            L.translate([READ], rsrc2(8, extra=1 << 10))
+    def test_tg_size_en_seeds_the_sgpr(self):
+        # agA44: TG_SIZE_EN gives the thread-group info SGPR (wave id << 6 | waves in the group) after the ids.
+        asm = L.translate([READ], rsrc2(8, extra=1 << 10))
+        self.assertIn("OpStore %tgp %tgv", asm)
 
     def test_group_over_1024_refused(self):
         for size in ((1025, 1, 1), (32, 33, 1), (16, 16, 5)):

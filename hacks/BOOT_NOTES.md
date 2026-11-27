@@ -3004,3 +3004,41 @@ Measured from warm logs (rt52 build 143, rt58 build 142, rt44). rt59 was a cold 
   Hacks in the recommended env: FRAME_CLEAR=f16 (hides carried-over NaN, clears RGBA16F >= 1280 wide at first draw),
   SKIP_CS=cs_8513f5a0 (A42: it writes NaN over target0), SKIP_GFX=DistantWindowEmissives, LOOP_CAP / LOOP_CAP_GFX,
   INDIRECT_CLAMP (from rt103.env). MESH_FORCE_X must stay off.
+
+## agA44 (sender gen 44, 2026-11-27) - the 1144 untranslated compute programs: 1141 translate now (offline)
+- Work dir /root/a44: fx/ = translator input (fspx/ copied from /root/a43/fspx_new/fspx, disasm/ = python-decoded
+  listings), fx2/ = the 94 that failed the first pass, sp5/ = their SPIR-V, index.merged.json (VM index + 1050),
+  index.merged2.json (+91 = 2677 entries), pydis.py, tr.sh (N shards, nice 19), deploy_next.sh, ed*.py edits.
+- ROOT CAUSE (Definite): llvm-mc was the problem, not the encodings. The game's pipeline-library CS are gfx1013-style
+  code: (1) v_mad_f32 / v_mac_f32 (VOP3 0x141, VOP2 0x1f), which gfx1030 removed - A43 used fspx_unpack's default
+  --mcpu gfx1030; (2) SGPR tuples that run into vcc_lo/vcc_hi (s106/s107) as ordinary SGPRs: s_load_dwordx8
+  [s100..s105,vcc_lo,vcc_hi], an S# in [s104,s105,vcc_lo,vcc_hi], SMEM base vcc, v_cmp_*_e64 vcc_hi. LLVM 21
+  rejects (2) on every CPU (LLVM 23 prints them as VCCTuple lists, which shader_ir already parses). The "exp
+  invalid_target_22" / "SMEM rejected" words in A43's census were desync after the first rejected word. The
+  repo's pure-Python decoder (tools/rdna2_decode.py, #1901) with mcpu gfx1013 decodes all but 3 programs cleanly,
+  in 6 s for all 1144 (llvm-mc took hours).
+- Translator changes: tools/fspx_unpack.py --backend python (+ grows the code range past the first s_endpgm while
+  a branch targets a long-branch trampoline after it: 30 programs); rdna2spirv: wave32 vcc_hi = s107 (operands
+  renamed, %vcc_hi aliased to %sgpr[107]), SMEM base vcc = [vcc_lo, s107], COMPUTE_PGM_RSRC2.TG_SIZE_EN (SGPR after
+  the group ids = wave id << 6 | waves in group; Mesa layout, Likely), s_bitreplicate_b64_b32 of a constant into a
+  wave64 mask, s_flbit_i32_b64 of a wave64 lane mask, ds_append/ds_consume (LDS; M0 taken as 0 - Plausible, the
+  programs never write M0). Tests updated: test_salu_flbit_64, test_lds_basic_alloc (both asserted the old refusals);
+  113 + 687 related semantic tests pass.
+  Recipe: fspx_unpack.py <dxbc...> --out DIR --disasm --backend python --mcpu gfx1013; rdna2spirv --wave64-emulate.
+- Result: 1141 of 1144 translate and pass spirv-val (3 left: the 3 with decoder-invalid words, reported as
+  v_max_f32_dpp "field dropped" at 0x13c - a decoder desync, not looked at). NOT GPU-verified.
+- Deployed to the VM (for rt213): 1050 .spv + merged index; original index kept as fspx_game\index.a44bak.json.
+  NOT deployed yet: the 91 in /root/a44/sp5 -> run /root/a44/deploy_next.sh (expects 2677 .spv), then rt214
+  (gta6rt-210.exe + /root/handoff/rt214.env = rt211.env family with WATCH_RANGE on the mesh arg buffer
+  0xde226a000-0xde2272000). C:\zroot\sp3.tar (3 GB) was left on the VM disk: delete it.
+- rt213 (210 + rt213.env, 1050 new CS): NO DATA. The host root disk hit 100% (my ~12 GB of translation outputs on
+  top of an almost full disk) and the win10 VM died about 2 min in (libvirt: shut off, reason crashed). I cut
+  /root/a44 to ~1.6 GB (11 GB free). /root/a43/fspx_new/disasm is 82 GB of llvm-mc listings (each warning repeats
+  the whole byte string), fully superseded by /root/a44/fx/disasm - deleting it was not permitted to me; it needs
+  the user. The VM was not restarted (main session: wait for free space).
+- Step 1 (who writes the mesh args at 0xde226a000) is still open. Note: INDIRECT_SRC reads the stand-in on the CPU at
+  replay time, before this frame's GPU work, so [0 1 1] there does not by itself prove the cull pass wrote 0 groups
+  (Plausible).
+- NEXT: free disk, start VM, deploy_next.sh, rt214 >= 1800 s; check the "no translated compute shader" count (expect
+  ~3), INDIRECT_SRC mesh args, rtdiag G-buffer dumps, device loss (new shaders untested on GPU: if the device is
+  lost, bisect by restoring index.a44bak.json + halves of the new entries).

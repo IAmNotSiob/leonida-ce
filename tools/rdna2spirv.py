@@ -347,6 +347,9 @@ class Gen:
         self.uses_viewport = False # VS: True once pos1 misc writes BuiltIn ViewportIndex
         self.gs = None             # GS: {"in": [(reg, sv)], "out": [(reg, sv)], "nreg": n, "maxv": n}
         self.wave64 = False        # compiled for 64-lane waves (64-bit EXEC writes, exec_hi, v_mbcnt_hi, ...)
+        # agA44: wave32 code where vcc_hi is the plain SGPR s107 (see wave32_vcc_hi_as_sgpr): %vcc_hi reads/writes
+        # go to %sgpr[107] instead, so the operand spelling (vcc_hi, s107, an slist slot) does not matter.
+        self.vcc_hi_sgpr = False
         self.cur_uniform_readlane = False
         self.w64g = None           # wave64 VS/PS/GS: wave64_halves.analyse() result (tier, reasons, rewrite sites)
         self.w64_scalar_spills = set()  # (vgpr, lane) pure scalar spill slots lowered to self.parked (SHADER-10)
@@ -411,6 +414,13 @@ class Gen:
         return self.consts[v]
 
     def emit(self, s):
+        if self.vcc_hi_sgpr and "%vcc_hi" in s:      # agA44: wave32, %vcc_hi is s107
+            if s.startswith("OpStore %vcc_hi "):
+                self.store_reg("sgpr", 107, s.split()[2])
+                return
+            m = re.fullmatch(r"(%\S+) = OpLoad %uint %vcc_hi", s)
+            if m:
+                s = f"{m.group(1)} = OpLoad %uint {self.reg_ptr('sgpr', 107)}"
         self.body.append("         " + s)
         if s.startswith("OpStore %active "):
             if self.exec_static_true:
@@ -4889,6 +4899,50 @@ class Gen:
             return v
         return self.lds_access(addr, byte_off, f)
 
+    def ds_append(self, op, a, mods):
+        """agA44: ds_append / ds_consume vD [offset:N] (LDS, not GDS): one atomic for the wave. RDNA2 ISA: the
+        dword at the address grows (append) or shrinks (consume) by the number of lanes on in EXEC and every active
+        lane gets the value from before. Address: offset:N. M0 is left out (taken as base 0): the game's compute
+        programs never write M0 and keep the counters at small constant LDS addresses they also touch with
+        ds_add_u32 at the same offsets (Plausible, not checked on hardware). The first active lane adds the count;
+        the other active lanes add 0 (so no branch on the lane), and the old value is shuffled from that lane."""
+        if len(a) != 1 or a[0]["k"] != "vgpr":
+            raise Unsupported(op + " operands")
+        self.uses_lds = True
+        off = self.mod_int(mods, "offset", 0)
+        sc, sem = self.cu(2), self.cu(0)
+        lo, hi = self.wave_mask({"k": "special", "t": "exec"})
+        c1, c2, cnt, ll, llu, hl, hlu, h32, lz, first, me, amt = (self.tmp() for _ in range(12))
+        self.emit(f"{c1} = OpBitCount %uint {lo}")
+        self.emit(f"{c2} = OpBitCount %uint {hi}")
+        self.emit(f"{cnt} = OpIAdd %uint {c1} {c2}")
+        self.emit(f"{ll} = OpExtInst %int %glsl FindILsb {self.as_int(lo)}")
+        self.emit(f"{llu} = OpBitcast %uint {ll}")
+        self.emit(f"{hl} = OpExtInst %int %glsl FindILsb {self.as_int(hi)}")
+        self.emit(f"{hlu} = OpBitcast %uint {hl}")
+        self.emit(f"{h32} = OpIAdd %uint {hlu} {self.cu(32)}")
+        self.emit(f"{lz} = OpIEqual %bool {lo} {self.cu(0)}")
+        self.emit(f"{first} = OpSelect %uint {lz} {h32} {llu}")
+        self.emit(f"{me} = OpIEqual %bool {self.wave_lane()} {first}")
+        self.emit(f"{amt} = OpSelect %uint {me} {cnt} {self.cu(0)}")
+        act = self.active_b()
+        pre, do, post, end, phi = self.tmp() + "_ap", self.tmp() + "_ado", self.tmp() + "_apost", self.tmp() + "_aend", self.tmp()
+        self.emit(f"OpBranch {pre}")
+        self.emit(f"{pre} = OpLabel")
+        self.emit(f"OpSelectionMerge {end} None")
+        self.emit(f"OpBranchConditional {act} {do} {end}")
+        self.emit(f"{do} = OpLabel")
+        atom = "OpAtomicISub" if op == "ds_consume" else "OpAtomicIAdd"
+        old = self.lds_atomic(self.cu(0), off, f"{atom} %uint {{p}} {sc} {sem} {amt}")
+        self.emit(f"OpBranch {post}")
+        self.emit(f"{post} = OpLabel")
+        self.emit(f"OpBranch {end}")
+        self.emit(f"{end} = OpLabel")
+        self.emit(f"{phi} = OpPhi %uint {old} {post} {self.cu(0)} {pre}")
+        r = self.tmp()
+        self.g_shuffle(r, phi, first)
+        self.dst(a[0], r)
+
     def lds_op(self, op, a, mods):
         """LDS (GFX10 DS encoding). Addresses are bytes. offset:N is bytes; read2/write2 offset0/offset1 count
         data-size units (x64 for st64). Writes and atomics run only in active lanes; results land in VGPRs through
@@ -7427,6 +7481,26 @@ class Gen:
             r = self.tmp()
             self.emit(f"{r} = OpBitReverse %uint {x}")
             self.dst(a[0], r)
+        elif op == "s_bitreplicate_b64_b32" and self.wave64 and a[1]["k"] == "imm" and \
+                (a[0]["k"] == "sgpr" and a[0].get("n") == 2 or
+                 a[0]["k"] == "special" and a[0].get("t") in ("exec", "vcc")):
+            # agA44: a constant lane mask (D[2i+1] = D[2i] = S0[i]), e.g. exec = 0xffff0000ffff0000 from 0xff00ff00 in
+            # a wave64 scan. Per-lane model: this lane's bit of the 64-bit constant (lane_masks marks D a mask).
+            v = a[1]["v"] & 0xFFFFFFFF
+            c = 0
+            for i in range(32):
+                if (v >> i) & 1:
+                    c |= 3 << (2 * i)
+            lane = self.wave_lane()
+            hi_l, sh, lo_w, hi_w, w, bit, on, m = (self.tmp() for _ in range(8))
+            self.emit(f"{hi_l} = OpUGreaterThanEqual %bool {lane} {self.cu(32)}")
+            self.emit(f"{sh} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
+            self.emit(f"{w} = OpSelect %uint {hi_l} {self.cu(c >> 32)} {self.cu(c & 0xFFFFFFFF)}")
+            self.emit(f"{bit} = OpShiftRightLogical %uint {w} {sh}")
+            self.emit(f"{lo_w} = OpBitwiseAnd %uint {bit} {self.cu(1)}")
+            self.emit(f"{on} = OpINotEqual %bool {lo_w} {self.cu(0)}")
+            self.emit(f"{m} = OpSelect %uint {on} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+            self.mask_dst(a[0], m)
         elif op in ("s_quadmask_b32", "s_quadmask_b64", "s_bitreplicate_b64_b32"):
             # RDNA2 ISA SOP1, on scalar data (a lane-mask operand stays Unsupported: each invocation holds only its
             # own lane's bit, and these ops read the other lanes of its quad or move bits between lanes):
@@ -8210,9 +8284,13 @@ class Gen:
             # there is none (0, and for i64 also -1). SCC is not written. The pair is 64-bit data (as for
             # s_lshl_b64); a lane-mask source stays Unsupported (#210).
             x = a[1]
-            if self.holds_lane_mask(x):
+            if self.holds_lane_mask(x) and (op != "s_flbit_i32_b64" or not self.wave64 or self.mask_half(x) is not None):
                 raise Unsupported(op + " of a lane mask")
-            if x["k"] == "sgpr" and x.get("n") == 2:
+            if self.holds_lane_mask(x):
+                # agA44: the whole wave64 mask (s_flbit_i32_b64 s14, exec: 63 - D is the last active lane), gathered
+                # as s_ff1_i32_b64 does.
+                lo, hi = self.wave_mask(x)
+            elif x["k"] == "sgpr" and x.get("n") == 2:
                 lo, hi = self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1)
             elif x["k"] == "imm":
                 v = x["v"] & 0xFFFFFFFFFFFFFFFF
@@ -8481,6 +8559,8 @@ class Gen:
             self.ds_lane_read(d, dat, src, lane)
         elif op == "ds_permute_b32":
             self.ds_permute(a, mods)
+        elif op in ("ds_append", "ds_consume") and self.stage in ("cs", "ms") and "gds" not in mods:
+            self.ds_append(op, a, mods)
         elif op.startswith("ds_") and self.stage == "gs":
             self.gs_ds(op, a, mods)
         elif op.startswith("ds_"):
@@ -15928,6 +16008,17 @@ def assemble(gen):
         for c in range(gen.cs["tid"] + 1):
             fn += [f"%li{c} = OpCompositeExtract %uint %lci {c}",
                    f"%lip{c} = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(c)}", f"OpStore %lip{c} %li{c}"]
+        if gen.cs.get("tg_size"):   # agA44: tg_size = wave id in the group << 6 | waves in the group
+            sx, sy, _ = gen.cs["size"]
+            r = gen.cs["user"] + len(gen.cs["tgid"])
+            fn += ["%tgx = OpCompositeExtract %uint %lci 0", "%tgy = OpCompositeExtract %uint %lci 1",
+                   "%tgz = OpCompositeExtract %uint %lci 2", f"%tgy1 = OpIMul %uint %tgy {gen.cu(sx)}",
+                   f"%tgz1 = OpIMul %uint %tgz {gen.cu(sx * sy)}", "%tgxy = OpIAdd %uint %tgx %tgy1",
+                   "%tgli = OpIAdd %uint %tgxy %tgz1",
+                   f"%tgw = OpShiftRightLogical %uint %tgli {gen.cu(6 if gen.wave64 else 5)}",
+                   f"%tgw6 = OpShiftLeftLogical %uint %tgw {gen.cu(6)}",
+                   f"%tgv = OpBitwiseOr %uint %tgw6 {gen.cu(gen.cs['tg_waves'])}",
+                   f"%tgp = OpAccessChain %_ptr_Function_uint %sgpr {gen.cu(r)}", "OpStore %tgp %tgv"]
     if gen.frag_inputs:
         fn += ["%fc = OpLoad %v4float %frag_coord"]
         if bary:
@@ -17106,6 +17197,28 @@ def fspx_wave_size(path, name):
     return None if not isinstance(wave32, bool) else (32 if wave32 else 64)
 
 
+def wave32_vcc_hi_as_sgpr(insns):
+    """agA44: in wave32 code VCC is vcc_lo alone and vcc_hi (SGPR 107) is an ordinary scalar register. The game's
+    compute programs (the 1144 pipeline-library ones the VM dumped after 11/24) allocate it like any other SGPR:
+    v_cmp_*_e64 vcc_hi, s_load_dwordx8 [s100..s105,vcc_lo,vcc_hi], an S# in [s104,s105,vcc_lo,vcc_hi], ... The
+    lane-mask tracking keys "vcc_hi" as half of a wave64 VCC, so rename it to s107 (and Gen.vcc_hi_sgpr sends the
+    %vcc_hi variable there too, for the paths that name it, such as s_mov_b64 vcc, s[..])."""
+    for ins in insns:
+        for a in ins.get("args") or ():
+            if a.get("k") == "special" and a.get("t") == "vcc_hi":
+                neg, ab = a.get("neg", False), a.get("abs", False)
+                a.clear()
+                a.update({"k": "sgpr", "r": 107, "n": 1, "neg": neg, "abs": ab})
+            elif a.get("k") == "slist":
+                a["r"] = [107 if x == "vcc_hi" else x for x in a["r"]]
+        # A scalar-memory base in vcc (s_load_dwordx4 s[60:63], vcc, 0x880) is the pair vcc_lo, s107.
+        args = ins.get("args") or ()
+        if ins.get("op", "").startswith(("s_load_", "s_buffer_load_")) and len(args) > 1 and \
+                args[1].get("k") == "special" and args[1].get("t") == "vcc":
+            args[1].clear()
+            args[1].update({"k": "slist", "r": ["vcc_lo", 107], "n": 2})
+
+
 def translate(path):
     info = parse_file(path)
     stage = stage_of(info["name"], path)
@@ -17198,6 +17311,9 @@ def translate(path):
         g.wave64 = fspx_ws == 64
     else:
         g.wave64 = code_w64 or stage == "ms"   # NGG mesh shaders here are wave64 (thread = wave id * 64 + lane)
+    if not g.wave64:
+        wave32_vcc_hi_as_sgpr(insns)
+        g.vcc_hi_sgpr = True
     if stage == "gs":
         ins_by_reg = {}
         for reg, mask, sv, ctype in input_signature(path, info["name"]):
@@ -17259,13 +17375,19 @@ def translate(path):
         # (separate VGPRs on GFX10). An FSPX program (the FidelityFX DLL's shaders) carries the same two fields in its
         # kind-0 entry (docs/fspx.md).
         rsrc2, lx, ly, lz = cs_dispatch_state(path, info["name"])
-        if (rsrc2 >> 10) & 1:
-            raise Unsupported("CS thread-group-size SGPR")
         if not (1 <= lx * ly * lz <= 1024):
             raise Unsupported("CS group size")
         user = (rsrc2 >> 1) & 31
         g.cs = {"user": user, "tgid": [c for c in range(3) if (rsrc2 >> (7 + c)) & 1],
-                "tid": (rsrc2 >> 11) & 3, "size": (lx, ly, lz)}
+                "tid": (rsrc2 >> 11) & 3, "size": (lx, ly, lz), "tg_size": bool((rsrc2 >> 10) & 1)}
+        if g.cs["tg_size"]:
+            # agA44: TG_SIZE_EN [10]: one more system SGPR after the workgroup ids, the thread-group info word.
+            # Mesa (ac_nir_lower_intrinsics_to_args.c, GFX10.3 compute): load_num_subgroups = tg_size[5:0],
+            # load_subgroup_id = tg_size[11:6]. Waves are thread i / W of the group (as s_get_waveid_in_workgroup).
+            w = 64 if g.wave64 else 32
+            g.cs["tg_waves"] = (lx * ly * lz + w - 1) // w
+            for i in (lx, lx * ly, 5, 6, g.cs["tg_waves"], user + len(g.cs["tgid"])):
+                g.cu(i)
         # LDS_SIZE [23:15] in 512-byte units. All 485 LDS-using corpus CS stay inside it; a constant offset past it,
         # which RDNA2 treats as out of range, is bounds-checked below (SHADER-309).
         need = ((rsrc2 >> 15) & 0x1FF) * 128

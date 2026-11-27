@@ -123,9 +123,12 @@ class Flbit64Tests(unittest.TestCase):
         self.assertEqual(run_lines(["s_flbit_i32_b64 s0, 1"])[0], 63)
         self.assertEqual(run_lines(["s_flbit_i32_i64 s0, -1"])[0], M32)
 
-    def test_lane_mask_source_is_rejected(self):
-        with self.assertRaises(rdna2spirv.Unsupported):
+    def test_lane_mask_source_reads_the_whole_wave(self):
+        # agA44: a wave64 lane mask (exec) is gathered across the wave, as s_ff1_i32_b64 does; the single-invocation
+        # interpreter stops at that subgroup operation instead of returning one lane's own bit.
+        with self.assertRaises(si.UnsupportedConstruct) as cm:
             run_lines(["s_flbit_i32_b64 s0, exec"])
+        self.assertIn("OpGroupNonUniform", str(cm.exception))
 
 
 if __name__ == "__main__":

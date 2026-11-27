@@ -82,7 +82,7 @@ _SCC_UNCONDITIONAL_WRITES = _ALL_SAVEEXEC_WREXEC | frozenset({
 _MASK_WORD_READERS = frozenset({
     "s_bcnt0_i32_b32", "s_bcnt1_i32_b32", "s_bcnt0_i32_b64", "s_bcnt1_i32_b64",
     "s_ff0_i32_b32", "s_ff1_i32_b32", "s_ff0_i32_b64", "s_ff1_i32_b64",
-    "s_flbit_i32_b32", "s_flbit_i32",
+    "s_flbit_i32_b32", "s_flbit_i32", "s_flbit_i32_b64",   # agA44: b64 of a wave64 lane mask
 })
 
 # Mask ops that emit a cross-lane vote in --wave64-emulate when SCC is live.
@@ -139,6 +139,7 @@ _ALWAYS_BARRIER_OPS = frozenset({
     "v_permlane16_b32", "v_permlanex16_b32",
     "ds_bpermute_b32", "ds_permute_b32", "ds_swizzle_b32",
     "s_wqm_b32", "s_wqm_b64",
+    "ds_append", "ds_consume",   # agA44: rdna2spirv's ds_append gathers EXEC and shuffles from the first lane
 })
 
 _VOTED_BRANCHES = frozenset({

@@ -211,6 +211,10 @@ def step(state, ins, wave64=True):
             return op != "v_mov_b32"
     if "_saveexec_b" in op or "_wrexec_b" in op:
         put(state, a[0], MASK_LO if op.endswith("_b32") else MASK)
+    elif op == "s_bitreplicate_b64_b32" and wave64 and a[1]["k"] == "imm":
+        # agA44: a constant replicated into a 64-bit lane mask (s_bitreplicate_b64_b32 exec, 0xff00ff00 in the wave64
+        # scans of the pipeline library's compute programs); rdna2spirv gives each lane its bit.
+        put(state, a[0], MASK)
     elif op == "s_bfm_b64":
         # In wave32 code it is 64-bit data, e.g. the first two words of an S# built in place (the pipeline library's
         # wave32 compute programs: s_bfm_b64 s[88:89], 2, 54); rdna2spirv computes the value there.
