@@ -6629,7 +6629,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         if (out) *out = nullptr;
         HRESULT hr = E_INVALIDARG;
         {
-            std::lock_guard lock(g_pso_mu);
+            std::unique_lock lock(g_pso_mu);
             xs_pso_load();
             const auto* w = reinterpret_cast<const std::uint64_t*>(desc_in);
             const XsPsoShader* vs = nullptr;
@@ -6668,6 +6668,11 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                     if (it->second.stage == "ms") { vs = &it->second; break; }
                 }
             }
+            // agA46: g_pso_map is a std::map filled once by xs_pso_load and never changed after, so vs/ps stay valid
+            // without the lock. Build the pipeline OUTSIDE g_pso_mu: it serialized every title PSO creation (24-68 ms
+            // each, ~25000 before boot state 1). LEONIDA_CE_PSO_SERIAL=1 keeps the old behaviour.
+            static const bool pso_serial = [] { const char* v = std::getenv("LEONIDA_CE_PSO_SERIAL"); return v && *v == '1'; }();
+            if (!pso_serial) lock.unlock();
             const bool ce_mesh = vs && vs->stage == "ms";  // agA43
             if (!missing && vs) {
                 D3D12_GRAPHICS_PIPELINE_STATE_DESC g{};
@@ -6983,8 +6988,10 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                 }
                 if (SUCCEEDED(hr) && out && *out && !g_placeholder_pso.load()) {
                     // keep the first working pipeline as the stand-in for pipelines we cannot build (below)
+                    IUnknown* none = nullptr;
                     static_cast<IUnknown*>(*out)->AddRef();
-                    g_placeholder_pso = static_cast<IUnknown*>(*out);
+                    if (!g_placeholder_pso.compare_exchange_strong(none, static_cast<IUnknown*>(*out)))
+                        static_cast<IUnknown*>(*out)->Release();  // agA46: another thread won (creation is parallel now)
                 }
                 if (SUCCEEDED(hr) && out && *out) {  // HACK diagnostic: pipeline -> shader names
                     std::lock_guard names_lock(g_pso_names_mu);
@@ -7062,7 +7069,13 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         static std::atomic<int> ok{0}, bad{0};
         if (SUCCEEDED(hr)) {
             const int k = ok++;
-            if (k < 3 || k % 500 == 0) { std::fprintf(stderr, "[hack] slot 57 CreateGraphicsPipelineState #%d ok (%llu)\n", k, (unsigned long long)desc->SizeInBytes); std::fflush(stderr); }
+            // agA46: seconds since the first PSO and how many threads created PSOs so far (parallel creation check).
+            static const ULONGLONG t0 = GetTickCount64();
+            static std::mutex tid_mu;
+            static std::set<DWORD> tids;
+            std::size_t ntid;
+            { std::lock_guard l(tid_mu); tids.insert(GetCurrentThreadId()); ntid = tids.size(); }
+            if (k < 3 || k % 500 == 0) { std::fprintf(stderr, "[hack] slot 57 CreateGraphicsPipelineState #%d ok (%llu) t+%.1f s, %zu creator threads\n", k, (unsigned long long)desc->SizeInBytes, (GetTickCount64() - t0) / 1000.0, ntid); std::fflush(stderr); }
         } else if (bad++ < 10) {
             const auto* w = reinterpret_cast<const std::uint64_t*>(desc_in);
             std::fprintf(stderr, "[hack] slot 57 desc words: %llx %llx %llx %llx %llx %llx\n", (unsigned long long)w[0],
