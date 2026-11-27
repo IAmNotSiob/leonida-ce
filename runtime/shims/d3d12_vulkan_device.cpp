@@ -6288,7 +6288,25 @@ public:
         if (const int why = compute_skip(entry->name)) {
             pipeline_.pipeline = empty_compute_pipeline(pipeline_.layout);
             if (!pipeline_.pipeline) return E_FAIL;
-            if (why == 1)
+            // HACK (agA46, LEONIDA_CE_SKIP_CS_LAZY=N): a SKIP_CS program keeps its placeholder, but its compile starts
+            // the first time a command list binds it (compute_pipeline_id -> kick_lazy), at most N at once, at
+            // below-normal priority. The real pipeline replaces the placeholder when done (as the background path).
+            // So only the programs the frame really uses are compiled, and "[hack] LAZY_CS" names them.
+            if (why == 1 && lazy_cs_slots()) {
+                auto job = std::make_shared<AsyncCompute>();
+                job->info = pipeline_info;
+                job->required_size = required_size;
+                if (pipeline_info.stage.pNext == &required_size) job->info.stage.pNext = &job->required_size;
+                job->name = entry->name;
+                job->device = &device_;
+                job->self = this;
+                job->event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+                job->placeholder = true;
+                async_job_ = job;
+                lazy_job_ = job;
+                goto compiled;
+            }
+            if (why == 1 || why == 3)
                 std::fprintf(stderr, "[hack] compute %s skipped (LEONIDA_CE_SKIP_CS)\n", entry->name.c_str());
             else
                 std::fprintf(stderr, "[hack] compute %s is not compiled (placeholder)\n", entry->name.c_str());
@@ -6444,9 +6462,10 @@ public:
             }
             return v;
         }();
+        // agA46: an item "!name" is a hard skip: it keeps the placeholder even with SKIP_CS_LAZY (returns 3).
         for (const std::string& pattern : skip_cs)
-            if (name.find(pattern) != std::string::npos) {
-                return 1;
+            if (pattern[0] == '!' ? name.find(pattern.c_str() + 1) != std::string::npos : name.find(pattern) != std::string::npos) {
+                return pattern[0] == '!' ? 3 : 1;
             }
         for (const char* pattern : kNeverCompile)
             if (name.find(pattern) != std::string::npos) {
@@ -6503,6 +6522,37 @@ public:
         SetEvent(job->event);
         static_cast<ID3D12PipelineState*>(job->self)->Release();
         return 0;
+    }
+
+    // agA46 LEONIDA_CE_SKIP_CS_LAZY=N (0 = off): concurrent lazy compiles.
+    static unsigned lazy_cs_slots() {
+        static const unsigned n = [] { const char* e = std::getenv("LEONIDA_CE_SKIP_CS_LAZY"); return e ? unsigned(std::strtoul(e, nullptr, 0)) : 0u; }();
+        return n;
+    }
+    static DWORD WINAPI lazy_compute_main(void* param) {
+        static HANDLE lazy_slots = CreateSemaphoreW(nullptr, LONG(lazy_cs_slots()), LONG(lazy_cs_slots()), nullptr);
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        const std::string name = (*static_cast<std::shared_ptr<AsyncCompute>*>(param))->name;
+        WaitForSingleObject(lazy_slots, INFINITE);
+        std::fprintf(stderr, "[hack] LAZY_CS compile start %s frame %llu\n", name.c_str(),
+                     (unsigned long long)leonida::ce::present_frame().load(std::memory_order_relaxed));
+        std::fflush(stderr);
+        async_compute_main(param);  // logs "background compute <name>: <result> after <ms>"
+        ReleaseSemaphore(lazy_slots, 1, nullptr);
+        return 0;
+    }
+public:
+    void kick_lazy() const {
+        if (!lazy_job_ || lazy_kicked_.exchange(true)) return;
+        static std::atomic<int> kicked{0};
+        std::fprintf(stderr, "[hack] LAZY_CS first bind #%d %s frame %llu\n", ++kicked, lazy_job_->name.c_str(),
+                     (unsigned long long)leonida::ce::present_frame().load(std::memory_order_relaxed));
+        std::fflush(stderr);
+        auto* self = const_cast<PipelineState*>(this);
+        static_cast<ID3D12PipelineState*>(self)->AddRef();  // released by async_compute_main
+        HANDLE t = CreateThread(nullptr, 0, &PipelineState::lazy_compute_main, new std::shared_ptr<AsyncCompute>(lazy_job_), 0, nullptr);
+        if (t) CloseHandle(t);
+        else static_cast<ID3D12PipelineState*>(self)->Release();
     }
 
     VkPipeline empty_compute_pipeline(VkPipelineLayout layout) {
@@ -6767,6 +6817,8 @@ private:
     std::set<VariantKey> pending_;  // variants queued for a background build
     VkShaderModule module_ = VK_NULL_HANDLE;
     std::shared_ptr<AsyncCompute> async_job_;  // HACK (Leonida CE boot): background compute compile
+    std::shared_ptr<AsyncCompute> lazy_job_;   // agA46 SKIP_CS_LAZY: compiled at first bind
+    mutable std::atomic<bool> lazy_kicked_{false};
     std::vector<VkPipeline> retired_;          // placeholders replaced by their real pipeline
     std::vector<VkShaderModule> modules_;
     VkDeviceSize code_base_ = 0;
@@ -12113,6 +12165,7 @@ const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature) 
 
 std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline) {
     const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    if (p && p->compute()) p->kick_lazy();  // agA46 SKIP_CS_LAZY
     return p && p->compute() ? p->id() : 0;
 }
 

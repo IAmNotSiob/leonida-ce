@@ -5326,6 +5326,47 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                 HANDLE t = CreateThread(nullptr, 0, [](void*) -> DWORD { xs_dump_thread_stacks(); return 0; }, nullptr, 0, nullptr);
                 if (t) CloseHandle(t);
             }
+            {   // HACK (agA46, LEONIDA_CE_ARENA_PEEK=<title va>:<bytes>[:<every>]): every <every> presents (default 60),
+                // read the stand-in of the placed buffer at <title va> straight from the arena (host-coherent: what the
+                // GPU wrote by now) and log its non-zero dwords. For the mesh EI args (agA43: CPU reads [0 1 1] at record).
+                static const std::array<std::uint64_t, 3> ap = [] {
+                    std::array<std::uint64_t, 3> r{0, 0, 60};
+                    if (const char* e = std::getenv("LEONIDA_CE_ARENA_PEEK")) {
+                        char* end = nullptr;
+                        r[0] = std::strtoull(e, &end, 0);
+                        if (end && *end == ':') r[1] = std::strtoull(end + 1, &end, 0);
+                        if (end && *end == ':') r[2] = std::strtoull(end + 1, &end, 0);
+                        if (!r[2]) r[2] = 60;
+                    }
+                    return r;
+                }();
+                static int ap_lines = 0;
+                if (ap[0] && ap[1] && f % ap[2] == 0 && g_arena_mapped && ap_lines < 400) {
+                    const XsPlaced* e = xs_find_placed(ap[0]);
+                    if (e && e->resource && ap[0] + ap[1] <= e->va + e->size) {
+                        const std::uint64_t off = e->resource->GetGPUVirtualAddress() + (ap[0] - e->va);
+                        if (off + ap[1] <= g_arena_size) {
+                            const auto* w = reinterpret_cast<const volatile std::uint32_t*>(g_arena_mapped + off);
+                            std::string s;
+                            unsigned nz = 0, shown = 0;
+                            for (std::uint64_t i = 0; i < ap[1] / 4; ++i) {
+                                const std::uint32_t v = w[i];
+                                if (!v) continue;
+                                ++nz;
+                                if (shown < 40) { char b[40]; std::snprintf(b, sizeof b, " +%llx=%x", (unsigned long long)(i * 4), v); s += b; ++shown; }
+                            }
+                            ++ap_lines;
+                            std::fprintf(stderr, "[hack] ARENA_PEEK frame %llu title 0x%llx arena 0x%llx: %u non-zero dwords of %llu:%s\n",
+                                         (unsigned long long)f, (unsigned long long)ap[0], (unsigned long long)off, nz,
+                                         (unsigned long long)(ap[1] / 4), s.c_str());
+                            std::fflush(stderr);
+                        }
+                    } else if (ap_lines < 4) {
+                        ++ap_lines;
+                        std::fprintf(stderr, "[hack] ARENA_PEEK frame %llu: no placed buffer over 0x%llx\n", (unsigned long long)f, (unsigned long long)ap[0]);
+                    }
+                }
+            }
             {   // HACK: capture frames 0, 1, 2, 4, ... and every 2000th
                 const bool pow2 = (f & (f - 1)) == 0;
                 const auto* plane = reinterpret_cast<const std::uint8_t*>(a2);

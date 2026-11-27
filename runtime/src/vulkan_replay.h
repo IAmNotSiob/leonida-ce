@@ -5732,6 +5732,21 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                         }
                         if (!first) continue;
                         VkClearAttachment c{VK_IMAGE_ASPECT_COLOR_BIT, std::uint32_t(slot), {}};
+                        // agA46 LEONIDA_CE_FRAME_CLEAR_COLOR=r,g,b,a (floats): clear to this colour instead of 0, so a
+                        // presented frame shows whether anything downstream reads this target (diagnostic).
+                        static const std::array<float, 4> fc_color = [] {
+                            std::array<float, 4> r{0, 0, 0, 0};
+                            if (const char* e = std::getenv("LEONIDA_CE_FRAME_CLEAR_COLOR"))
+                                for (int k = 0; k < 4 && *e; ++k) {
+                                    char* end = nullptr;
+                                    r[k] = std::strtof(e, &end);
+                                    if (end == e) break;
+                                    e = end;
+                                    while (*e == ',') ++e;
+                                }
+                            return r;
+                        }();
+                        for (int k = 0; k < 4; ++k) c.clearValue.color.float32[k] = fc_color[k];
                         const VkClearRect all{{{0, 0}, d.area}, 0, 1};
                         vk.clear_attachments(command_buffer, 1, &c, 1, &all);
                     }
