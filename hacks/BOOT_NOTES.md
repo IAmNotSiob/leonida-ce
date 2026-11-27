@@ -3042,3 +3042,40 @@ Measured from warm logs (rt52 build 143, rt58 build 142, rt44). rt59 was a cold 
 - NEXT: free disk, start VM, deploy_next.sh, rt214 >= 1800 s; check the "no translated compute shader" count (expect
   ~3), INDIRECT_SRC mesh args, rtdiag G-buffer dumps, device loss (new shaders untested on GPU: if the device is
   lost, bisect by restoring index.a44bak.json + halves of the new entries).
+
+## agA45 (sender gen 45, 2026-11-27) - why the 1141 new CS SPIR-V is so big (offline, no VM)
+- Work dir /root/a45: out/ = 1141 .spv (bvh outlined + --opt, RECOMMENDED), out_noopt/ = bvh outlined only, tr.sh
+  (N shards, nice 19), deploy.sh [out|out_noopt], prof.py (per-RDNA-opcode count of emitted SPIR-V lines), stats.py
+  (size distribution vs the deployed sizes in /tmp/vs2), runs.py / ophist.py (repeated pure runs, words per opcode).
+- ROOT CAUSE (Definite, measured): there is no general translator blow-up. The programs are huge: median 18,531
+  instructions (p90 22,177, max 46,740 = 239 KB of code) vs 458 (p90 3,104) for the 1536 older shaders. SPIR-V
+  bytes per source instruction are the SAME as the old corpus (new p10..p90 ~190-280 B/insn; old ~240-440), i.e.
+  ~40-50 words per instruction from the register-in-Function-variable lowering (load, bitcast, op, NoContraction,
+  bitcast, EXEC select, store). Structured control flow (939 structured, 186 emulated-wave64 structured), no
+  dispatch loop, no waterfall/switch duplication: pure-run dedupe over a 19K-insn module would save only 21% of
+  %main lines. spirv-opt (-Os, or scalar-replacement + ssa-rewrite + ADCE) makes it BIGGER (9.0 -> 11.5/12.4 MB:
+  phi webs over ~100 live registers).
+- The one real blow-up: image_bvh(64)_intersect_ray was inlined at every use, ~2,800 instructions each (24
+  round-toward-zero slab products/subtractions = Dekker splits). 41 programs use it (2..72 sites); in cs_5c2c7ae5 it
+  was 32% of the module. FIX (tools/rdna2spirv.py): the step is emitted once per module as %bvh_fn (DontInline;
+  heap base + 14 raw register words -> v4uint, phi-merged tri/box/other results) and its slab test as %bvh_slab_fn
+  (called 24x); the call site loads the registers, calls, writes vD..vD+3. Same semantics: the 16 image_bvh
+  semantic tests pass (and fail if the slab args are swapped); full semantic suite 6015 tests, same 2 pre-existing
+  failures (test_bitcast_round_trip, test_int32_to_f64); 2037 rdna2spirv pytest pass, 1 pre-existing failure
+  (test_compute_thread_group_size_sgpr_is_rejected, asserts the refusal A44 removed).
+- --opt (existing tools/spirv_opt.py peephole, off by default, NOT used for the old corpus): -26% across the board.
+- Sizes (1141 each, all pass spirv-val; index entries identical to /root/a44/index.merged2.json, so index.json
+  needs no change):
+    before (A44)      total 3.40 GB  p50 3.87 MB  p90 4.68 MB  max 13.43 MB  >1.5MB 766  >3MB 706
+    out_noopt (bvh)   total 3.36 GB  p50 3.86 MB  p90 4.67 MB  max  9.01 MB  >1.5MB 761  >3MB 701
+    out (bvh + opt)   total 2.50 GB  p50 2.89 MB  p90 3.46 MB  max  6.70 MB  >1.5MB 719  >3MB 512
+  (5c2c7ae5 13.4 -> 9.0 -> 6.7 MB; 5244844 13.1 -> 8.6 -> 6.4; e27b072b 12.7 -> 8.3 -> 6.2).
+  The <1.5 MB target is NOT reachable by removing bloat: it needs ~3x fewer SPIR-V instructions per RDNA
+  instruction (an SSA-style lowering of the register file), not a fix.
+- NVIDIA data (rt214/rt215 logs, /root/rb): of 316 new CS attempted, 29 failed with -13 after 216-490 s, all
+  3.1-4.9 MB; many of the same size succeeded after ~450-495 s. Compile time is the problem, size is a proxy.
+  Not GPU-verified whether out/ compiles within the limit (VM was busy). %bvh_fn is DontInline: a hint only.
+- NEXT: deploy (cd /root/a45 && ./deploy.sh out; backs up the replaced 1141 .spv to C:\zroot\a44spv_bak.tar), rerun,
+  count -13. If still failing: raise/remove the runtime's background compile limit for these, or ship them via
+  a pipeline cache built once; translator-side the next lever is fewer ops per VALU write (EXEC select +
+  bitcasts are ~30% of words).

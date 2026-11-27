@@ -394,6 +394,7 @@ class Gen:
         self.fmt_fn = None    # lines of the typed-buffer format-decode function, once a dynamic-format load needs it
         self.fmt_norm_fn = None    # lines of the shared exact norm quotient for a run-time width (SHADER-849)
         self.fmt_enc_fn = None    # lines of the format-encode and element-size functions, once a typed store needs them
+        self.bvh_fns = None       # agA45: lines of %bvh_fn and %bvh_slab_fn (image_bvh*_intersect_ray, outlined once)
         self.uses_fmt_tables = False    # %fmt_desc_tab / %fmt_norm_rep_tab: a format's kind and channel widths
         self.x_round_fns: dict[str, list[str]] = {}       # emulate_inline: helper functions for x_round pre-barrier setup
         self.x_round_fn_types: dict[int, str] = {}        # emulate_inline: arity -> OpTypeFunction id for x_round_fns
@@ -14603,6 +14604,60 @@ class Gen:
         ld = lambda r: self.load_reg("vgpr", r)
         self.uses_psb = True
         self.uses_long = True
+        self.uses_heap = True
+        self.cu(1), self.cu(2)        # as host_addr: push-constant member indices of %heap_base
+        # agA45: the ~2,800 instructions of one step are emitted once per module as %bvh_fn and called here (the
+        # game's pipeline-library compute programs inline up to 72 of them: 32% of a 13 MB module). A 32-bit node
+        # id is the 64-bit form with a zero high word.
+        if is64:
+            nlo, nhi, rest = ld(regs[0]), ld(regs[1]), regs[2:]
+        else:
+            nlo, nhi, rest = ld(regs[0]), self.cu(0), regs[1:]
+        args = [desc[0], desc[1], nlo, nhi] + [ld(r) for r in rest[:10]]
+        fn = self.bvh_function()
+        r = self.tmp()
+        self.emit(f"{r} = OpFunctionCall %v4uint_bvh {fn} %heap_base {' '.join(args)}")
+        for k in range(4):
+            x = self.tmp()
+            self.emit(f"{x} = OpCompositeExtract %uint {r} {k}")
+            self.dst({"k": "vgpr", "r": vd["r"] + k, "n": 1}, x)
+
+    def _outline(self, build):
+        """agA45: run build() with its emitted lines collected apart from %main's body (for a helper OpFunction).
+        Bitcast pairs remembered by tof/tou are per function: none crosses in or out."""
+        saved = (self.body, self.bitcast_from, self._active_ssa)
+        self.body, self.bitcast_from, self._active_ssa = [], {}, None
+        try:
+            ret = build()
+            return self.body, ret
+        finally:
+            self.body, self.bitcast_from, self._active_ssa = saved
+
+    def bvh_function(self):
+        """agA45: %bvh_fn (heap base, D# words 0 and 1, node id lo/hi, t max, origin, direction, inverse direction:
+        the raw register words) -> the four result words; and %bvh_slab_fn(bound, origin, inverse direction) =
+        (bound - origin) * inverse direction, each rounded toward zero, which it calls 24 times."""
+        if self.bvh_fns is None:
+            slab = ["%bvhs_m", "%bvhs_o", "%bvhs_i"]
+            sl_lines, sl_ret = self._outline(
+                lambda: self.f32_mul_rtz(self.f32_sub_rtz(slab[0], slab[1]), slab[2]))
+            names = ["d0", "d1", "nlo", "nhi"] + [f"r{i}" for i in range(10)]
+            params = [f"%bvhp_{n}" for n in names]
+            lines, ret = self._outline(lambda: self._bvh_body(params[0:2], params[2], params[3], params[4:],
+                                                              "%bvhp_heap"))
+            self.bvh_fns = (["%bvh_slab_fn = OpFunction %float None %fn_bvh_slab"] +
+                            [f"{p} = OpFunctionParameter %float" for p in slab] +
+                            ["%bvh_slab_entry = OpLabel"] + sl_lines +
+                            [f"         OpReturnValue {sl_ret}", "OpFunctionEnd"] +
+                            ["%bvh_fn = OpFunction %v4uint_bvh DontInline %fn_bvh",    # 72 call sites in one program
+                             "%bvhp_heap = OpFunctionParameter %ulong"] +
+                            [f"{p} = OpFunctionParameter %uint" for p in params] +
+                            ["%bvh_fn_entry = OpLabel"] + lines +
+                            [f"         OpReturnValue {ret}", "OpFunctionEnd"])
+        return "%bvh_fn"
+
+    def _bvh_body(self, desc, node_lo, node_hi, raw, heap):
+        """The body of %bvh_fn (see image_bvh): returns the %v4uint_bvh result."""
         e = self.emit
         T = self.tmp
 
@@ -14623,14 +14678,7 @@ class Gen:
         e(f"{sortb} = OpShiftRightLogical %uint {desc[1]} {self.cu(31)}")
         e(f"{sort} = OpINotEqual %bool {sortb} {self.cu(0)}")
         # node id
-        if is64:
-            node = u64(ld(regs[0]), ld(regs[1]))
-            rest = regs[2:]
-        else:
-            n32 = T()
-            e(f"{n32} = OpUConvert %ulong {ld(regs[0])}")
-            node = n32
-            rest = regs[1:]
+        node = u64(node_lo, node_hi)
         nlo, ntype = T(), T()
         e(f"{nlo} = OpUConvert %uint {node}")
         e(f"{ntype} = OpBitwiseAnd %uint {nlo} {self.cu(7)}")
@@ -14638,8 +14686,9 @@ class Gen:
         e(f"{nm} = OpBitwiseAnd %ulong {node} {self.cl(0xFFFFFFFFFFFFFFF8)}")
         e(f"{off} = OpShiftLeftLogical %ulong {nm} {self.cl(3)}")
         e(f"{addr} = OpIAdd %ulong {base} {off}")
-        ptr = T()
-        e(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(addr)}")
+        ptr, haddr = T(), T()
+        e(f"{haddr} = OpIAdd %ulong {heap} {addr}")      # host_addr, with the heap base passed in
+        e(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {haddr}")
 
         def ldw(i):
             pp, v = T(), T()
@@ -14647,13 +14696,24 @@ class Gen:
             e(f"{v} = OpLoad %uint {pp} Aligned 4")
             return v
 
-        f = lambda r: self.tof(ld(r))
-        tmax = f(rest[0])
-        org = [f(r) for r in rest[1:4]]
-        dirv = [f(r) for r in rest[4:7]]
-        inv = [f(r) for r in rest[7:10]]
+        f = self.tof
+        tmax = f(raw[0])
+        org = [f(r) for r in raw[1:4]]
+        dirv = [f(r) for r in raw[4:7]]
+        inv = [f(r) for r in raw[7:10]]
         INF, ONE, NEGINF = (self.tof(self.cu(x)) for x in (0x7F800000, 0x3F800000, 0xFF800000))
-        out = lambda k, v: self.dst({"k": "vgpr", "r": vd["r"] + k, "n": 1}, v)
+        res = {}                       # branch -> its four result words
+
+        def out(k, v):
+            res.setdefault(cur[0], [None] * 4)[k] = v
+        cur = [None]
+        vecs = {}
+
+        def compose(branch):
+            v_ = T()
+            e(f"{v_} = OpCompositeConstruct %v4uint_bvh {' '.join(res[branch])}")
+            vecs[branch] = v_
+        vec = vecs.__getitem__
 
         def fop(o, x, y):
             r = T()
@@ -14687,6 +14747,7 @@ class Gen:
 
         # ---------------- triangle ----------------
         e(f"{L['tri']} = OpLabel")
+        cur[0] = "tri"
         # The node type picks the triangle's vertex slots in the 64-byte node (12 bytes each; slot 4 is the
         # metadata words 12..14): TRI0 (0,1,2), TRI1 (1,3,2), TRI2 (2,3,4), TRI3 (2,4,0). AMD GPURT
         # CalcTriangleCompressionVertexIndices; the XDXR software path's Read3Verts (docs/bvh.md 7a).
@@ -14821,6 +14882,7 @@ class Gen:
             bad = b if bad is None else orr(bad, b)
         for k, (v, c) in enumerate(zip(w, (0x7F800000, 0x3F800000, 0, 0))):
             out(k, sel(bad, self.cu(c), v, "%uint"))
+        compose("tri")
         e(f"OpBranch {L['end1']}")
 
         # ---------------- not a triangle ----------------
@@ -14828,6 +14890,7 @@ class Gen:
         e(f"OpSelectionMerge {L['end2']} None")
         e(f"OpBranchConditional {is_box} {L['box']} {L['oth']}")
         e(f"{L['box']} = OpLabel")
+        cur[0] = "box"
         dist, idx = [], []
         for i in range(4):
             child = ldw(i)
@@ -14843,8 +14906,12 @@ class Gen:
                     e(f"{x} = OpCompositeExtract %float {v2} {c}")
                     m16.append(x)
             mm = [sel(is_b16, m16[c], m32[c]) for c in range(6)]
-            b0 = [self.f32_mul_rtz(self.f32_sub_rtz(mm[c], org[c]), inv[c]) for c in range(3)]
-            b1 = [self.f32_mul_rtz(self.f32_sub_rtz(mm[3 + c], org[c]), inv[c]) for c in range(3)]
+            def slab(m_, c_):
+                r_ = T()
+                e(f"{r_} = OpFunctionCall %float %bvh_slab_fn {m_} {org[c_]} {inv[c_]}")
+                return r_
+            b0 = [slab(mm[c], c) for c in range(3)]
+            b1 = [slab(mm[3 + c], c) for c in range(3)]
             near, far, nnan, fnan = [], [], [], []
             for c in range(3):
                 pos = bop("OpFOrdGreaterThanEqual", inv[c], "%f0")
@@ -14873,14 +14940,22 @@ class Gen:
             idx[p_], idx[q_] = sel(sw, idx[q_], idx[p_], "%uint"), sel(sw, idx[p_], idx[q_], "%uint")
         for k in range(4):
             out(k, idx[k])
+        compose("box")
         e(f"OpBranch {L['end2']}")
         e(f"{L['oth']} = OpLabel")
+        cur[0] = "oth"
         for k in range(4):            # instance / aabb nodes are handled by the shader, not the instruction
             out(k, self.cu(0xFFFFFFFF))
+        compose("oth")
         e(f"OpBranch {L['end2']}")
         e(f"{L['end2']} = OpLabel")
+        nt_v = T()
+        e(f"{nt_v} = OpPhi %v4uint_bvh {vec('box')} {L['box']} {vec('oth')} {L['oth']}")
         e(f"OpBranch {L['end1']}")
         e(f"{L['end1']} = OpLabel")
+        r = T()
+        e(f"{r} = OpPhi %v4uint_bvh {vec('tri')} {L['tri']} {nt_v} {L['end2']}")
+        return r
 
     def ms_export(self, tgt, ins):
         """NGG export in a mesh shader: thread t exports vertex t (pos/param) and primitive t (prim). The values are
@@ -15666,6 +15741,10 @@ def assemble(gen):
         types.append("%v4uint_bal = OpTypeVector %uint 4")       # dedupe_types merges it with any other uvec4
     if gen.uses_bvh and not any(t.startswith("%v3float = ") for t in types):
         types.append("%v3float = OpTypeVector %float 3")
+    if gen.bvh_fns:
+        types.append("%v4uint_bvh = OpTypeVector %uint 4")      # dedupe_types merges it with any other uvec4
+        types.append("%fn_bvh = OpTypeFunction %v4uint_bvh %ulong " + " ".join(["%uint"] * 14))
+        types.append("%fn_bvh_slab = OpTypeFunction %float %float %float %float")
     if gen.partial_color_outputs:
         types.append("%initial_mrt = OpConstantNull %v4float")
     gvars = [f"{n} = OpVariable %_ptr_Output_v4 Output" + (" %initial_mrt" if n in gen.partial_color_outputs else "")
@@ -16057,6 +16136,7 @@ def assemble(gen):
         helpers.extend(function)
     for function in gen.x_round_fns.values():
         helpers.extend(function)
+    helpers.extend(gen.bvh_fns or [])
     tree, nesting = (capped_tree(gen.succ) if gen.blocks and not gen.emulate and not gen.bar_rounds
                      else (None, None))
     if nesting is not None:
