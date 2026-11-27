@@ -4593,10 +4593,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                         }
                         if (!used && src_mode == 4 && !(s_ok && plausible(s_))) { prepared_draw.skip = true; used = -1; }
                     }
-                    static std::atomic<int> told_src{0};
-                    if (told_src++ < 48)
+                    static std::atomic<int> told_src{0}, told_mesh{0};
+                    if (draw->mesh ? told_mesh++ < 64 : told_src++ < 48)  // agA43: mesh draws have their own 64
                         std::fprintf(stderr, "[hack] INDIRECT_SRC: %s stand-in@0x%llx %s[%u %u %u %d %u] title@0x%llx %s[%u %u %u %d %u] "
-                                     "arena@title %s[%u %u %u %d %u] -> mode %d used %d\n", draw->indexed ? "indexed" : "draw",
+                                     "arena@title %s[%u %u %u %d %u] -> mode %d used %d\n", draw->mesh ? (draw->ind_count_buffer ? "mesh+count" : "mesh") : draw->indexed ? "indexed" : "draw",
                                      (unsigned long long)prepared_draw.ind_offset, s_ok ? "" : "(n/a)", s_[0], s_[1], s_[2], int(s_[3]), s_[4],
                                      (unsigned long long)tva, t_ok ? "" : "(n/a)", t_[0], t_[1], t_[2], int(t_[3]), t_[4],
                                      g_ok ? "" : "(n/a)", g_[0], g_[1], g_[2], int(g_[3]), g_[4], src_mode, used);
