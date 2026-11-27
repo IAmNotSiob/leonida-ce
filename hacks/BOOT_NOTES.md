@@ -2753,3 +2753,71 @@ Where it stands:
   then translate the real depth func / stencil / cull. (4) The world is still GPU-driven (agA36: INDIRECT args [3 0 0 0 0]);
   the culling compute reads depth (HiZ from the previous frame's depth). Empty depth may be WHY instance counts are 0, so
   depth can fix both.
+
+## agA38 (sender gen 38, 2026-11-27) - shader prebake
+
+Goal (user): stop paying for shader compiles during boot and gameplay. Builds 150, 151 and 152 (commits ea51710a5, aaf35ca2c, 86b9ddd6b).
+All switches default off.
+
+Where things are (runtime/shims/d3d12_vulkan_device.cpp):
+- Compute: create_compute -> pick_entry -> library->spirv -> compute_transforms (LOOP_CAP, VSHARP_GUARD_ALL with the slot
+  hashed from the name, VA_GUARD; moved out of create_compute without changes) -> layout (push 144 B, plus the bindless
+  set 0 layout when the module has bindings) -> subgroup_size_for -> AsyncCompute thread (40 slots). The title waits 5 ms,
+  then gets an empty placeholder pipeline. compute_skip = the SKIP_CS and kNeverCompile lists.
+- Graphics: create_graphics only stores a Recipe. variant(key) builds on first draw on compile_pool (half the cores). Until
+  that build finishes, the replay skips the draw (rtdiag "pending-pso"). key = unbound slots + RT_RETARGET format
+  overrides. One D3D12 PSO can have several Vulkan variants.
+- The pipeline cache is pipeline_cache.bin next to the exe. PipelineCacheWriter saves it every 60 s if it grew, and save_now
+  saves it at once (agA38).
+- The "bg compiles N avg ms" figure the main session quotes is not in the code. Plausible: it is computed from the
+  "[hack] background compute X: 0 after N ms" lines.
+
+Switches:
+- LEONIDA_CE_PSO_RECORD=<file>: appends, in first-use order, "G <record> <variant>" (graphics, at the variant's first draw)
+  and, from build 151, "C <module>" (compute, at first creation). A record is the D3D12 description field by field as hex
+  u32s, plus the input elements, plus the stage programs as FSSM SHA-256. Pointers, the root signature and CachedPSO are
+  left out because create_graphics doesn't read them.
+- LEONIDA_CE_PSO_PREBAKE=<file>: started at the title's first PSO. The jobs are the file's descriptions and modules in file
+  order, on LEONIDA_CE_PREBAKE_THREADS threads (default: every core) at the LOWEST priority (151; 150 used below-normal
+  and built graphics first, then all compute). A graphics job runs create_graphics on a prebake PipelineState
+  (programs by hash, no arena copy, not registered) and build()s every recorded variant. The pipelines go to
+  DeviceState::ce_prebaked, and a title PSO with the same record takes them at its first draw ("adopted"; the PSO
+  destructor doesn't destroy those). Prebake PSO objects stay alive until ~Device, so their layouts outlive the
+  pipelines. The re-encoded record must equal the file's ("re-encode mismatch" must be 0).
+  LEONIDA_CE_PSO_ADOPT=0 only warms the cache.
+- Demand bump (151): if a draw needs a variant whose job is queued, the job moves to the front and the draw waits up to
+  LEONIDA_CE_PREBAKE_WAIT_MS (default 100). If the variant is still not built, the draw is skipped once and no second
+  build starts. A compute module is moved to the front with no wait (LEONIDA_CE_PREBAKE_WAIT_CS_MS, default 0), then the
+  normal path runs.
+- LEONIDA_CE_PREBAKE_COMPUTE=1 (or a substring list): every translated compute module. In 151 this only applies when the
+  list has no C lines or there is no list. The library has 2689 main cs, 18 fspx/, 52 bvh/ and 1536 fspx_game/
+  modules: 4295 in all.
+- The prebake must use the same transforms as the run. It uses this run's env, so it is right by construction, but only
+  with GUARD_SLOT_HASH on (the default). With =0, slots follow creation order and the SPIR-V differs.
+
+Offline numbers (this Linux box, RTX 6000 Ada, host NVIDIA driver, runtime/test/vk_pipeline_check built for Linux at
+/root/agA38/vk_pipeline_check, 64 threads, __GL_SHADER_DISK_CACHE=0). The rt59 compute transforms were applied by
+/root/agA38/xform.cpp, which reproduces LOOP_CAP and VSHARP_GUARD_ALL:
+- fspx_game, 1536 cs, raw: 5881 CPU-s, 3.8 s mean, 113 s wall.
+- fspx_game, transformed (1396 capped): 7512 CPU-s, 4.9 s mean, slowest 125 s, 141 s wall, 28 GB peak RSS.
+- main FSSM cs, 2689 transformed: not finished after 41 min wall; stopped at ~2550. 729 modules took over 60 s each
+  (92,818 CPU-s in those alone, max 757 s), and 680 of those are *_CS_RaytracingResolve_*. ScreenProbes_Activate* modules
+  were still compiling after more than 20 min; kNeverCompile already skips some of them. Peak RSS was 250 GB at 64 jobs.
+  A full eager compute bake is far too much, even on a 128-core host.
+- The VM's Windows driver differs, so these are only a guide (Likely within 2x).
+
+Expectations (Plausible): a cold compute cache costs hours of CPU time. Building only what was used, at lowest priority
+and in first-use order, is what makes a LOOP_CAP change cheap. Graphics adoption removes pending-pso for every recorded
+variant once its job is done, and the bump covers the start.
+rt70 (build 150, eager PREBAKE_COMPUTE=1, all 4295 modules on every core): the title never reached gameplay. The boot
+starved and stayed in the menu pace up to frame 13500. RaytracingResolve modules took 32-189 s each on the VM, and there
+was no "done" line in 1500 s. The PSO record was only 9 lines. No device loss.
+-> Build 151 (lazy, what the user asked for): only recorded first-use modules and variants, at lowest priority, with a
+demand bump. Build 152: RaytracingResolve deferred to the end of the queue (LEONIDA_CE_PREBAKE_LAST), threads = a
+quarter of the cores.
+Runs requested: rt70 (150: all compute + record), rt71 (150: eager graphics prebake), rt72 (152: lazy graphics from rt70's
+list, writes the first list with C lines), rt73 (152: full lazy from rt72's list).
+Next: read rt72/rt73. If gameplay arrives, re-run with a changed LOOP_CAP (cold cache) and PSO_PREBAKE from the rt73
+list, to measure the case this was built for. Plausible extras: a per-module "slow list" that the prebake never builds
+and that create_compute always gives a placeholder (rt70 + offline: RaytracingResolve), and capping concurrent large
+compiles by memory (offline peak was 250 GB).
