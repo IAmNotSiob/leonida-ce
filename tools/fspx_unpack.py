@@ -145,6 +145,10 @@ def code_range(code: bytes):
     the first s_endpgm. end is None when the program has no s_endpgm."""
     words = struct.unpack_from(f"<{len(code) // 4}I", code)
     start = PROLOGUE_SIZE if len(words) > 8 and all(words[k] >> 16 == 0xD580 for k in PROLOGUE_WORDS) else 0
+    # agA43: the game programs the VM dumped after 11/24 (1144 of them) have a 24-byte prologue (two VOP3 words, the
+    # same 24 bytes the PSO map keys on), then s_inst_prefetch; read as code from 0 they decode as invalid words.
+    if not start and len(words) > 8 and all(words[k] >> 16 == 0xD580 for k in (0, 3)):
+        start = 24
     pos = code.find(ENDPGM, start)
     while pos >= 0 and pos % 4:
         pos = code.find(ENDPGM, pos + 1)
