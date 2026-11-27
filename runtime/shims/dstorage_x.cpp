@@ -37,6 +37,10 @@
 #include "../src/shader_library.h"
 #include <vector>
 
+// agA40: bytes read by DirectStorage requests, for the gameinput [clock] line.
+extern "C" std::atomic<unsigned long long> leonida_ce_ds_bytes;
+std::atomic<unsigned long long> leonida_ce_ds_bytes{0};
+
 namespace {
 
 constexpr int kSlots = 96;
@@ -482,6 +486,7 @@ int32_t run_request(const Req& r) {
         }
     }
     total += src_size;
+    leonida_ce_ds_bytes += src_size;  // agA40 [clock]
     if (!ok) {
         if (fails++ < 12) {
             const bool have = src.size() == src_size;

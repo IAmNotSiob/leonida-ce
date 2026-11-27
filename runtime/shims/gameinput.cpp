@@ -55,6 +55,9 @@
 
 using namespace gi;
 
+extern "C" unsigned long long leonida_ce_present_count();  // agA40, d3d12_xs_device.cpp
+extern "C" std::atomic<unsigned long long> leonida_ce_ds_bytes;  // agA40, dstorage_x.cpp
+
 namespace {
 // agA5 HACK: call counters for the scripted-press log
 std::atomic<long> g_ce_reads{0}, g_ce_reads_ok{0}, g_ce_gpstate{0}, g_ce_gpstate_nz{0}, g_ce_devcb{0}, g_ce_rdcb{0};
@@ -1949,6 +1952,22 @@ void apply_script(bool* down) {
             g_script_state = st;
         }
         if (st == 3 && !g_script_s3) g_script_s3 = now;
+        {   // agA40 [clock] every 5 s: script time, process uptime, boot state, presents, DirectStorage MiB.
+            static uint64_t last_clock = 0;
+            if (now - last_clock >= 5000000) {
+                last_clock = now;
+                FILETIME c{}, e{}, k{}, u{}, sys{};
+                double up = -1;
+                if (GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) {
+                    GetSystemTimeAsFileTime(&sys);
+                    const auto q = [](const FILETIME& f) { return (uint64_t(f.dwHighDateTime) << 32) | f.dwLowDateTime; };
+                    up = double(q(sys) - q(c)) / 1e7;
+                }
+                std::fprintf(stderr, "[clock] t=%.1f proc=%.1f state %d frame %llu ds %llu MiB\n", (now - g_script_t0) / 1e6, up, st,
+                             leonida_ce_present_count(), leonida_ce_ds_bytes.load(std::memory_order_relaxed) >> 20);
+                std::fflush(stderr);
+            }
+        }
         static uint64_t last_w = 0;
         if (st == 3 && now - last_w > 5000000) { last_w = now; log_s3_wait("tick", (now - g_script_t0) / 1e6); }
     }

@@ -8098,3 +8098,8 @@ void reset_device_proxy_stats() {
 }
 
 }  // namespace rt::d3d12_xs
+
+// agA40: the present count, for the gameinput [clock] line.
+extern "C" unsigned long long leonida_ce_present_count() {
+    return ::leonida::ce::present_frame().load(std::memory_order_relaxed);
+}
