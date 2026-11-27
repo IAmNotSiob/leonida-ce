@@ -825,7 +825,51 @@ void hang_dump_threads(std::uint64_t idle_ms) {
     }
     CloseHandle(snap);
 }
+// main session: window title "Americas | {fps} | Leonida CE ol algo" (LEONIDA_CE_TITLE overrides the format; "0" = off).
+// A separate low-rate thread does the WM_SETTEXT with a timeout, so a busy window thread can never stall a present.
+std::atomic<std::uint64_t> g_title_frame{0};
+void title_thread_start() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        const char* f = std::getenv("LEONIDA_CE_TITLE");
+        if (f && f[0] == '0' && !f[1]) return;
+        HANDLE h = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+            const char* f = std::getenv("LEONIDA_CE_TITLE");
+            const std::string fmt = f && *f ? f : "Americas | {fps} | Leonida CE ol algo";
+            const DWORD pid = GetCurrentProcessId();
+            std::uint64_t last_frame = g_title_frame.load(), last_tick = GetTickCount64();
+            for (;;) {
+                Sleep(1000);
+                const std::uint64_t fr = g_title_frame.load(), now = GetTickCount64();
+                const double fps = now > last_tick ? double(fr - last_frame) * 1000.0 / double(now - last_tick) : 0.0;
+                last_frame = fr; last_tick = now;
+                char num[32];
+                std::snprintf(num, sizeof num, fps < 10.0 ? "%.1f fps" : "%.0f fps", fps);
+                std::string t = fmt;
+                if (const std::size_t at = t.find("{fps}"); at != std::string::npos) t.replace(at, 5, num);
+                wchar_t wt[256];
+                const int n = MultiByteToWideChar(CP_UTF8, 0, t.c_str(), -1, wt, 256);
+                if (n <= 0) continue;
+                struct Ctx { DWORD pid; const wchar_t* text; } ctx{pid, wt};
+                EnumWindows([](HWND w, LPARAM lp) -> BOOL {
+                    auto* c = reinterpret_cast<Ctx*>(lp);
+                    DWORD wp = 0;
+                    GetWindowThreadProcessId(w, &wp);
+                    if (wp == c->pid && IsWindowVisible(w) && !GetWindow(w, GW_OWNER)) {
+                        DWORD_PTR r = 0;
+                        SendMessageTimeoutW(w, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(c->text), SMTO_ABORTIFHUNG | SMTO_NORMAL, 100, &r);
+                    }
+                    return TRUE;
+                }, reinterpret_cast<LPARAM>(&ctx));
+            }
+            return 0;
+        }, nullptr, 0, nullptr);
+        if (h) { SetThreadPriority(h, THREAD_PRIORITY_LOWEST); CloseHandle(h); }
+    });
+}
 void hang_heartbeat(std::uint64_t frame) {
+    g_title_frame.store(frame);
+    title_thread_start();
     static const bool on = [] { const char* v = std::getenv("LEONIDA_CE_HANG_WATCH"); return !v || *v != '0'; }();
     if (!on) return;
     g_hang_last_tick.store(GetTickCount64());
