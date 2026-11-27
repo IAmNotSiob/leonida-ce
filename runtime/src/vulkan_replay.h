@@ -5830,10 +5830,27 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 for (std::uint32_t k = 0; k < draw->ind_max && k < 64; ++k) vk.draw_mesh_tasks(command_buffer, mesh_force_x, 1, 1);
             } else
             if (d.ind_buffer && draw->mesh) {  // agA43 indirect DISPATCH_MESH
+                // HACK (agA46, LEONIDA_CE_MESH_EI_WINDOW=1, with POOL_GPU): read the args at heap_base + title VA (the pool
+                // window, where shaders write through raw VAs) instead of the placed buffer's arena stand-in, which no
+                // command of the frame writes (rt233 NANPROBE_BUF: [0 1 1] all frame).
+                static const bool ei_window = [] { const char* e = std::getenv("LEONIDA_CE_MESH_EI_WINDOW"); return e && e[0] == '1'; }();
+                VkBuffer ib = d.ind_buffer;
+                VkDeviceSize io = d.ind_offset;
+                if (ei_window && draw->ind_title_va) {
+                    const auto& w = ::leonida::ce::pool_window();
+                    const std::uint64_t end = draw->ind_title_va + std::uint64_t(draw->ind_max ? draw->ind_max : 1) * draw->ind_stride;
+                    if (w.buffer && draw->ind_title_va >= w.lo && end <= w.hi) { ib = w.buffer; io = draw->ind_title_va - w.base; }
+                    static std::atomic<int> told{0};
+                    if (told++ < 4) {
+                        std::fprintf(stderr, "[hack] MESH_EI_WINDOW: title 0x%llx -> %s offset 0x%llx\n", (unsigned long long)draw->ind_title_va,
+                                     ib == w.buffer ? "window" : "stand-in (outside window)", (unsigned long long)io);
+                        std::fflush(stderr);
+                    }
+                }
                 if (d.cnt_buffer && vk.draw_mesh_tasks_indirect_count)
-                    vk.draw_mesh_tasks_indirect_count(command_buffer, d.ind_buffer, d.ind_offset, d.cnt_buffer, d.cnt_offset, draw->ind_max, draw->ind_stride);
+                    vk.draw_mesh_tasks_indirect_count(command_buffer, ib, io, d.cnt_buffer, d.cnt_offset, draw->ind_max, draw->ind_stride);
                 else if (!d.cnt_buffer && vk.draw_mesh_tasks_indirect)
-                    vk.draw_mesh_tasks_indirect(command_buffer, d.ind_buffer, d.ind_offset, draw->ind_max, draw->ind_stride);
+                    vk.draw_mesh_tasks_indirect(command_buffer, ib, io, draw->ind_max, draw->ind_stride);
             } else if (d.ind_buffer) {  // agA19 LEONIDA_CE_INDIRECT_DRAW
                 if (draw->indexed) vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
                 if (d.cnt_buffer) {

@@ -64,6 +64,9 @@ inline std::atomic<HeapSyncFn>& heap_sync_fn() {
     static std::atomic<HeapSyncFn> f{nullptr};
     return f;
 }
+// agA46 (LEONIDA_CE_MESH_EI_WINDOW): the POOL_GPU window buffer (one piece) and the title VA at its offset 0.
+struct PoolWindow { VkBuffer buffer = VK_NULL_HANDLE; std::uint64_t base = 0, lo = 0, hi = 0; };
+inline PoolWindow& pool_window() { static PoolWindow w; return w; }
 // agA24 (LEONIDA_CE_POOL_GPU): applies queued texture-pool page binds (ExecuteCommandLists, before the replay).
 inline std::atomic<HeapSyncFn>& pool_sync_fn() {
     static std::atomic<HeapSyncFn> f{nullptr};

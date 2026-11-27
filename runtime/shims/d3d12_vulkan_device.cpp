@@ -8547,6 +8547,10 @@ public:
                 g_pool.device_type = dtype;
                 g_pool.host_props = host_props;
                 g_pool.mode = mode;
+                if (pieces.size() == 1) {  // agA46 MESH_EI_WINDOW
+                    auto& w = leonida::ce::pool_window();
+                    w.base = g_pool.base; w.lo = lo; w.hi = hi; w.buffer = pieces[0];
+                }
                 std::fprintf(stderr, "[hack] POOL_GPU=%d: window [0x%llx, 0x%llx), buffer at device 0x%llx = heap_base + 0x%llx "
                              "(%zu piece(s) of 0x%llx, sparse alignment 0x%llx, memory types 0x%x -> %u)%s\n", mode, (unsigned long long)lo,
                              (unsigned long long)hi, (unsigned long long)got, (unsigned long long)(got - arena.address),
