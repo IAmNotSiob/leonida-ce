@@ -2709,3 +2709,47 @@ Where it stands:
 - Existing generic knobs, not used in recent envs: LEONIDA_CE_INDIRECT_CLAMP=1 (GPU pass zeroes indirect dispatch records
   with a dimension > INDIRECT_CLAMP_MAX, default 65535) and DISPATCH_MAX=N (skip CPU dispatches over N groups). Candidates
   if loop-free hangs remain.
+
+## agA39 (sender gen 39, 2026-11-27) - why there is no world: no depth, no MRT
+- Work files /root/a39 (edit scripts, msg160/161.txt, osg.py = DXBC output-signature reader).
+- FINDING (Definite, from the code): slot 57 (console PSO record -> PC CreateGraphicsPipelineState, d3d12_xs_device.cpp) builds
+  EVERY title graphics pipeline from the shaders only. DSVFormat is UNKNOWN (no depth state), NumRenderTargets=1 with RGBA8,
+  cull NONE and topology TRIANGLE. agA4 noted "depth/stencil not translated" and it was never revisited. Consequences:
+  * prepare_draw attaches a DSV only when pipeline->depth_format != UNDEFINED, so NO draw has ever had a depth attachment.
+    No "[rtdiag]   depth" line appears in any log rt4-rt59 (grep count 0). Depth buffers only ever see clears, so TiledLighting /
+    SSSResolve reconstruct from cleared depth (Likely the NaN source; NANPROBE will name the pass).
+  * render targets past slot 0 are dropped: G-buffer pixel shaders declare several (OSG1 of
+    PS_PropFoliageDeferredTo_GBuffer: SV_Target0..2), so G-buffer slots 1+ were never written.
+  * depth-only draws (prepass / shadows) render nothing; rt59 frame 10400 has 7832 "no-target" draws.
+- variant-skip (rtdiag) = a draw whose attachment variant (unbound slot / RT_RETARGET format) is still compiling in the
+  background. It is transient after cache-invalidating env changes (pending-pso is the same for base pipelines). The counts
+  fell 29762 -> 9134 within 100 frames in rt59; it is not a cause of the black screen.
+- Build 160 (302c00a40), diagnostics, all default off:
+  * LEONIDA_CE_NANPROBE=<frame>[:<max>] | auto[:<min frame>[:<draws>]] (+ LEONIDA_CE_NANPROBE_TARGET, default 0x100001b00 =
+    rt59 target0). While one frame is built, 8 texels of the target are copied to a 2 MiB arena region after every draw into
+    it, every dispatch / ExecuteIndirect, clears/copies into it and at each list start (vkCmdCopyImageToBuffer with layout
+    round trip from the tracker). 12 frames later "[nanprobe] #i list L cmd C <B|D|C|I|X> <pipeline> ...: k/8 bad" lines
+    (changes only) + "[nanprobe] summary ... first bad #i". auto arms 2 frames after the first frame with >= <draws> draws
+    into the target. Code: runtime/src/ce_nanprobe.h + detail::nanprobe_rt in vulkan_replay.h.
+  * RTDIAG dump: "bindings: dsv-bound / depth-dropped / mrt-dropped" + top pipelines of no-target / depth-dropped / mrt-dropped.
+  * LEONIDA_CE_PSO_STATE_LOG=<file>: one hex line per distinct (shader pair, blob #0), the data for decoding the console
+    depth/stencil/raster state (+0x3c "db" values seen: 0x10, 0x12, 0x14 (PS_Copy_SRV_To_Depth), 0x18 (all Scaleform)).
+    Blob #0 fields seen in the 6 old dumps: +0x100..0x11f = SX_MRT0..7_BLEND_OPT (0x06000600 = BLEND_DISABLED,
+    matches cb0 0x80000000), +0xc0/+0xc4 0x0100ff00 = DB_STENCILREFMASK(_BF)-like, +0x78 0xf = CB_SHADER_MASK-like.
+- Build 161 (ee2ec3913), the fix attempt, default off:
+  * LEONIDA_CE_PSO_MRT=1: NumRenderTargets from the PS DXBC output signature (highest SV_Target register + 1), with a mask
+    and blend per target from CB_TARGET_MASK / CB_BLENDi_CONTROL. RTV formats are RGBA8 placeholders that RT_RETARGET fixes.
+  * LEONIDA_CE_PSO_DEPTH=1: test = db bit 1, write = db bit 2 or a PS with SV_Depth (Plausible decode), func =
+    LEONIDA_CE_PSO_DEPTH_FUNC (ge default). The replay gives a pipeline with depth state but no DSV format
+    (GraphicsPipeline::ce_depth_any) a variant whose depth/stencil attachment format = the bound DSV's VkFormat (variant
+    key bits 16..31). Emit takes the aspects from the bound image.
+  * .tls 0x1459 for both builds.
+- Runs requested from the main session: rt80 = 160 + rt80.env (rt59.env + NANPROBE=auto:9000:150 + PSO_STATE_LOG);
+  rt81 = 161 + rt81.env (rt80.env + PSO_DEPTH=1 + PSO_MRT=1). Proposed rt82 = rt81.env + PSO_DEPTH_FUNC=le if rt81 draws
+  depth but stays black. Results not seen by agA39.
+- NEXT: (1) rt80: read the nanprobe list (first D/C after which target0 is NaN) and the census (how many draws bind a DSV;
+  which pipelines are mrt-dropped). (2) rt81: depth lines present? target0 still NaN? (3) Decode blob #0 from
+  psostate_rt8x.txt: correlate db/+0x28/+0x38 with pass names (prepass, GBuffer, shadow, Copy_SRV_To_Depth, fullscreen),
+  then translate the real depth func / stencil / cull. (4) The world is still GPU-driven (agA36: INDIRECT args [3 0 0 0 0]);
+  the culling compute reads depth (HiZ from the previous frame's depth). Empty depth may be WHY instance counts are 0, so
+  depth can fix both.
