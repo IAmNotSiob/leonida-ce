@@ -3263,7 +3263,7 @@ inline void report_if_due() {
     std::uint8_t* const arena = ::leonida::ce::arena_host().load(std::memory_order_relaxed);
     const std::uint64_t base = ::leonida::ce::nanprobe::region().load(std::memory_order_relaxed);
     std::fprintf(stderr, "[nanprobe] frame %llu target 0x%llx: %zu samples in %u lists (region 0x%llx)\n",
-                 (unsigned long long)armed, (unsigned long long)c.target, s.meta.size(), s.lists, (unsigned long long)base);
+                 (unsigned long long)armed, (unsigned long long)::leonida::ce::nanprobe::target_locked().load(), s.meta.size(), s.lists, (unsigned long long)base);
     if (!arena || !base) { std::fflush(stderr); return; }
     int prev_bad = -1;
     std::uint32_t prev_px[4] = {~0u, ~0u, ~0u, ~0u};
@@ -3370,8 +3370,25 @@ inline bool note_draw(const PreparedDraw& d) {
     const std::uint64_t armed = ::leonida::ce::nanprobe::armed().load(std::memory_order_relaxed);
     if (armed ? (f + 40 < armed || f > armed) : !c.automatic) return false;
     for (const auto& a : d.colors) {
-        if (!a.id || rtdiag::address_for_id(a.id) != c.target) continue;
+        if (!a.id) continue;
+        const std::uint64_t addr = rtdiag::address_for_id(a.id);
+        std::uint64_t want = ::leonida::ce::nanprobe::target_locked().load(std::memory_order_relaxed);
+        if (!want) {  // agA41 NANPROBE_TARGET=auto: lock onto the first 2560x1440 RGBA16F target from <min frame> on
+            if (!addr || f < c.min_frame || a.binding.width != 2560 || a.binding.height != 1440 ||
+                a.binding.format != VK_FORMAT_R16G16B16A16_SFLOAT ||
+                ::leonida::ce::pipeline_name(reinterpret_cast<std::uint64_t>(d.pipeline)).find("TiledLighting") == std::string::npos)
+                continue;  // agA42: the scene target is the one TiledLighting/SSSResolve draws into (not the hair copy)
+            if (::leonida::ce::nanprobe::target_locked().compare_exchange_strong(want, addr)) {
+                std::fprintf(stderr, "[nanprobe] auto target: 0x%llx (2560x1440 RGBA16F) at frame %llu\n", (unsigned long long)addr,
+                             (unsigned long long)f);
+                std::fflush(stderr);
+                want = addr;
+            }
+        }
+        if (addr != want) continue;
         ::leonida::ce::nanprobe::count_target_draw(f);
+        if (const std::uint64_t ar = ::leonida::ce::nanprobe::armed().load(std::memory_order_relaxed))
+            ::leonida::ce::auto_trace_frame().store(ar, std::memory_order_relaxed);  // agA42 FRAME_TRACE_AUTO
         State& s = state();
         std::lock_guard l(s.m);
         s.target = a.binding;
@@ -5654,6 +5671,62 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             if (d.depth.id && (depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) rendering.pDepthAttachment = &depth;
             if (d.depth.id && (depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) rendering.pStencilAttachment = &depth;
             vk.begin_rendering(command_buffer, &rendering);
+            // HACK (agA42, LEONIDA_CE_FRAME_CLEAR=<T# addr>[,<addr>..] | f16): clear the named colour targets (or, with
+            // "f16", every RGBA16F attachment >= 1280 wide) to 0 at their FIRST draw of each present frame. Hides any NaN
+            // a target carries over from the previous frame (history feedback / in-place passes); also wipes whatever a
+            // compute pass wrote into it earlier in the frame. Needs LEONIDA_CE_RTDIAG=1 for addresses.
+            if (vk.clear_attachments) {
+                struct FcCfg { std::vector<std::uint64_t> addr; bool f16 = false; };
+                static const FcCfg fc = [] {
+                    FcCfg r;
+                    const char* e = std::getenv("LEONIDA_CE_FRAME_CLEAR");
+                    if (!e) return r;
+                    if (std::strncmp(e, "f16", 3) == 0) { r.f16 = true; return r; }
+                    while (*e) {
+                        char* end = nullptr;
+                        const std::uint64_t a = std::strtoull(e, &end, 0);
+                        if (end == e) break;
+                        r.addr.push_back(a);
+                        e = end;
+                        while (*e == ',' || *e == ' ') ++e;
+                    }
+                    return r;
+                }();
+                if (fc.f16 || !fc.addr.empty()) {
+                    static std::mutex fc_m;
+                    static std::unordered_map<std::uintptr_t, std::uint64_t> fc_last;
+                    static std::uint64_t fc_told = 0;
+                    const std::uint64_t f = ::leonida::ce::present_frame().load(std::memory_order_relaxed);
+                    for (std::size_t slot = 0; slot < d.colors.size(); ++slot) {
+                        const auto& a = d.colors[slot];
+                        if (!a.id) continue;
+                        bool want = false;
+                        if (fc.f16) want = a.binding.format == VK_FORMAT_R16G16B16A16_SFLOAT && a.binding.width >= 1280;
+                        else {
+                            const std::uint64_t ad = rtdiag::address_for_id(a.id);
+                            for (std::uint64_t x : fc.addr) want = want || (ad && ad == x);
+                        }
+                        if (!want) continue;
+                        bool first = false;
+                        {
+                            std::lock_guard l(fc_m);
+                            auto& last = fc_last[a.id];
+                            if (last != f + 1) { last = f + 1; first = true; }
+                            if (first && fc_told < 24) {
+                                ++fc_told;
+                                std::fprintf(stderr, "[hack] FRAME_CLEAR frame %llu slot %zu id %llx %ux%u fmt %d pipe %s\n",
+                                             (unsigned long long)f, slot, (unsigned long long)a.id, a.binding.width, a.binding.height,
+                                             int(a.binding.format), ::leonida::ce::pipeline_name(reinterpret_cast<std::uint64_t>(d.pipeline)).c_str());
+                                std::fflush(stderr);
+                            }
+                        }
+                        if (!first) continue;
+                        VkClearAttachment c{VK_IMAGE_ASPECT_COLOR_BIT, std::uint32_t(slot), {}};
+                        const VkClearRect all{{{0, 0}, d.area}, 0, 1};
+                        vk.clear_attachments(command_buffer, 1, &c, 1, &all);
+                    }
+                }
+            }
 
             ShaderUserData data{};
             std::copy(draw->user_data.begin(), draw->user_data.end(), data.s);

@@ -38,12 +38,17 @@ inline const Config& config() {
             }
             if (r.max == 0 || r.max > 16384) r.max = 16384;
         }
-        if (const char* t = std::getenv("LEONIDA_CE_NANPROBE_TARGET")) r.target = std::strtoull(t, nullptr, 0);
+        // agA41: LEONIDA_CE_NANPROBE_TARGET=auto (or 0) = the first 2560x1440 RGBA16F colour target drawn into from
+        // <min frame> on (its T# address moved between builds: 0x100001b00 in rt59/rt80/rt93, 0x100001c00 in rt103).
+        if (const char* t = std::getenv("LEONIDA_CE_NANPROBE_TARGET"))
+            r.target = std::strncmp(t, "auto", 4) == 0 ? 0 : std::strtoull(t, nullptr, 0);
         return r;
     }();
     return c;
 }
 inline bool on() { return config().frame != 0 || config().automatic; }
+// agA41: the probed target address (the configured one, or the one auto selection locked onto; 0 = none yet).
+inline std::atomic<std::uint64_t>& target_locked() { static std::atomic<std::uint64_t> t{config().target}; return t; }
 // The probed frame: the configured one, or 0 until auto mode arms.
 inline std::atomic<std::uint64_t>& armed() { static std::atomic<std::uint64_t> a{config().frame}; return a; }
 // Auto mode: count a draw into the target while frame f is built; arms when a whole frame had enough of them.

@@ -5194,6 +5194,26 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             }
             xs_trap_tick(f);
             xs_prof_report(f);  // agA40
+            {   // agA42 DIAGNOSTIC LEONIDA_CE_LIST_SLOT_STATS=N: every N presents, console list-slot calls per frame since the
+                // last report (all lists). Shows which console-only slots (dropped: 28-30, 70, 74, 75, 101, 126, ...) the
+                // title calls how often, e.g. in gameplay.
+                static const unsigned every = [] { const char* e = std::getenv("LEONIDA_CE_LIST_SLOT_STATS"); return e ? unsigned(std::atoi(e)) : 0u; }();
+                if (every && f && f % every == 0) {
+                    static std::uint64_t last[kListSlots];
+                    std::string line;
+                    for (unsigned sl = 0; sl < kListSlots; ++sl) {
+                        const std::uint64_t h = ListStats::hits[sl].load(std::memory_order_relaxed);
+                        const std::uint64_t dlt = h - last[sl];
+                        last[sl] = h;
+                        if (!dlt) continue;
+                        char b[48];
+                        std::snprintf(b, sizeof b, " %u:%.1f", sl, double(dlt) / every);
+                        line += b;
+                    }
+                    std::fprintf(stderr, "[hack] LIST_SLOT_STATS frame %llu (calls/frame, slot:n):%s\n", (unsigned long long)f, line.c_str());
+                    std::fflush(stderr);
+                }
+            }
             {   // HACK (Leonida CE boot): frame pacing. Presents were uncapped (about 240 per second; the frame events
                 // answer at once), while the title runs at 30 on the console and frees things a set number of frames
                 // later. LEONIDA_CE_FPS (30 by default, 0 for none) spaces presents at least 1/FPS apart.

@@ -111,6 +111,8 @@ inline thread_local std::vector<std::uint64_t>* t_list_marks = nullptr;
 inline std::atomic<std::uint64_t>& present_frame() { static std::atomic<std::uint64_t> f{0}; return f; }
 // agA32 LEONIDA_CE_FRAME_TRACE=<f>[,<f2>|<a>-<b>...]: every list replayed while one of these frames is built is logged
 // with its draws/dispatches in order (pipeline names, consecutive repeats folded; needs LEONIDA_CE_CHECKPOINTS=1).
+// agA42: frame chosen by NANPROBE auto mode (0 = none yet).
+inline std::atomic<std::uint64_t>& auto_trace_frame() { static std::atomic<std::uint64_t> f{0}; return f; }
 inline bool frame_traced(std::uint64_t f) {
     static const std::vector<std::pair<std::uint64_t, std::uint64_t>> v = [] {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> r;
@@ -129,6 +131,12 @@ inline bool frame_traced(std::uint64_t f) {
     }();
     for (const auto& [a, b] : v)
         if (f >= a && f <= b) return true;
+    // agA42: LEONIDA_CE_FRAME_TRACE_AUTO=1 also traces the frame NANPROBE auto mode arms on (auto_trace_frame()).
+    static const bool ft_auto = [] { const char* e = std::getenv("LEONIDA_CE_FRAME_TRACE_AUTO"); return e && e[0] == 0x31; }();
+    if (ft_auto) {
+        const std::uint64_t at = auto_trace_frame().load(std::memory_order_relaxed);
+        if (at && f == at) return true;
+    }
     return false;
 }
 inline void trace_list(const char* kind, std::uint64_t frame, std::uint64_t seq, std::size_t i, std::size_t n,
