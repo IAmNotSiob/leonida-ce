@@ -3339,6 +3339,20 @@ inline void sample(VkCommandBuffer cb, const ReplayFunctions& vk, LayoutTracker*
         m.texel = block_format(t.format, VK_IMAGE_ASPECT_COLOR_BIT).bytes;
         s.meta.push_back(m);
     }
+    // agA46 LEONIDA_CE_NANPROBE_BUF=<arena offset>: sample 128 bytes of the arena (a buffer stand-in, e.g. the mesh
+    // ExecuteIndirect args) instead of the target's texels, so the report names the commands that change it.
+    static const std::uint64_t buf_off = [] { const char* e = std::getenv("LEONIDA_CE_NANPROBE_BUF"); return e ? std::strtoull(e, nullptr, 0) : 0ull; }();
+    if (buf_off && vk.copy_buffer) {
+        memory_barrier(vk, cb, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT);
+        const VkBufferCopy region{buf_off, base + slot * ::leonida::ce::nanprobe::slot_bytes, ::leonida::ce::nanprobe::slot_bytes};
+        vk.copy_buffer(cb, buf, buf, 1, &region);
+        memory_barrier(vk, cb, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+        std::lock_guard l(s.m);
+        if (slot < s.meta.size()) { s.meta[slot].sampled = true; s.meta[slot].format = VK_FORMAT_UNDEFINED; }
+        return;
+    }
     const std::uint32_t texel = block_format(t.format, VK_IMAGE_ASPECT_COLOR_BIT).bytes;
     if (!texel || texel > 16 || t.samples != 1 || !t.image || !tracker) return;
     const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
