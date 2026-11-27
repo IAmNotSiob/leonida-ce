@@ -2891,3 +2891,17 @@ Measured from warm logs (rt52 build 143, rt58 build 142, rt44). rt59 was a cold 
   right (blits off; sga_dr GE test-only; DownsampleMinDepth ALWAYS+write; BlitColour stencil only). "func N" in the log is
   D3D12_COMPARISON_FUNC (1 never .. 8 always). It did not reach gameplay, so there was no nanprobe and no picture.
 - rt102 = build 190 (main session: 180 + a title FPS thread) warm re-run of rt100.env.
+- Build 171 (13aa30e9c): the refresh pass's re-uploads go in one upload buffer and one submission (rt52's log implies ~23000
+  re-uploads in the run, each with its own buffer/allocator/list/fence/ExecuteCommandLists). LEONIDA_CE_REFRESH_BATCH=0 = old.
+- CORRECTION from rt100 (build 180 contains 170/171), whose "[refresh] pass" log measured the pass: the 64 KiB whole-chunk reads of
+  build 170 were a REGRESSION. ReadProcessMemory moves only ~200 MB/s here: 53 textures / 252 MiB = 1.28 s per pass already in
+  the splash (passes 3-14), and 1214 textures / 4 GiB = 8.4 s after the load, on every 30th present. rt100: 0->1 61.9,
+  1->3 96.4, 13->0 319.9, 11->0 397.6. The batching works.
+- Build 173 (5414f8ef1): CHUNK_KB defaults to 0 again (one 8-byte read per sample). Non-glyph textures get one sample per 64 KiB
+  physical page (LEONIDA_CE_REFRESH_STRIDE_KB); glyph caches are still hashed in full. A 40 ms budget per pass with a rotating
+  cursor (LEONIDA_CE_REFRESH_BUDGET_MS, 0 = none). Plus LEONIDA_CE_PROF=1: a "[prof]" line every 60 presents with wall ms/f,
+  pacing sleep, refresh, proxy total and the top proxy slots (inclusive, summed over threads). rt93 = rt102.env + PROF=1.
+- The GPU box hard-reset at ~18:38 box time and left empty git objects for an agA40 commit (9e38f054e). They were moved to
+  /root/a40-git-empty, experimental was reset to d352c6e58, and the work was committed again as 5414f8ef1. Two stale reflog
+  lines still name 9e38f054e.
+- Warm 0->1 is not compile-bound: all 1313 background compute PSOs finish before 0->1 (p50 16 ms, p99 6.5 s = the bvh ones).
