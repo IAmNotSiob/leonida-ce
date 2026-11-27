@@ -1139,6 +1139,37 @@ static bool ce_name_list_match(const char* env, const std::string& name) {
         if (s.empty() || name.find(s) != std::string::npos) return true;
     return false;
 }
+// agA37: LEONIDA_CE_LOOP_CAP_GFX=sub1,sub2[:N],1[:N] -> the inner cap for a graphics module (0 = not capped).
+// Default cap = LEONIDA_CE_LOOP_CAP_GFX_INNER, else LOOP_CAP_INNER, else 2^22 (agA29: rt22's capped mirror PS ran to
+// 16384 blocks per pixel every frame, so graphics wants a much lower cap). The first matching item wins.
+static std::uint32_t ce_loop_cap_gfx(const std::string& name) {
+    static const std::vector<std::pair<std::string, std::uint32_t>> items = [] {
+        const char* g = std::getenv("LEONIDA_CE_LOOP_CAP_GFX_INNER");
+        const char* v = g ? g : std::getenv("LEONIDA_CE_LOOP_CAP_INNER");
+        const std::uint32_t def = std::uint32_t(v ? std::strtoul(v, nullptr, 0) : (1u << 22));
+        std::vector<std::pair<std::string, std::uint32_t>> r;
+        if (const char* e = std::getenv("LEONIDA_CE_LOOP_CAP_GFX")) {
+            const std::string all(e);
+            for (std::size_t at = 0; at <= all.size();) {
+                const std::size_t comma = all.find(',', at);
+                std::string item = all.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+                std::uint32_t cap = def;
+                if (const std::size_t colon = item.find(':'); colon != std::string::npos) {
+                    const std::uint32_t c = std::uint32_t(std::strtoul(item.c_str() + colon + 1, nullptr, 0));
+                    if (c) cap = c;
+                    item.resize(colon);
+                }
+                if (!item.empty()) r.emplace_back(item == "1" ? std::string() : item, cap);
+                if (comma == std::string::npos) break;
+                at = comma + 1;
+            }
+        }
+        return r;
+    }();
+    for (const auto& [pattern, cap] : items)
+        if (name.find(pattern) != std::string::npos) return cap;
+    return 0;
+}
 static void ce_guard_all(std::vector<std::uint32_t>& words, const char* name, bool compute) {
     if (!ce_guard_all_on() || std::strncmp(name, "bvh/", 4) == 0) return;  // the runtime BVH builder uses real addresses
     static const std::uint64_t limit = [] {
@@ -5262,14 +5293,9 @@ public:
             // (src/spirv_loop_cap.h) on graphics stages whose name contains one of the substrings. rt21 hung (TDR, no
             // faulted warp) in PS_MIRROR_PBR_MATERIAL_CLEARCOAT/STANDARD_5f34c83e (17 / 13 loops). Only the matched
             // modules change, so only their pipelines recompile.
-            if (ce_name_list_match("LEONIDA_CE_LOOP_CAP_GFX", stage.entry->name)) {
-                // LEONIDA_CE_LOOP_CAP_GFX_INNER (agA29): the graphics cap, else LOOP_CAP_INNER. rt22: the capped mirror PS
-                // ran to 16384 blocks per pixel every frame (5 s / frame), so graphics wants a much lower cap.
-                static const std::uint32_t inner = [] {
-                    const char* g = std::getenv("LEONIDA_CE_LOOP_CAP_GFX_INNER");
-                    const char* v = g ? g : std::getenv("LEONIDA_CE_LOOP_CAP_INNER");
-                    return std::uint32_t(v ? std::strtoul(v, nullptr, 0) : (1u << 22));
-                }();
+            // agA37: items may carry their own cap, "pattern:N" (first match wins), e.g.
+            // LOOP_CAP_GFX=PS_MIRROR_PBR,HairStrand,1:0x1000 = those two at LOOP_CAP_GFX_INNER, every other module 4096.
+            if (const std::uint32_t inner = ce_loop_cap_gfx(stage.entry->name)) {
                 static const std::uint32_t outer = [] { const char* v = std::getenv("LEONIDA_CE_LOOP_CAP_OUTER"); return std::uint32_t(v ? std::strtoul(v, nullptr, 0) : (1u << 18)); }();
                 const int n = leonida::spirv_cap_loops(stage.words, inner, outer);
                 static std::atomic<int> told{0};
