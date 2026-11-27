@@ -2850,3 +2850,44 @@ Measured from warm logs (rt52 build 143, rt58 build 142, rt44). rt59 was a cold 
   retries every 3 s, and keeps the old 10 s A cadence for the rest of the run.
 - Runs requested: rt90 (build 170, rt59.env + the new PRESS) and rt91 (rt90 + NO_PLACED_REFRESH=1 = the upper bound of
   the refresh cost).
+
+## agA41 (sender gen 41, 2026-11-27) - the real console depth/stencil decode
+- Work files /root/a41 (rows.py = psostate loader, ed1/ed2.py = the edits, msg180.txt).
+- FINDING (Definite): blob #0 +0x3c is NOT DB_DEPTH_CONTROL. +0x38/+0x3c and +0x4c/+0x50 are SPI_SHADER_PGM_RSRC1/RSRC2 pairs
+  of two shader stages (RSRC1 0x082c03xx = FLOAT_MODE 0xc0 + DX10_CLAMP; RSRC2 0x10/0x12/0x14/0x16/0x18 = USER_SGPR 8..12, the
+  same values at +0x3c and +0x50). So agA39's PSO_DEPTH (build 161, rt81) was driven by user-SGPR counts: blits got a depth
+  test, UI got depth writes.
+- FINDING (Very likely, 11210 rt80 blobs against pass names): GCN context registers in blob #0:
+  * +0xb8 DB_DEPTH_CONTROL (bit0 stencil, 1 Z test, 2 Z write, 4-6 ZFUNC, 7 backface, 8-10 STENCILFUNC, 20-22 STENCILFUNC_BF;
+    func 0 never, 1 less, 2 equal, 3 le, 4 greater, 5 ne, 6 ge, 7 always = D3D12 func - 1).
+    0x007007f0 off: Scaleform, blits, BlurFilter, PostFX, TexturedUnlit_IM, sga_dr (mostly), BlitHDRGameScreenshot (6422 rows)
+    0x007007e2 GE test-only: VfxVBuffer, ptfx, AlphaPrepass, DistantWindowEmissives (1470)
+    0x007007e7 GE + write + stencil: HairStrandVBuffer/GBuffer, Octa, RopeTransformD+PS_DeferredTextured
+    0x007007a2 EQUAL test-only: VS_TiledLighting/vs_classfied_fullScreen + TL_PS_* / PS_MIRROR_PBR_* / SSSResolve (material-depth
+      classification: a full-screen quad per material at depth = id)
+    0x007007f6/7 ALWAYS + write: ps_generate_material_mask, DownsampleMin/MaxDepth, VS_Blit (no PS), Copy_SRV_To_Depth (f7)
+    0x007007b6 LE + write: CascadeShadows (forward Z for shadows; the main view is reversed Z)
+    0x002002f1 stencil EQUAL, no Z: Scaleform masked Cxform (940); 0x00200291 PS_BlitColour (stencil-masked blit)
+  * +0xbc DB_STENCIL_CONTROL (fail, zpass, zfail, then _BF, 4 bits each; 0x00030030 = zpass REPLACE).
+  * +0xc0 / +0xc4 DB_STENCILREFMASK / _BF (testval 0-7 (0 in the blob; the ref is dynamic), mask 8-15, writemask 16-23, opval 24-31).
+  * +0xa0 PA_SU_SC_MODE_CNTL: 0x00201a40 (no cull, poly offset front+back enabled, MULTI_PRIM_IB), 0x42 cull back, 0x41 cull
+    front, 0x46 cull back + FACE (CW front). Most pipelines are cull none.
+  * Also Plausible: +0x68 DB_SHADER_CONTROL (0x10 EARLY_Z_THEN_LATE_Z, 0x50 + KILL, 0x11 Z_EXPORT on DownsampleMinDepth),
+    +0x70 SPI_SHADER_COL_FORMAT (4 = FP16_ABGR per target, 0x441 = 3 targets), +0x78 CB_SHADER_MASK.
+- FINDING (Definite, code): rt81's "depth-dropped == dsv-bound" was a census bug. note_binding looked at the base pipeline's
+  depth_format, which stays UNDEFINED for PSO_DEPTH pipelines even when their variant attaches the DSV.
+- The world G-buffer pipelines barely appear in psostate (GBuffer-ish names: ~120 of 11210). The main world is rendered as a
+  visibility buffer + compute + tiled lighting; target0 is mostly drawn by sga_dr (depth off), TiledLighting/SSSResolve (EQUAL),
+  ptfx and DistantWindowEmissives (GE test).
+- Build 180 (9dd08e6e3): LEONIDA_CE_PSO_DEPTH=1 translates DB_DEPTH_CONTROL + stencil; LEONIDA_CE_PSO_DEPTH_FUNC only
+  overrides when set (never EQUAL/ALWAYS); LEONIDA_CE_PSO_STENCIL=0 = no stencil; LEONIDA_CE_PSO_CULL=1 (default off) = cull +
+  winding. Census: "bindings: dsv-bound, depth-attached, depth-off, depth-dropped, mrt-dropped". .tls 0x1459.
+- Stencil ref: the replay sets it from the command list's OMSetStencilRef (d3d12_com.cpp). Plausible that the title's refs come
+  through that; if Scaleform masks or BlitColour vanish, A/B with LEONIDA_CE_PSO_STENCIL=0.
+- Runs requested: rt100 = 180 + rt81.env renamed; rt101 = rt100 + PSO_CULL=1.
+- rt81 (161, wrong decode; stopped at ~frame 4100): mrt-dropped 650-1100 (PSO_MRT works), 106 depth lines, still black.
+- rt100 (180; stopped at ~1150 s, frame 2100, cold compile: pending-pso 16513 at frame 2000, 130-144 s per 60 frames, no
+  device loss): "dsv-bound 42504, depth-attached 42504, depth-off 0, depth-dropped 0, mrt-dropped 717". The decisions look
+  right (blits off; sga_dr GE test-only; DownsampleMinDepth ALWAYS+write; BlitColour stencil only). "func N" in the log is
+  D3D12_COMPARISON_FUNC (1 never .. 8 always). It did not reach gameplay, so there was no nanprobe and no picture.
+- rt102 = build 190 (main session: 180 + a title FPS thread) warm re-run of rt100.env.
