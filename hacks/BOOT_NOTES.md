@@ -2663,3 +2663,12 @@ Where it stands:
 - Envs (no new build): rt53 = rt51.env + LOOP_CAP=cs_d5613de2,cs_d94af257,cs_f33ac9e9,cs_d8b54205:0x100,
   cs_22383ee2:0x4000,1:0x80000 (only those two modules recompile). rt54 = rt53.env with COPY_SRC_SYNC=0 and no TRACE
   (A/B for the data trigger: expected clean like rt44).
+- agA37 noted that every run with non-zero CBV_PLACED CBs lost the device; rt51 hung in the cs_d8b54205 plane loop (CB+0x1c4).
+  My reading of rt51: no wrong bytes in the traced TAA range (the 9 DIFFERENT were several copies into the same dst per frame).
+  But there is a TIMING HOLE (Plausible as the hang cause): the source stand-in over the upload ring is ONE buffer for every lap,
+  and the ring laps every ~2 frames (TAA src ~9.4 MiB/frame through ~0x111a0000..0x125d0000). With the GPU >= 1 lap behind, a
+  later submit-time sync overwrites bytes an earlier GPU copy has not read yet.
+- Build 142 (771b3c4f7, on top of A37's 143): LEONIDA_CE_CSS_STAGE_MB=N gives each synced copy a private slot of an N MiB arena
+  DEFAULT staging ring (CSS_STAGE: lines); the forwarded copy is redirected to it (a3/a4 replaced after the [watch] lines).
+  LEONIDA_CE_CSS_STAGE_AT=record fills the slot at record time. The trace prints "title since record: same / CHANGED".
+  rt56 = 142 + rt56.env (rt51.env + CSS_STAGE_MB=64); rt58 = rt56.env + CSS_STAGE_AT=record. Requested from the main session.
