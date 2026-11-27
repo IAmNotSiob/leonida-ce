@@ -2649,3 +2649,17 @@ Where it stands:
   then a run that lives >= 300 frames past gameplay with RTDIAG dumps decides whether the scene shows. If still black: the
   next suspects are other CPU-written placed buffers read through copies > 1 MiB (raise the cap) or through views (needs
   per-use syncing like this one), and the TAA input colour (DRAW_SRV s9+0x0 2560x1440 fmt 19 images).
+- rt51 (build 143 = 141, LOOP_CAP ...,1:0x80000, COPY_SRC_SYNC=1 + TRACE, no PLACED_BUF_OVER_TEX; main session): STILL
+  LOST seconds into gameplay. Queue 4 now advances (max-signal 32), so the cs_22383ee2 cap works (Likely). New direct
+  checkpoint: top cs_27004ef4 (a 20-line loop-free clear = bystander), bottom cs_d8b54205 (= the dispatch in flight).
+  cs_d8b54205 is a culling kernel with barriers. Its one loop tests a point against planes s15 = 1 .. CB[0x1c4]
+  (plane i at CB 0x104 + 16 i, one s_buffer_load per iteration), so a garbage plane count means up to 2^32 iterations.
+  The per-invocation cap (2^19) does not save it: every wave of a many-group dispatch runs 2^19 iterations.
+  The "LOOP_CAP:" log stops after 64 lines (told < 64), so a missing name does NOT mean "not capped".
+- PATTERN (Plausible-Likely): every run that put NON-ZERO bytes into the CBV_PLACED CBs lost the device (rt42/43:
+  CBV_PLACED_ALIAS binds the oldest record; rt46/47/51: COPY_SRC_SYNC copies ring bytes in; rt51 CSS_TRACE
+  19 LANDED / 26 DIFFERENT / 8 ZERO). Both runs where those CBs stayed all zero (rt41, rt44) were clean: count 0 means
+  zero loop iterations. So the counts the CBs now carry are wrong (stale ring bytes, or the wrong ring offset/lap).
+- Envs (no new build): rt53 = rt51.env + LOOP_CAP=cs_d5613de2,cs_d94af257,cs_f33ac9e9,cs_d8b54205:0x100,
+  cs_22383ee2:0x4000,1:0x80000 (only those two modules recompile). rt54 = rt53.env with COPY_SRC_SYNC=0 and no TRACE
+  (A/B for the data trigger: expected clean like rt44).
