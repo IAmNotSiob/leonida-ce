@@ -2419,8 +2419,116 @@ bool xs_upload_3d_on() {
     static const bool on = [] { const char* e = std::getenv("LEONIDA_CE_UPLOAD_3D"); return e && e[0] == '1'; }();
     return on;
 }
+// agA40: the 30-frame refresh re-uploaded ~300-400 small placed textures per pass (rt52: ~23000 in the run, mostly 16x4
+// RGBA16F), each with its own upload buffer, allocator, list, fence and ExecuteCommandLists. With a batch, the detiled
+// bytes are kept in CPU memory and xs_upload_flush sends them all in one upload buffer and one submission.
+// LEONIDA_CE_REFRESH_BATCH=0 = one submission per texture (old).
+struct XsUploadItem {
+    ID3D12Resource* tex = nullptr;
+    std::vector<std::uint8_t> bytes;
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> fps;
+    UINT mips = 0, slices = 0, pc_mips = 0;
+};
+struct XsUploadBatch {
+    std::vector<XsUploadItem> items;
+    std::uint64_t bytes = 0;
+};
+struct XsUploadPending { ID3D12Fence* f; ID3D12GraphicsCommandList* l; ID3D12CommandAllocator* a; ID3D12Resource* u; };
+std::mutex g_upload_pend_mu;
+std::vector<XsUploadPending> g_upload_pend;
+// Keeps the objects until their fence completes, and releases the ones already done.
+void xs_upload_pend_add(ID3D12Fence* f, ID3D12GraphicsCommandList* l, ID3D12CommandAllocator* a, ID3D12Resource* u) {
+    std::lock_guard pl(g_upload_pend_mu);
+    g_upload_pend.push_back({f, l, a, u});
+    for (auto it = g_upload_pend.begin(); it != g_upload_pend.end();) {
+        if (it->f->GetCompletedValue() >= 1) {
+            it->f->Release(); it->l->Release(); it->a->Release(); it->u->Release();
+            it = g_upload_pend.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+void xs_upload_flush(ID3D12Device* dev, XsUploadBatch& b) {
+    std::vector<XsUploadItem> items;
+    items.swap(b.items);
+    b.bytes = 0;
+    ID3D12CommandQueue* queue = g_upload_queue.load();
+    if (items.empty() || !queue || !dev) return;
+    std::vector<UINT64> base(items.size());
+    UINT64 total = 0;
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        total = (total + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) & ~UINT64(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1);
+        base[i] = total;
+        total += items[i].bytes.size();
+    }
+    if (!total) return;
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = total;
+    bd.Height = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* up = nullptr;
+    ID3D12CommandAllocator* alloc = nullptr;
+    ID3D12GraphicsCommandList* list = nullptr;
+    ID3D12Fence* fence = nullptr;
+    const D3D12_COMMAND_LIST_TYPE type = queue->GetDesc().Type;
+    bool ok = SUCCEEDED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                     nullptr, __uuidof(ID3D12Resource), reinterpret_cast<void**>(&up))) &&
+              SUCCEEDED(dev->CreateCommandAllocator(type, __uuidof(ID3D12CommandAllocator), reinterpret_cast<void**>(&alloc))) &&
+              SUCCEEDED(dev->CreateCommandList(0, type, alloc, nullptr, __uuidof(ID3D12GraphicsCommandList),
+                                               reinterpret_cast<void**>(&list))) &&
+              SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&fence)));
+    void* mapped = nullptr;
+    if (ok && SUCCEEDED(up->Map(0, nullptr, &mapped)) && mapped) {
+        auto* dst_base = static_cast<std::uint8_t*>(mapped);
+        for (std::size_t i = 0; i < items.size(); ++i)
+            if (!items[i].bytes.empty()) std::memcpy(dst_base + base[i], items[i].bytes.data(), items[i].bytes.size());
+        up->Unmap(0, nullptr);
+        std::size_t copies = 0;
+        for (std::size_t i = 0; i < items.size(); ++i) {
+            const auto& it = items[i];
+            for (UINT sl = 0; sl < it.slices; ++sl)
+                for (UINT m = 0; m < it.mips; ++m) {
+                    const UINT sub = m + sl * it.pc_mips;
+                    if (sub >= it.fps.size()) continue;
+                    D3D12_TEXTURE_COPY_LOCATION dst{}, srcl{};
+                    dst.pResource = it.tex;
+                    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    dst.SubresourceIndex = sub;
+                    srcl.pResource = up;
+                    srcl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                    srcl.PlacedFootprint = it.fps[sub];
+                    srcl.PlacedFootprint.Offset += base[i];
+                    list->CopyTextureRegion(&dst, 0, 0, 0, &srcl, nullptr);
+                    ++copies;
+                }
+        }
+        list->Close();
+        ID3D12CommandList* lists[] = {list};
+        queue->ExecuteCommandLists(1, lists);
+        queue->Signal(fence, 1);
+        xs_upload_pend_add(fence, list, alloc, up);
+        fence = nullptr; list = nullptr; alloc = nullptr; up = nullptr;
+        static std::atomic<std::uint64_t> flushes{0};
+        const auto k = ++flushes;
+        if (k <= 4 || (k & (k - 1)) == 0)
+            std::fprintf(stderr, "[refresh] batch #%llu: %zu textures, %zu copies, %llu KiB in one submission\n",
+                         (unsigned long long)k, items.size(), copies, (unsigned long long)(total >> 10));
+    }
+    if (fence) fence->Release();
+    if (list) list->Release();
+    if (alloc) alloc->Release();
+    if (up) up->Release();
+}
+
 void xs_upload_placed_texture(ID3D12Device* dev, const D3D12_RESOURCE_DESC& console_desc, ID3D12Resource* tex,
-                              std::uint64_t va, bool force = false) {
+                              std::uint64_t va, bool force = false, XsUploadBatch* batch = nullptr) {
     ID3D12CommandQueue* queue = g_upload_queue.load();
     // agA31 (LEONIDA_CE_UPLOAD_3D=1, default off): TEXTURE3D too. Placed 3D textures never got their title bytes (rt33
     // DIAG_TEX: 64x64x32 / 64x64x64 noise volumes R16F / RGBA16F / R32_UINT; the intro shows full-scale 64-px noise).
@@ -2489,6 +2597,31 @@ void xs_upload_placed_texture(ID3D12Device* dev, const D3D12_RESOURCE_DESC& cons
     UINT64 total = 0;
     dev->GetCopyableFootprints(&rd, 0, static_cast<UINT>(fps.size()), 0, fps.data(), rows.data(), row_bytes.data(), &total);
     if (!total) return;
+    if (batch) {  // agA40: detile into CPU memory now, submit with the rest of the pass in xs_upload_flush
+        XsUploadItem item;
+        item.tex = tex;
+        item.bytes.resize(static_cast<std::size_t>(total));
+        item.mips = mips;
+        item.slices = slices;
+        item.pc_mips = pc_mips;
+        for (UINT s = 0; s < slices; ++s)
+            for (UINT m = 0; m < mips; ++m) {
+                const UINT sub = m + s * pc_mips;
+                const auto& fp = fps[sub];
+                const std::size_t row_pitch = fp.Footprint.RowPitch;
+                const std::size_t depth_pitch = row_pitch * rows[sub];
+                const std::size_t room = static_cast<std::size_t>(total - fp.Offset);
+                bool read_fault = false;
+                if (xs_detile_seh(lay, src, src_bytes, m, s, item.bytes.data() + fp.Offset, room, row_pitch, depth_pitch,
+                                  &read_fault) != leonida::xg::Error::Ok && read_fault)
+                    xs_note_title_read_fault(src);
+            }
+        item.fps = std::move(fps);
+        batch->bytes += total;
+        batch->items.push_back(std::move(item));
+        if (batch->bytes >= (64ull << 20)) xs_upload_flush(dev, *batch);
+        return;
+    }
 
     D3D12_HEAP_PROPERTIES hp{};
     hp.Type = D3D12_HEAP_TYPE_UPLOAD;
@@ -2557,20 +2690,8 @@ void xs_upload_placed_texture(ID3D12Device* dev, const D3D12_RESOURCE_DESC& cons
         if (wait_old) {
             for (int i = 0; i < 2000 && fence->GetCompletedValue() < 1; ++i) Sleep(1);
         } else {
-            struct Pending { ID3D12Fence* f; ID3D12GraphicsCommandList* l; ID3D12CommandAllocator* a; ID3D12Resource* u; };
-            static std::mutex pend_mu;
-            static std::vector<Pending> pend;
-            std::lock_guard pl(pend_mu);
-            pend.push_back({fence, list, alloc, up});
+            xs_upload_pend_add(fence, list, alloc, up);
             fence = nullptr; list = nullptr; alloc = nullptr; up = nullptr;
-            for (auto it = pend.begin(); it != pend.end();) {
-                if (it->f->GetCompletedValue() >= 1) {
-                    it->f->Release(); it->l->Release(); it->a->Release(); it->u->Release();
-                    it = pend.erase(it);
-                } else {
-                    ++it;
-                }
-            }
         }
         static std::atomic<int> n{0};
         const bool has_data = nz != 0;
@@ -3135,6 +3256,8 @@ void xs_refresh_placed_textures(ID3D12Device* dev) {
     QueryPerformanceFrequency(&rf_freq);
     QueryPerformanceCounter(&rf_t0);
     std::uint64_t rf_bytes = 0, rf_uploads = 0, rf_commits = 0;
+    static const bool batch_on = [] { const char* v = std::getenv("LEONIDA_CE_REFRESH_BATCH"); return !(v && v[0] == '0'); }();
+    XsUploadBatch batch;
     for (const auto& t : textures) {
         const std::uint64_t len = t.size;
         if (!len) continue;
@@ -3182,10 +3305,11 @@ void xs_refresh_placed_textures(ID3D12Device* dev) {
                              (unsigned long long)t.desc.Width, t.desc.Height, (int)t.desc.Format);
                 std::fflush(stderr);
             }
-            xs_upload_placed_texture(dev, t.desc, t.resource, t.va, true);
+            xs_upload_placed_texture(dev, t.desc, t.resource, t.va, true, batch_on ? &batch : nullptr);
             ++rf_uploads;
         }
     }
+    xs_upload_flush(dev, batch);  // agA40: the rest of the pass's uploads, one submission (textures still held)
     {
         LARGE_INTEGER rf_t1{};
         QueryPerformanceCounter(&rf_t1);
