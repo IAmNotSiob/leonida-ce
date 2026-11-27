@@ -2672,3 +2672,15 @@ Where it stands:
   DEFAULT staging ring (CSS_STAGE: lines); the forwarded copy is redirected to it (a3/a4 replaced after the [watch] lines).
   LEONIDA_CE_CSS_STAGE_AT=record fills the slot at record time. The trace prints "title since record: same / CHANGED".
   rt56 = 142 + rt56.env (rt51.env + CSS_STAGE_MB=64); rt58 = rt56.env + CSS_STAGE_AT=record. Requested from the main session.
+- rt52 (143, rt51.env warm): TAA CB correct again (CSS_TRACE 36 LANDED / 0 ZERO / 12 DIFFERENT; DRAW_PEEK 2560 1440 ...). VM shots
+  in gameplay: the whole frame is max 1/255. => The TAA constants were NOT the last cause of black. DEVICE LOST at 651 s.
+- UPSTREAM OF TAA (from the rt41/rt44 gameplay probes; CB-independent):
+  * target0 = 2560x1440 fmt 10 RGBA16F, the busiest target (SSSResolve / TiledLighting, sga_dr, TexturedUnlit, ptfx, ...) is
+    uniformly 0x7fff = FP16 NaN in EVERY probe (rt41 3750-5400, rt44 3600-4200) (Very likely). agA33's "target0 all zero" was the
+    .ppm view of NaN. NaN through the TAA / tonemap to UNORM gives black.
+  * Its inputs are empty (Likely): the 2560x1440 fmt 17 V-buffer (only HairStrandVBuffer draws listed) is zero, and so are the
+    TAA SRVs (fmt 19 depth/stencil views, fmt 29, 2304x576 fmt 54) and SSSResolve ud9+0xc0. No world-geometry pipelines appear in the
+    top-24 targets, so the world probably goes through a path that never lands (V-buffer by indirect / mesh / compute raster).
+  * NEXT for black: find the world V-buffer / depth writer and why it is skipped (rt44 rtdiag: pending-pso 867, variant-skip
+    462, no-target 4908 per 60 frames). Put an RTDIAG dump right after gameplay starts (DUMP_FROM ~3100, EVERY 60) so one
+    lands before a device loss.
