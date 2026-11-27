@@ -2374,12 +2374,30 @@ bool xs_copy_title_seh(void* dst, std::uint64_t va, std::uint64_t len) {
 bool xs_hash_title_seh(std::uint64_t va, std::uint64_t len, std::uint64_t stride, std::uint64_t* hash, std::uint64_t* nonzero) {
     // main session (rt45): the __try + memcpy loop did not catch a vanished title page (AV at 0xcc52fe000 in here,
     // same clang SEH problem as agA31 STANDIN_UPLOAD). Read through ReadProcessMemory in 4 KiB chunks on the stack.
+    // agA40 (LEONIDA_CE_REFRESH_CHUNK_KB, default 64; 0 = old: one 8-byte read per sample at strides >= 4 KiB): one
+    // ReadProcessMemory per chunk instead of one syscall per 4 KiB page. rt52/rt58/rt44 stalled >= 2 s on every 30th
+    // present from frame ~2040 (1253+ placed textures) = this pass. Same sampled words, so the same hash.
+    static const std::uint64_t chunk_bytes = [] {
+        const char* v = std::getenv("LEONIDA_CE_REFRESH_CHUNK_KB");
+        const std::uint64_t kb = v ? std::strtoull(v, nullptr, 10) : 64ull;
+        return kb ? std::min<std::uint64_t>(kb, 1024ull) * 1024ull : 4096ull;
+    }();
+    static const bool chunk_old = [] { const char* v = std::getenv("LEONIDA_CE_REFRESH_CHUNK_KB"); return v && v[0] == '0'; }();
     std::uint64_t h = *hash, nz = *nonzero;
-    alignas(8) std::uint8_t chunk[4096];
+    std::vector<std::uint8_t> heap_chunk;
+    alignas(8) std::uint8_t small_chunk[4096];
+    std::uint8_t* chunk = small_chunk;
+    std::uint64_t room = sizeof small_chunk;
+    if (chunk_bytes > room && (stride % 8) == 0 && (chunk_bytes % stride) == 0) {
+        heap_chunk.resize(chunk_bytes);
+        chunk = heap_chunk.data();
+        room = chunk_bytes;
+    }
     std::uint64_t o = 0;
     while (o + 8 <= len) {
-        // Read [o, o + n): the whole 4 KiB around the samples when the stride is small, else just the one word.
-        const std::uint64_t n = stride < sizeof chunk ? std::min<std::uint64_t>(sizeof chunk, len - o) & ~7ull : 8;
+        // Read [o, o + n): the whole chunk around the samples when the stride fits in it, else just the one word.
+        const bool whole = stride < room || (!chunk_old && stride <= room && room > 4096);
+        const std::uint64_t n = whole ? std::min<std::uint64_t>(room, len - o) & ~7ull : 8;
         SIZE_T got = 0;
         if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(va + o), chunk, static_cast<SIZE_T>(n), &got) || got != n)
             return false;
@@ -2390,7 +2408,7 @@ bool xs_hash_title_seh(std::uint64_t va, std::uint64_t len, std::uint64_t stride
             h = (h ^ w) * 1099511628211ull;
             nz |= w;
         }
-        o += stride < sizeof chunk ? i : stride;
+        o += whole ? i : stride;
     }
     *hash = h;
     *nonzero = nz;
@@ -3111,10 +3129,23 @@ void xs_refresh_placed_textures(ID3D12Device* dev) {
             std::fprintf(stderr, "[hack] REFRESH_CURRENT: pass %llu: %zu textures, %zu superseded skipped\n",
                          (unsigned long long)passes, textures.size(), skipped);
     }
+    // agA40: pass timing (LEONIDA_CE_REFRESH_LOG=1 logs every pass; otherwise powers of two and passes over 250 ms).
+    static const bool refresh_log = [] { const char* v = std::getenv("LEONIDA_CE_REFRESH_LOG"); return v && v[0] == '1'; }();
+    LARGE_INTEGER rf_freq{}, rf_t0{};
+    QueryPerformanceFrequency(&rf_freq);
+    QueryPerformanceCounter(&rf_t0);
+    std::uint64_t rf_bytes = 0, rf_uploads = 0, rf_commits = 0;
     for (const auto& t : textures) {
         const std::uint64_t len = t.size;
-        if (len) rt::xmem::commit_physical_range(reinterpret_cast<const void*>(t.va), len);  // XMem views commit on touch
-        if (!len || !xs_readable(reinterpret_cast<const void*>(t.va), static_cast<UINT_PTR>(len))) continue;
+        if (!len) continue;
+        // agA40: commit only when the range is not already committed and readable (commit_physical_range does a
+        // VirtualQuery per 64 KiB page; nearly every texture was committed on an earlier pass). Same result.
+        if (!xs_readable(reinterpret_cast<const void*>(t.va), static_cast<UINT_PTR>(len))) {
+            ++rf_commits;
+            rt::xmem::commit_physical_range(reinterpret_cast<const void*>(t.va), len);  // XMem views commit on touch
+            if (!xs_readable(reinterpret_cast<const void*>(t.va), static_cast<UINT_PTR>(len))) continue;
+        }
+        rf_bytes += len;
         std::uint64_t h = 1469598103934665603ull, nonzero = 0;
         // HACK (agA5): sampling 8 bytes per 4 KiB missed glyphs Scaleform adds to its glyph-cache textures (re3: most
         // body-text glyphs missing). Textures up to LEONIDA_CE_REFRESH_FULL_KB (default 4096) are hashed in full.
@@ -3152,6 +3183,20 @@ void xs_refresh_placed_textures(ID3D12Device* dev) {
                 std::fflush(stderr);
             }
             xs_upload_placed_texture(dev, t.desc, t.resource, t.va, true);
+            ++rf_uploads;
+        }
+    }
+    {
+        LARGE_INTEGER rf_t1{};
+        QueryPerformanceCounter(&rf_t1);
+        const double ms = rf_freq.QuadPart ? 1000.0 * double(rf_t1.QuadPart - rf_t0.QuadPart) / double(rf_freq.QuadPart) : 0.0;
+        static std::uint64_t rf_pass = 0, rf_slow = 0;
+        ++rf_pass;
+        if (refresh_log || (rf_pass & (rf_pass - 1)) == 0 || (ms > 250.0 && rf_slow++ < 200)) {
+            std::fprintf(stderr, "[refresh] pass %llu: %zu textures, %llu MiB, %llu commits, %llu uploads, %.1f ms\n",
+                         (unsigned long long)rf_pass, textures.size(), (unsigned long long)(rf_bytes >> 20),
+                         (unsigned long long)rf_commits, (unsigned long long)rf_uploads, ms);
+            std::fflush(stderr);
         }
     }
 }
