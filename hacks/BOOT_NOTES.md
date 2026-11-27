@@ -2988,3 +2988,19 @@ Measured from warm logs (rt52 build 143, rt58 build 142, rt44). rt59 was a cold 
   MIMG ops 36/39/47 (0xf09c0708 ...). After the first rejected word llvm-mc loses sync and the rest is garbage.
   Plausible: the console compiler uses s104..s107 (VCC aliases) as plain SGPRs. A translator fix = decode those words in
   tools/shader_disasm.py / rdna2spirv.py instead of relying on llvm-mc, with an SGPR file of 108.
+- Translation attempt of the 1144 (fspx_unpack 66bcf3d8e + rdna2spirv --wave64-emulate, 16 shards): 9 of 1144 translate
+  (/root/a43/spirv_new, NOT deployed). Failures: 934 fall-through into undecodable words, 90 CS thread-group-size SGPR,
+  26 s_bitreplicate on a lane mask, 23 ds_append, 20 branch into data, 9 cannot re-anchor, a few v_cmp / mask
+  destination and v_fma_mix field drops. Inputs kept: /root/a43/csnew (containers), /root/a43/fspx_new (unpacked + disasm).
+- STATE / HANDOFF (agA43, Very likely for the chain, not proven end to end):
+  world = mesh pipelines (fixed: built, drawn) -> their indirect args say 0 groups -> the GPU-driven count is not
+  produced -> no G-buffer, no depth -> TiledLighting has nothing -> black. Most likely the count writers (culling /
+  visibility compute: CPU writes [0 1 1], culling bumps x) are among the 1144 empty compute pipelines.
+  NEXT: (1) teach the disassembler path the rejected SMEM (sdata up to s107) / MIMG op 36/39/47 encodings and the other
+  translator gaps above, translate csnew, deploy to C:\zroot\root\leonida-work\shaders\spirv\fspx_game (back up index.json),
+  re-run with build 210 + rt211.env; (2) find which compute writes the mesh arg buffer (title 0xde226a000, stand-in
+  0xffde4f00 in rt211) - a DISPATCH_LOG / FRAME_TRACE on the scene frame (~13950) and check it against missing_cs.txt
+  (/root/a43/missing_cs.txt = the 1144 FSPX code hashes); (3) speed up mesh PSO creation (0->1 at ~500 s).
+  Hacks in the recommended env: FRAME_CLEAR=f16 (hides carried-over NaN, clears RGBA16F >= 1280 wide at first draw),
+  SKIP_CS=cs_8513f5a0 (A42: it writes NaN over target0), SKIP_GFX=DistantWindowEmissives, LOOP_CAP / LOOP_CAP_GFX,
+  INDIRECT_CLAMP (from rt103.env). MESH_FORCE_X must stay off.
