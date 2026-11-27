@@ -6302,8 +6302,32 @@ public:
                 job->self = this;
                 job->event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
                 job->placeholder = true;
+                // agA46 LEONIDA_CE_LAZY_NOOPT=1: VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT for these (NVIDIA takes
+                // ~8 min per 3-5 MB module with optimisation).
+                static const bool noopt = [] { const char* e = std::getenv("LEONIDA_CE_LAZY_NOOPT"); return e && e[0] == '1'; }();
+                if (noopt) job->info.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
                 async_job_ = job;
                 lazy_job_ = job;
+                // agA46 LEONIDA_CE_LAZY_PREWARM=<file>: names (one per line, substrings) whose lazy compile starts at
+                // creation (during the boot), not at first bind. The list is the "LAZY_CS first bind" names of a run.
+                static const std::vector<std::string> prewarm = [] {
+                    std::vector<std::string> v;
+                    if (const char* f = std::getenv("LEONIDA_CE_LAZY_PREWARM")) {
+                        if (FILE* fp = std::fopen(f, "r")) {
+                            char line[512];
+                            while (std::fgets(line, sizeof line, fp)) {
+                                std::string t(line);
+                                while (!t.empty() && (t.back() == '\n' || t.back() == '\r' || t.back() == ' ')) t.pop_back();
+                                if (!t.empty()) v.push_back(t);
+                            }
+                            std::fclose(fp);
+                        }
+                        std::fprintf(stderr, "[hack] LAZY_PREWARM: %zu names from %s\n", v.size(), f);
+                    }
+                    return v;
+                }();
+                for (const std::string& n : prewarm)
+                    if (entry->name.find(n) != std::string::npos) { kick_lazy(); break; }
                 goto compiled;
             }
             if (why == 1 || why == 3)
@@ -6545,6 +6569,12 @@ public:
     void kick_lazy() const {
         if (!lazy_job_ || lazy_kicked_.exchange(true)) return;
         static std::atomic<int> kicked{0};
+        if (kicked.load() == 0) {  // agA46 LEONIDA_CE_LAZY_TRACE=N: FRAME_TRACE_AUTO traces the frame N after the first lazy bind
+            static const long tr = [] { const char* e = std::getenv("LEONIDA_CE_LAZY_TRACE"); return e ? std::strtol(e, nullptr, 0) : -1L; }();
+            if (tr >= 0)
+                leonida::ce::auto_trace_frame().store(leonida::ce::present_frame().load(std::memory_order_relaxed) + std::uint64_t(tr),
+                                                      std::memory_order_relaxed);
+        }
         std::fprintf(stderr, "[hack] LAZY_CS first bind #%d %s frame %llu\n", ++kicked, lazy_job_->name.c_str(),
                      (unsigned long long)leonida::ce::present_frame().load(std::memory_order_relaxed));
         std::fflush(stderr);

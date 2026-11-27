@@ -1675,6 +1675,7 @@ int main(int argc, char** argv) {
                         cpi.layout = layout_for(meta);
                     }
                     cpi.flags = capture;
+                    if (std::getenv("VKPC_NOOPT")) cpi.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;  // agA46
                     // Only whole-pipeline feedback is reported.
                     VkPipelineCreationFeedback fb{};
                     VkPipelineCreationFeedbackCreateInfo fci{
