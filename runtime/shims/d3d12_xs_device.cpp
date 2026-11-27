@@ -325,6 +325,41 @@ void xs_pso_load() {
     std::fprintf(stderr, "[hack] pso map: %zu shaders\n", g_pso_map.size());
     std::fflush(stderr);
 }
+// agA39: a pixel shader's outputs from its DXBC output signature (OSG1 / OSGN / OSG5): the number of render targets
+// (highest SV_Target register + 1) and whether it writes depth (SV_Depth, SV_DepthGreaterEqual, SV_DepthLessEqual).
+struct XsPsOutputs { unsigned targets = 0; bool depth = false; bool ok = false; };
+XsPsOutputs xs_ps_outputs(const std::vector<std::uint8_t>& d) {
+    XsPsOutputs r;
+    const auto u32 = [&d](std::size_t at, std::uint32_t& v) {
+        if (at + 4 > d.size()) return false;
+        std::memcpy(&v, d.data() + at, 4);
+        return true;
+    };
+    std::uint32_t chunks = 0;
+    if (d.size() < 32 || std::memcmp(d.data(), "DXBC", 4) != 0 || !u32(28, chunks) || chunks > 64) return r;
+    for (std::uint32_t i = 0; i < chunks; ++i) {
+        std::uint32_t o = 0;
+        if (!u32(32 + 4 * i, o) || o + 16 > d.size()) return r;
+        const char* fcc = reinterpret_cast<const char*>(d.data() + o);
+        std::size_t es = 0, pre = 0;
+        if (!std::memcmp(fcc, "OSG1", 4)) { es = 32; pre = 4; }
+        else if (!std::memcmp(fcc, "OSG5", 4)) { es = 28; pre = 4; }
+        else if (!std::memcmp(fcc, "OSGN", 4)) { es = 24; pre = 0; }
+        else continue;
+        const std::size_t base = o + 8;
+        std::uint32_t count = 0, first = 0;
+        if (!u32(base, count) || !u32(base + 4, first) || count > 64) return r;
+        for (std::uint32_t k = 0; k < count; ++k) {
+            const std::size_t e = base + first + k * es + pre;
+            std::uint32_t sysval = 0, reg = 0;
+            if (!u32(e + 8, sysval) || !u32(e + 16, reg)) return r;
+            if (sysval == 64 && reg < 8) r.targets = std::max(r.targets, reg + 1);
+            if (sysval == 65 || sysval == 66 || sysval == 67) r.depth = true;
+        }
+        r.ok = true;
+    }
+    return r;
+}
 void xs_pso_want(const std::string& hex) {
     if (!g_pso_wanted.insert(hex).second) return;
     HANDLE h = CreateFileW(ce_data_path(L"leonida-psowant.txt").c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, 0, nullptr);
@@ -6199,6 +6234,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                     b.BlendOpAlpha = D3D12_BLEND_OP_ADD;
                 }
                 char psostate[64] = "";
+                UINT ce_rts = 1;  // agA39 PSO_MRT
                 // HACK (agA4, LEONIDA_CE_PSO_BLEND, default on, =0 off): blob #0 of the console record (0x17c/0x184 bytes)
                 // carries GCN context registers at fixed offsets. +0xd0..+0xef = CB_BLEND0..7_CONTROL (0x80000000 =
                 // blend off + DISABLE_ROP3; 0xe5040504 = SRC_ALPHA/INV_SRC_ALPHA, separate alpha, enable), +0xcc =
@@ -6267,6 +6303,82 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                         }
                         if (pso_blend && ok) g.BlendState.RenderTarget[0] = d;
                         if (pso_wmask) g.BlendState.RenderTarget[0].RenderTargetWriteMask = static_cast<UINT8>(tmask & 0xf);
+                        // agA39 LEONIDA_CE_PSO_MRT=1: as many render targets as the pixel shader declares SV_Target registers
+                        // (G-buffer passes write 3+; one RGBA8 slot dropped the rest). Each takes its CB_TARGET_MASK nibble
+                        // and its CB_BLENDi_CONTROL; the formats are fixed by RT_RETARGET at the draw.
+                        static const bool pso_mrt = [] { const char* v = std::getenv("LEONIDA_CE_PSO_MRT"); return v && *v == '1'; }();
+                        if (pso_mrt && ps) {
+                            const XsPsOutputs po = xs_ps_outputs(ps->dxbc);
+                            if (po.ok && po.targets > 1) {
+                                ce_rts = po.targets;
+                                g.BlendState.IndependentBlendEnable = TRUE;
+                                for (unsigned i = 1; i < ce_rts; ++i) {
+                                    D3D12_RENDER_TARGET_BLEND_DESC bi{};
+                                    bi.SrcBlend = bi.SrcBlendAlpha = D3D12_BLEND_ONE;
+                                    bi.DestBlend = bi.DestBlendAlpha = D3D12_BLEND_ZERO;
+                                    bi.BlendOp = bi.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+                                    bi.LogicOp = D3D12_LOGIC_OP_NOOP;
+                                    const std::uint32_t ci = cb[i];
+                                    bool oki = true;
+                                    if (ci & (1u << 30)) {
+                                        bi.BlendEnable = TRUE;
+                                        bi.SrcBlend = fac(ci & 31, oki);
+                                        bi.BlendOp = op((ci >> 5) & 7, oki);
+                                        bi.DestBlend = fac((ci >> 8) & 31, oki);
+                                        if (ci & (1u << 29)) {
+                                            bi.SrcBlendAlpha = fac((ci >> 16) & 31, oki);
+                                            bi.BlendOpAlpha = op((ci >> 21) & 7, oki);
+                                            bi.DestBlendAlpha = fac((ci >> 24) & 31, oki);
+                                        } else {
+                                            bi.SrcBlendAlpha = bi.SrcBlend; bi.BlendOpAlpha = bi.BlendOp; bi.DestBlendAlpha = bi.DestBlend;
+                                        }
+                                        const auto amap = [](D3D12_BLEND& f) {
+                                            if (f == D3D12_BLEND_SRC_COLOR) f = D3D12_BLEND_SRC_ALPHA;
+                                            else if (f == D3D12_BLEND_INV_SRC_COLOR) f = D3D12_BLEND_INV_SRC_ALPHA;
+                                            else if (f == D3D12_BLEND_DEST_COLOR) f = D3D12_BLEND_DEST_ALPHA;
+                                            else if (f == D3D12_BLEND_INV_DEST_COLOR) f = D3D12_BLEND_INV_DEST_ALPHA;
+                                            else if (f == D3D12_BLEND_SRC1_COLOR) f = D3D12_BLEND_SRC1_ALPHA;
+                                            else if (f == D3D12_BLEND_INV_SRC1_COLOR) f = D3D12_BLEND_INV_SRC1_ALPHA;
+                                            else if (f == D3D12_BLEND_BLEND_FACTOR) f = D3D12_BLEND_ALPHA_FACTOR;
+                                            else if (f == D3D12_BLEND_INV_BLEND_FACTOR) f = D3D12_BLEND_INV_ALPHA_FACTOR;
+                                        };
+                                        amap(bi.SrcBlendAlpha); amap(bi.DestBlendAlpha);
+                                    }
+                                    if (!pso_blend || !oki) bi.BlendEnable = FALSE;
+                                    bi.RenderTargetWriteMask = static_cast<UINT8>(pso_wmask ? (tmask >> (4 * i)) & 0xf : 0xf);
+                                    g.BlendState.RenderTarget[i] = bi;
+                                }
+                            }
+                        }
+                        // agA39 LEONIDA_CE_PSO_DEPTH=1: depth state from blob #0 +0x3c (Plausible: bit 1 = depth test, bit 2 =
+                        // depth write; 0x10 off, 0x12 test, 0x14 write) and from the PS (SV_Depth: write); compare op from
+                        // LEONIDA_CE_PSO_DEPTH_FUNC (ge default = reversed Z; le, gt, lt, always). =2: test + write on every
+                        // pipeline (bisect knob). The DSV format follows the depth buffer a draw binds (replay variant).
+                        static const int pso_depth = [] { const char* v = std::getenv("LEONIDA_CE_PSO_DEPTH"); return v ? std::atoi(v) : 0; }();
+                        if (pso_depth) {
+                            static const D3D12_COMPARISON_FUNC zfunc = [] {
+                                const char* v = std::getenv("LEONIDA_CE_PSO_DEPTH_FUNC");
+                                const std::string f = v ? v : "ge";
+                                return f == "le" ? D3D12_COMPARISON_FUNC_LESS_EQUAL : f == "gt" ? D3D12_COMPARISON_FUNC_GREATER
+                                     : f == "lt" ? D3D12_COMPARISON_FUNC_LESS : f == "always" ? D3D12_COMPARISON_FUNC_ALWAYS
+                                     : D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+                            }();
+                            const bool ps_depth = ps && xs_ps_outputs(ps->dxbc).depth;
+                            const bool test = pso_depth == 2 || (dbc & 2) != 0;
+                            const bool write = pso_depth == 2 || (dbc & 4) != 0 || ps_depth;
+                            if (test || write) {
+                                g.DepthStencilState.DepthEnable = TRUE;
+                                g.DepthStencilState.DepthWriteMask = write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+                                g.DepthStencilState.DepthFunc = test ? zfunc : D3D12_COMPARISON_FUNC_ALWAYS;
+                                const D3D12_DEPTH_STENCILOP_DESC keep{D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
+                                                                      D3D12_COMPARISON_FUNC_ALWAYS};
+                                g.DepthStencilState.FrontFace = g.DepthStencilState.BackFace = keep;
+                                static std::atomic<int> told_depth{0};
+                                if (told_depth++ < 24)
+                                    std::fprintf(stderr, "[hack] PSO_DEPTH: %s + %s db %x ps-depth %d -> test %d write %d func %d\n", vs->name.c_str(),
+                                                 ps ? ps->name.c_str() : "(no PS)", dbc, int(ps_depth), int(test), int(write), int(g.DepthStencilState.DepthFunc));
+                            }
+                        }
                         std::snprintf(psostate, sizeof(psostate), " [cb0 %08x tm %x db %x]", cb[0], tmask & 0xf, dbc);
                         // agA39 LEONIDA_CE_PSO_STATE_LOG=<file>: every distinct (shader pair, blob #0) as one text line
                         // "<vs> + <ps> | <len> | <blob #0 as hex dwords>", for decoding the depth/stencil/MRT state offline.
@@ -6316,8 +6428,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                 g.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
                 g.RasterizerState.DepthClipEnable = TRUE;
                 g.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-                g.NumRenderTargets = 1;
-                g.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+                g.NumRenderTargets = ce_rts;  // agA39 PSO_MRT (1 without it)
+                for (UINT i = 0; i < ce_rts; ++i) g.RTVFormats[i] = DXGI_FORMAT_R8G8B8A8_UNORM;
                 g.SampleDesc.Count = 1;
                 hr = self->real->CreateGraphicsPipelineState(&g, *riid, out);
                 if (SUCCEEDED(hr) && out && *out && !g_placeholder_pso.load()) {

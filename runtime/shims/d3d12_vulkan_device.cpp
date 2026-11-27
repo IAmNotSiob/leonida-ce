@@ -6079,6 +6079,12 @@ public:
             }
         recipe_.sample_mask = sample_mask;
         recipe_.depth = depth;
+        {   // agA39 LEONIDA_CE_PSO_DEPTH=1: depth/stencil state without a DSV format (the console PSO translation) follows the
+            // depth buffer a draw binds, through a variant with that buffer's format.
+            static const bool pso_depth = [] { const char* e = std::getenv("LEONIDA_CE_PSO_DEPTH"); return e && e[0] && e[0] != '0'; }();
+            graphics_.ce_depth_any = pso_depth && desc.DSVFormat == DXGI_FORMAT_UNKNOWN &&
+                                     (desc.DepthStencilState.DepthEnable || desc.DepthStencilState.StencilEnable);
+        }
         recipe_.blends = std::move(blends);
         recipe_.blend = blend;
         // agA38: LEONIDA_CE_PSO_RECORD / _PREBAKE: the description as a record. A prebake object stops here.
@@ -6571,6 +6577,13 @@ private:
             rendering.depthAttachmentFormat = graphics_.depth_format;
         if (depth_bound && (graphics_.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT))
             rendering.stencilAttachmentFormat = graphics_.depth_format;
+        // agA39 LEONIDA_CE_PSO_DEPTH: variant key bits 16..31 = the bound depth buffer's format (PSO without a DSV format)
+        if (const VkFormat ce_depth = VkFormat(unbound >> 16); ce_depth != VK_FORMAT_UNDEFINED && !graphics_.depth_format) {
+            if (ce_depth != VK_FORMAT_S8_UINT) rendering.depthAttachmentFormat = ce_depth;
+            if (ce_depth == VK_FORMAT_S8_UINT || ce_depth == VK_FORMAT_D16_UNORM_S8_UINT || ce_depth == VK_FORMAT_D24_UNORM_S8_UINT ||
+                ce_depth == VK_FORMAT_D32_SFLOAT_S8_UINT)
+                rendering.stencilAttachmentFormat = ce_depth;
+        }
 
         VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
         VkPipelineVertexInputDivisorStateCreateInfoEXT divisor_state{

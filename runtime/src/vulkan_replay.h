@@ -842,6 +842,9 @@ struct GraphicsPipeline {
     std::function<VkPipeline(std::uint32_t unbound, const VkFormat* formats)> retarget;
     std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
     bool ce_skip = false;       // agA37 LEONIDA_CE_SKIP_GFX: a stage name matched; every draw is left out
+    // agA39 LEONIDA_CE_PSO_DEPTH: the PSO has depth/stencil state but no DSV format (the console PSO names none). A draw
+    // that binds a depth buffer takes a variant with the buffer's format (variant key bits 16..31 = that VkFormat).
+    bool ce_depth_any = false;
 };
 
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
@@ -2620,6 +2623,23 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         if (!a.view) return ReplayResult::unsupported;
         shrink(a.binding, draw.depth, a.range);
     }
+    VkFormat ce_depth_format = VK_FORMAT_UNDEFINED;  // agA39 LEONIDA_CE_PSO_DEPTH
+    if (draw.depth.resource && pipeline->depth_format == VK_FORMAT_UNDEFINED && pipeline->ce_depth_any) {
+        if (const ResourceBinding* binding = resolve(draw.depth.resource);
+            binding && binding->image && (binding->aspects & depth_stencil_aspects) && binding->samples == pipeline->samples) {
+            auto& a = p.depth;
+            a.binding = *binding;
+            a.id = draw.depth.resource;
+            if (view_range(a.binding, draw.depth, a.binding.aspects, a.range)) {
+                a.view = vk.image_view(a.binding, a.range);
+                if (a.view) {
+                    shrink(a.binding, draw.depth, a.range);
+                    ce_depth_format = a.binding.format;
+                }
+            }
+            if (!ce_depth_format) p.depth = {};
+        }
+    }
     if (p.area.width == UINT32_MAX) {  // no attachment: the viewport bounds the rendering
         p.area = {std::uint32_t(std::max(0.0f, draw.viewport.x + draw.viewport.width)),
                   std::uint32_t(std::max(0.0f, draw.viewport.y + draw.viewport.height))};
@@ -2632,6 +2652,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     for (std::size_t slot = 0; slot < p.colors.size(); ++slot)
         if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED && !p.colors[slot].id) unbound |= 1u << slot;
     if (pipeline->depth_format != VK_FORMAT_UNDEFINED && !p.depth.id) unbound |= GraphicsPipeline::unbound_depth;
+    if (ce_depth_format) unbound |= std::uint32_t(ce_depth_format) << 16;  // agA39 PSO_DEPTH: the variant's depth format
     if (unbound || retargeted) {
         if (retargeted)
             p.pipeline = pipeline->retarget(unbound, retarget_formats.data());
@@ -5623,8 +5644,11 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             rendering.colorAttachmentCount = std::uint32_t(d.colors.size());
             rendering.pColorAttachments = colors.data();
             const GraphicsPipeline& graphics = *d.graphics;
-            if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) rendering.pDepthAttachment = &depth;
-            if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) rendering.pStencilAttachment = &depth;
+            // agA39 PSO_DEPTH: a pipeline without a DSV format renders into the bound buffer's aspects (its variant has its format)
+            const VkImageAspectFlags depth_aspects = graphics.depth_aspects
+                ? graphics.depth_aspects : (d.depth.binding.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT));
+            if (d.depth.id && (depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) rendering.pDepthAttachment = &depth;
+            if (d.depth.id && (depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) rendering.pStencilAttachment = &depth;
             vk.begin_rendering(command_buffer, &rendering);
 
             ShaderUserData data{};
