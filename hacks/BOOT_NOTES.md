@@ -2694,3 +2694,18 @@ Where it stands:
   (the .sum CHANGED count matches other lines). TAA CB correct. DEVICE LOST ~frame 3100 anyway (direct: DistantWindowEmissives,
   compute: cs_c5b1005e, queue 4 sem UINT64_MAX), so the lap aliasing is not the (only) loss cause. Shots s09/s10 = Windows desktop
   after the crash, not a picture. Last logged INDIRECT_SRC args still [3 0 0 0 0] (logging capped early; inconclusive).
+- agA37 rt52 (cap 1:0x80000; main session): lost at 651 s. Direct checkpoint cs_56009f29 (screen-space image kernel,
+  LOOP-FREE), compute top cs_c5b1005e (43 lines, loop-free bystander). LIST_TIME before the loss: one list (cs_c63f7a7c
+  x5, cs_35a0bae6 x5, HeatHaze, all loop-free blurs) took 36 s and then 52 s of GPU time (rt41/rt44 max ~0.12 s, rt51
+  1.7 s). Reading (Plausible): async compute waves stuck in capped-but-long loops (2^19 iterations each) hold the SMs, so
+  direct-queue work crawls until a TDR. 2^19 per invocation is too high a cap.
+- Static census (census2.py: backward branches whose exit compare is a scalar int compare): fspx_game compute 4232
+  constant-bound (only 14 x 10000 and 3 x 65535 above 8192, i.e. safety guards) vs 13309 bound by an SGPR (CB/buffer data);
+  graphics 17822 constant-bound (48 x 9999 + 4 x 65535 above 4096) vs 15401 SGPR-bound. So a low cap truncates
+  almost no constant-bound loop; data-bound loops cannot be measured offline.
+- Build 145 (39528ead1): LOOP_CAP_GFX takes "pattern:N" items too. rt59.env = rt58.env + LOOP_CAP=...,cs_d8b54205:0x100,
+  1:0x2000 + LOOP_CAP_GFX=PS_MIRROR_PBR,HairStrand,1:0x400 + DISPATCH_LOG=1. Offline: graphics sample 2237/2650 capped,
+  spirv-val clean. Cold compile of everything once.
+- Existing generic knobs, not used in recent envs: LEONIDA_CE_INDIRECT_CLAMP=1 (GPU pass zeroes indirect dispatch records
+  with a dimension > INDIRECT_CLAMP_MAX, default 65535) and DISPATCH_MAX=N (skip CPU dispatches over N groups). Candidates
+  if loop-free hangs remain.
