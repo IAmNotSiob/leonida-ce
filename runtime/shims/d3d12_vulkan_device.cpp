@@ -8934,6 +8934,9 @@ public:
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: kind = leonida::IndirectKind::draw; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: kind = leonida::IndirectKind::draw_indexed; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: kind = leonida::IndirectKind::dispatch; break;
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH:  // agA43
+            if (!state_.info.mesh_shader || !state_.context->vk.vkCmdDrawMeshTasksIndirectCountEXT) return E_NOTIMPL;
+            kind = leonida::IndirectKind::mesh; break;
         default: return E_NOTIMPL;
         }
         return create_command_signature(kind, desc->ByteStride, riid, out, identity());

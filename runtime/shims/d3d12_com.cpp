@@ -885,6 +885,7 @@ public:
                 kind == leonida::IndirectKind::draw ? sizeof(D3D12_DRAW_ARGUMENTS)
                 : kind == leonida::IndirectKind::draw_indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS)
                 : kind == leonida::IndirectKind::dispatch ? sizeof(D3D12_DISPATCH_ARGUMENTS)
+                : kind == leonida::IndirectKind::mesh ? sizeof(D3D12_DISPATCH_MESH_ARGUMENTS)
                 : 0;
             if (!record_size || stride < record_size || stride % 4 != 0)
                 return check(false);
@@ -918,6 +919,24 @@ public:
         // rendering scope and no graphics pipeline/root arguments bound (each Draw opens and closes its own scope), so
         // the draw ran outside vkCmdBeginRendering with whatever (compute) pipeline was bound. Record it as a Draw
         // carrying the indirect buffer instead; replay emits the indirect call inside the draw's own scope.
+        if (kind == leonida::IndirectKind::mesh) {  // agA43: an indirect DispatchMesh, recorded as a mesh Draw (see DispatchMesh)
+            if (!max_command_count) return;
+            if (!graphics_pipeline_ || !graphics_.layout) return check(false);
+            if (unfit(graphics_)) return;
+            if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
+            leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, {}, 0, viewport_,
+                               scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, 1, 1, 1, 0, 0};
+            draw.mesh = true;
+            draw.ind_buffer = cmd.argument_buffer;
+            draw.ind_offset = cmd.argument_offset;
+            draw.ind_max = cmd.max_count;
+            draw.ind_stride = cmd.stride;
+            draw.ind_count_buffer = cmd.count_buffer;
+            draw.ind_count_offset = cmd.count_offset;
+            draw.ind_title_va = cmd.title_va;
+            check(list_.draw(std::move(draw)));
+            return;
+        }
         static const bool ind_draw = [] { const char* e = std::getenv("LEONIDA_CE_INDIRECT_DRAW"); return !e || e[0] != '0'; }();
         if (ind_draw && kind != leonida::IndirectKind::dispatch) {
             if (!max_command_count) return;

@@ -926,6 +926,8 @@ struct ReplayFunctions {
     PFN_vkCmdSetBlendConstants set_blend_constants = nullptr;
     PFN_vkCmdDraw draw = nullptr;
     PFN_vkCmdDrawMeshTasksEXT draw_mesh_tasks = nullptr;  // VK_EXT_mesh_shader; null: mesh draws are unsupported
+    PFN_vkCmdDrawMeshTasksIndirectEXT draw_mesh_tasks_indirect = nullptr;  // agA43 indirect DISPATCH_MESH
+    PFN_vkCmdDrawMeshTasksIndirectCountEXT draw_mesh_tasks_indirect_count = nullptr;
     PFN_vkCmdDrawIndexed draw_indexed = nullptr;
     std::function<const GraphicsPipeline*(std::uintptr_t)> graphics_pipeline;
     // The buffer and offset a console VA range starts in (from ResourceBinding::va), false when none does. `size` is
@@ -2546,7 +2548,15 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         return ReplayResult::unsupported;
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
     if (!pipeline || (!pipeline->pipeline && !pipeline->variant)) { static bool told_ = false; if (!told_) { told_ = true; std::fprintf(stderr, "[hack] replay: unresolved resource at vulkan_replay.h:%d\n", __LINE__); } return ReplayResult::unresolved_resource; }
-    if (pipeline->mesh != draw.mesh) return ReplayResult::invalid_draw;
+    if (pipeline->mesh != draw.mesh) {
+        // HACK (agA43): a mesh draw with a non-mesh pipeline (the titles mesh PSOs get slot 57s placeholder) or the
+        // reverse: leave this draw out instead of failing the whole list.
+        static std::atomic<std::uint64_t> told{0};
+        const std::uint64_t k = ++told;
+        if ((k & (k - 1)) == 0) { std::fprintf(stderr, "[hack] MESH_MISMATCH: %llu draws left out (draw mesh %d, pipeline mesh %d)\n", (unsigned long long)k, int(draw.mesh), int(pipeline->mesh)); std::fflush(stderr); }
+        p.skip = true;
+        return ReplayResult::success;
+    }
     if (draw.mesh && !vk.draw_mesh_tasks) return ReplayResult::unsupported;
     if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
     if (pipeline->color_formats.size() > max_render_targets) return ReplayResult::unsupported;
@@ -4518,7 +4528,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
             if (draw->ind_buffer && !prepared_draw.skip) {  // agA19 LEONIDA_CE_INDIRECT_DRAW
                 const ResourceBinding* ab = resolve(draw->ind_buffer);
-                const VkDeviceSize rec = draw->indexed ? 20 : 16;
+                const VkDeviceSize rec = draw->mesh ? 12 : draw->indexed ? 20 : 16;  // agA43 mesh
                 const VkDeviceSize bytes = VkDeviceSize(draw->ind_max - 1) * draw->ind_stride + rec;
                 const ResourceBinding* cb = draw->ind_count_buffer ? resolve(draw->ind_count_buffer) : nullptr;
                 static std::atomic<int> told_ind{0};
@@ -5783,7 +5793,12 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                         &d.vertex_sizes[slot], &d.vertex_strides[slot]);
             }
             ::leonida::ce::checkpoint(command_buffer, reinterpret_cast<std::uint64_t>(d.pipeline));
-            if (d.ind_buffer) {  // agA19 LEONIDA_CE_INDIRECT_DRAW
+            if (d.ind_buffer && draw->mesh) {  // agA43 indirect DISPATCH_MESH
+                if (d.cnt_buffer && vk.draw_mesh_tasks_indirect_count)
+                    vk.draw_mesh_tasks_indirect_count(command_buffer, d.ind_buffer, d.ind_offset, d.cnt_buffer, d.cnt_offset, draw->ind_max, draw->ind_stride);
+                else if (!d.cnt_buffer && vk.draw_mesh_tasks_indirect)
+                    vk.draw_mesh_tasks_indirect(command_buffer, d.ind_buffer, d.ind_offset, draw->ind_max, draw->ind_stride);
+            } else if (d.ind_buffer) {  // agA19 LEONIDA_CE_INDIRECT_DRAW
                 if (draw->indexed) vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
                 if (d.cnt_buffer) {
                     if (draw->indexed) vk.draw_indexed_indirect_count(command_buffer, d.ind_buffer, d.ind_offset, d.cnt_buffer, d.cnt_offset, draw->ind_max, draw->ind_stride);

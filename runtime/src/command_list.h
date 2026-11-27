@@ -599,6 +599,7 @@ enum class IndirectKind : std::uint8_t {
     draw = 0,
     draw_indexed = 1,
     dispatch = 2,
+    mesh = 3,  // agA43: DISPATCH_MESH (recorded as a mesh Draw carrying the indirect buffer)
 };
 
 struct ExecuteIndirect {

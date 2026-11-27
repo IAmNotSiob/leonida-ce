@@ -6297,7 +6297,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             std::memcpy(args, desc->pArgumentDescs, sizeof(args[0]) * desc->NumArgumentDescs);
             D3D12_COMMAND_SIGNATURE_DESC d2 = *desc;
             d2.pArgumentDescs = args;
-            for (auto replacement : {D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH, D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH}) {
+            for (auto replacement : {D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH}) {  // agA43: was DISPATCH_MESH first
                 for (UINT i = 0; i < d2.NumArgumentDescs; ++i)
                     if (static_cast<int>(desc->pArgumentDescs[i].Type) >= 100 || desc->pArgumentDescs[i].Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH) {
                         std::memset(&args[i], 0, sizeof(args[i]));
@@ -6594,21 +6594,47 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             const XsPsoShader* vs = nullptr;
             const XsPsoShader* ps = nullptr;
             bool missing = false;
-            for (int i = 0; i < 6; ++i) {
+            // agA43: the record holds 8 (ptr, size) pairs; #6 is the geometry (mesh) stage code of NGG pipelines
+            // (rt206 dump: PS_DeferredTextured records = #2 PS code, #3 its table, #6 0x9c0 code, #7 its table).
+            for (int i = 0; i < 8; ++i) {
                 const auto* ptr = reinterpret_cast<const std::uint8_t*>(w[1 + 2 * i]);
                 const std::uint64_t len = w[2 + 2 * i];
-                if (!ptr || len < 64 || (i != 2 && i != 4)) continue;  // code blobs are #2 and #4
+                if (!ptr || len < 64 || (i != 2 && i != 4)) continue;  // code blobs are #2 and #4 (#6: below)
                 const std::string hex = xs_hex24(ptr);
                 auto it = g_pso_map.find(hex);
                 if (it == g_pso_map.end()) { xs_pso_want(hex); missing = true; continue; }
                 if (it->second.stage == "vs") vs = &it->second;
                 else if (it->second.stage == "ps") ps = &it->second;
+                else if (it->second.stage == "ms" && !vs) vs = &it->second;  // agA43
             }
+            if (!missing && !vs && w[13] && w[14] >= 64 && w[14] < (1u << 24) &&
+                xs_readable(reinterpret_cast<const void*>(w[13]), 24)) {  // agA43: blob #6 = the NGG/mesh geometry code
+                const std::string hex = xs_hex24(reinterpret_cast<const void*>(w[13]));
+                auto it = g_pso_map.find(hex);
+                if (it == g_pso_map.end()) { xs_pso_want(hex); missing = true; }
+                else if (it->second.stage == "ms" || it->second.stage == "vs") vs = &it->second;
+            }
+            // agA43 (mesh pipelines): a record with no vertex stage in #2/#4 may carry a mesh shader in another blob.
+            // Look the other blobs up (stage "ms"); unknown headers go to the want list for psomatch.
+            if (!missing && !vs) {
+                for (int i = 0; i < 8; ++i) {
+                    const auto* ptr = reinterpret_cast<const std::uint8_t*>(w[1 + 2 * i]);
+                    const std::uint64_t len = w[2 + 2 * i];
+                    if (!ptr || len < 64 || len > (1u << 24) || i == 2 || i == 4 || i == 6 || !xs_readable(ptr, 24)) continue;
+                    const std::string hex = xs_hex24(ptr);
+                    auto it = g_pso_map.find(hex);
+                    if (it == g_pso_map.end()) continue;  // (not wanted: these are data blobs)
+                    if (it->second.stage == "ms") { vs = &it->second; break; }
+                }
+            }
+            const bool ce_mesh = vs && vs->stage == "ms";  // agA43
             if (!missing && vs) {
                 D3D12_GRAPHICS_PIPELINE_STATE_DESC g{};
                 g.pRootSignature = reinterpret_cast<ID3D12RootSignature*>(w[0]);
-                g.VS = {vs->dxbc.data(), vs->dxbc.size()};
-                g.InputLayout = {vs->elements.data(), static_cast<UINT>(vs->elements.size())};
+                if (!ce_mesh) {
+                    g.VS = {vs->dxbc.data(), vs->dxbc.size()};
+                    g.InputLayout = {vs->elements.data(), static_cast<UINT>(vs->elements.size())};
+                }
                 if (ps) g.PS = {ps->dxbc.data(), ps->dxbc.size()};
                 for (auto& rt : g.BlendState.RenderTarget) rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
                 // HACK (agA3, LEONIDA_CE_SF_BLEND, default on, =0 off): this PSO is built from the shaders only, the
@@ -6874,7 +6900,46 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                 g.NumRenderTargets = ce_rts;  // agA39 PSO_MRT (1 without it)
                 for (UINT i = 0; i < ce_rts; ++i) g.RTVFormats[i] = DXGI_FORMAT_R8G8B8A8_UNORM;
                 g.SampleDesc.Count = 1;
-                hr = self->real->CreateGraphicsPipelineState(&g, *riid, out);
+                if (!ce_mesh) {
+                    hr = self->real->CreateGraphicsPipelineState(&g, *riid, out);
+                } else {
+                    // agA43: a mesh pipeline, through ID3D12Device2::CreatePipelineState with the same translated state.
+                    struct alignas(void*) SRoot { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; ID3D12RootSignature* v; };
+                    struct alignas(void*) SCode { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_SHADER_BYTECODE v; };
+                    struct alignas(void*) SBlend { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_BLEND_DESC v; };
+                    struct alignas(void*) SMask { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; UINT v; };
+                    struct alignas(void*) SRast { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_RASTERIZER_DESC v; };
+                    struct alignas(void*) SDepth { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_DEPTH_STENCIL_DESC v; };
+                    struct alignas(void*) SRtv { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_RT_FORMAT_ARRAY v; };
+                    struct alignas(void*) SFmt { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; DXGI_FORMAT v; };
+                    struct alignas(void*) SSample { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; DXGI_SAMPLE_DESC v; };
+                    struct MeshStream { SRoot root; SCode ms; SCode ps; SBlend blend; SMask mask; SRast rast; SDepth depth; SRtv rtv; SFmt dsv; SSample sample; } st{};
+                    st.root = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, g.pRootSignature};
+                    st.ms = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, {vs->dxbc.data(), vs->dxbc.size()}};
+                    st.ps = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, g.PS};
+                    st.blend = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.BlendState};
+                    st.mask = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.SampleMask};
+                    st.rast = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.RasterizerState};
+                    st.depth = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.DepthStencilState};
+                    st.rtv.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS;
+                    st.rtv.v.NumRenderTargets = g.NumRenderTargets;
+                    for (UINT i = 0; i < 8; ++i) st.rtv.v.RTFormats[i] = g.RTVFormats[i];
+                    st.dsv = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.DSVFormat};
+                    st.sample = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.SampleDesc};
+                    ID3D12Device2* d2 = nullptr;
+                    hr = self->real->QueryInterface(IID_PPV_ARGS(&d2));
+                    if (SUCCEEDED(hr) && d2) {
+                        const D3D12_PIPELINE_STATE_STREAM_DESC sd{sizeof(st), &st};
+                        hr = d2->CreatePipelineState(&sd, *riid, out);
+                        d2->Release();
+                    }
+                    static std::atomic<int> told_mesh{0};
+                    if (told_mesh++ < 24 || FAILED(hr)) {
+                        std::fprintf(stderr, "[hack] MESH_PSO: %s + %s -> 0x%08lx\n", vs->name.c_str(), ps ? ps->name.c_str() : "(no PS)",
+                                     static_cast<unsigned long>(hr));
+                        std::fflush(stderr);
+                    }
+                }
                 if (SUCCEEDED(hr) && out && *out && !g_placeholder_pso.load()) {
                     // keep the first working pipeline as the stand-in for pipelines we cannot build (below)
                     static_cast<IUnknown*>(*out)->AddRef();
@@ -6905,6 +6970,42 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             char v[8] = {};
             return GetEnvironmentVariableA("LEONIDA_CE_NO_PLACEHOLDER", v, sizeof(v)) && v[0] == '1';
         }();
+        if (FAILED(hr) && Slot == 57) {  // agA43 DIAGNOSTIC: the records that get the placeholder (mesh pipelines?)
+            static std::atomic<int> nv{0};
+            const int r = nv++;
+            const auto* w = reinterpret_cast<const std::uint64_t*>(desc_in);
+            if (r < 48 && w && xs_readable(w, 0x160)) {
+                std::string line;
+                for (int i = 0; i < 8; ++i) {
+                    const auto* ptr = reinterpret_cast<const std::uint8_t*>(w[1 + 2 * i]);
+                    const std::uint64_t len = w[2 + 2 * i];
+                    char b[96];
+                    std::string hx = "-", st = "";
+                    if (ptr && len >= 24 && len < (1u << 24) && xs_readable(ptr, 24)) {
+                        hx = xs_hex24(ptr);
+                        auto it = g_pso_map.find(hx);
+                        if (it != g_pso_map.end()) st = " " + it->second.stage + ":" + it->second.name.substr(0, 40);
+                    }
+                    std::snprintf(b, sizeof b, " [%d len 0x%llx ", i, (unsigned long long)len);
+                    line += b + hx + st + "]";
+                }
+                std::fprintf(stderr, "[hack] PLACEHOLDER_PSO #%d:%s\n", r, line.c_str());
+                std::fflush(stderr);
+                CreateDirectoryW(ce_data_path(L"leonida-dump").c_str(), nullptr);
+                wchar_t name[160];
+                swprintf_s(name, L"%s\\nvs%02d_record.bin", ce_data_path(L"leonida-dump").c_str(), r);
+                HANDLE h = CreateFileW(name, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (h != INVALID_HANDLE_VALUE) { DWORD wr; WriteFile(h, desc_in, 0x160, &wr, nullptr); CloseHandle(h); }
+                for (int i = 0; i < 8; ++i) {
+                    const void* ptr = reinterpret_cast<const void*>(w[1 + 2 * i]);
+                    const std::uint64_t len = w[2 + 2 * i];
+                    if (!ptr || !len || len > (1u << 22) || !xs_readable(ptr, static_cast<std::size_t>(len))) continue;
+                    swprintf_s(name, L"%s\\nvs%02d_blob%d.bin", ce_data_path(L"leonida-dump").c_str(), r, i);
+                    h = CreateFileW(name, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                    if (h != INVALID_HANDLE_VALUE) { DWORD wr; WriteFile(h, ptr, static_cast<DWORD>(len), &wr, nullptr); CloseHandle(h); }
+                }
+            }
+        }
         if (FAILED(hr) && out && !no_placeholder) {
             if (IUnknown* stand_in = g_placeholder_pso.load()) {
                 const HRESULT qi = stand_in->QueryInterface(*riid, out);
