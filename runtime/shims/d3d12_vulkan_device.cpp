@@ -6860,6 +6860,42 @@ void ce_prebake_run(DeviceState& device) {
                 ++listed_cs;
             }
     }
+    // Build 152 (rt70: RaytracingResolve compute modules took 32-189 s each to compile and the eager prebake starved the
+    // boot): compute modules named by LEONIDA_CE_PREBAKE_LAST (comma substrings; default RaytracingResolve; 0 = none) go
+    // to the end of the queue, still in their order. A title request still moves one to the front.
+    std::size_t deferred = 0;
+    {
+        static const std::vector<std::string> last = [] {
+            std::vector<std::string> v;
+            const char* e = std::getenv("LEONIDA_CE_PREBAKE_LAST");
+            const std::string all = e ? e : "RaytracingResolve";
+            if (all == "0") return v;
+            for (std::size_t at = 0; at <= all.size();) {
+                const std::size_t comma = all.find(',', at);
+                std::string item = all.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+                if (!item.empty()) v.push_back(item);
+                if (comma == std::string::npos) break;
+                at = comma + 1;
+            }
+            return v;
+        }();
+        const auto late = [&](const CePrebakeJob& j) {
+            if (!j.entry) return false;
+            for (const std::string& p : last)
+                if (j.entry->name.find(p) != std::string::npos) return true;
+            return false;
+        };
+        std::stable_partition(jobs.begin(), jobs.end(), [&](const CePrebakeJob& j) { return !late(j); });
+        index.clear();
+        for (std::size_t i = 0; i < jobs.size(); ++i) {
+            if (jobs[i].entry) {
+                index.emplace("C " + jobs[i].entry->name, i);
+                deferred += late(jobs[i]);
+            } else {
+                for (const std::string& v : jobs[i].variants) index.emplace("G " + jobs[i].record + " " + v, i);
+            }
+        }
+    }
     const std::size_t count = jobs.size();
     {
         std::lock_guard l(device.ce_pq_mu);
@@ -6873,8 +6909,9 @@ void ce_prebake_run(DeviceState& device) {
     static const unsigned threads = [] {
         const char* v = std::getenv("LEONIDA_CE_PREBAKE_THREADS");
         const unsigned n = v ? unsigned(std::strtoul(v, nullptr, 0)) : 0;
-        return n ? n : std::max(2u, std::thread::hardware_concurrency());
+        return n ? n : std::max(1u, std::thread::hardware_concurrency() / 4);  // build 152: a quarter of the cores
     }();
+    std::fprintf(stderr, "[hack] PREBAKE: %zu compute module(s) deferred to the end (LEONIDA_CE_PREBAKE_LAST)\n", deferred);
     std::fprintf(stderr, "[hack] PREBAKE: %zu job(s) on %u lowest-priority thread(s): %zu graphics description(s) with %zu "
                          "variant(s), %zu compute module(s) (%s); list %zu line(s), %zu bad, %zu unknown module(s)%s\n",
                  count, threads, by_record.size(), variants, listed_cs, all_compute ? "all: no recorded list" : "recorded",
