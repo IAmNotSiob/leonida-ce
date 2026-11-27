@@ -6204,6 +6204,7 @@ public:
                 if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS)
                     return E_INVALIDARG;
                 pipeline_.pipeline = empty_compute_pipeline(pipeline_.layout);
+                leonida::ce::name_pipeline(pipeline_.pipeline, "placeholder untranslated");  // agA46
                 if (!pipeline_.pipeline) return E_INVALIDARG;
                 static std::atomic<int> placeholders{0};
                 const int n = ++placeholders;
@@ -6295,6 +6296,7 @@ public:
         // (agA38: the lists are in compute_skip, which the prebake uses too.)
         if (const int why = compute_skip(entry->name)) {
             pipeline_.pipeline = empty_compute_pipeline(pipeline_.layout);
+            if (pipeline_.pipeline) leonida::ce::name_pipeline(pipeline_.pipeline, "placeholder " + entry->name);  // agA46
             if (!pipeline_.pipeline) return E_FAIL;
             // HACK (agA46, LEONIDA_CE_SKIP_CS_LAZY=N): a SKIP_CS program keeps its placeholder, but its compile starts
             // the first time a command list binds it (compute_pipeline_id -> kick_lazy), at most N at once, at
@@ -6373,6 +6375,7 @@ public:
                 job->taken = true;
             } else {
                 pipeline_.pipeline = empty_compute_pipeline(pipeline_.layout);
+                if (pipeline_.pipeline) leonida::ce::name_pipeline(pipeline_.pipeline, "placeholder " + entry->name);  // agA46
                 if (!pipeline_.pipeline) return E_FAIL;
                 job->placeholder = true;
                 std::fprintf(stderr, "[hack] compute %s compiles in the background (placeholder for now)\n",
