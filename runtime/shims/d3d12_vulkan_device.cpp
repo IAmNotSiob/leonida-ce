@@ -1902,6 +1902,17 @@ struct DeviceState {
     std::mutex ce_prebaked_mu;
     std::map<std::string, VkPipeline> ce_prebaked;
     std::vector<ID3D12PipelineState*> ce_prebake_keep;
+    // agA38 (build 151): the prebake queue. Jobs run in list order (first use in the recorded run); a title request
+    // for a queued job moves it to the front (ce_pq_urgent). ce_pq_state: 0 queued, 1 building, 2 done.
+    // ce_pq_index: "C <module>" / "G <record> <variant>" -> job. ce_pq_running: workers still alive.
+    std::mutex ce_pq_mu;
+    std::condition_variable ce_pq_cv;
+    std::deque<std::size_t> ce_pq_urgent;
+    std::map<std::string, std::size_t> ce_pq_index;
+    std::vector<std::uint8_t> ce_pq_state;
+    std::size_t ce_pq_next = 0;
+    bool ce_pq_ready = false;
+    bool ce_pq_running = false;
 
     VkPipelineCache pipeline_cache() {
         std::call_once(pipeline_cache_once, [this] {
@@ -5161,25 +5172,88 @@ bool ce_variant_parse(const std::string& t, std::uint32_t& unbound, std::array<V
     return false;
 }
 
-void ce_pso_record_line(const std::string& record, const std::string& variant) {
+// One line appended to LEONIDA_CE_PSO_RECORD's file: "G <record> <variant>" (a graphics variant at its first draw)
+// or "C <module>" (a compute module at its first creation). The file's order is first-use order.
+void ce_record_write(const std::string& line, bool compute) {
     const char* const path = ce_pso_record_path();
     if (!path) return;
     static std::mutex mu;
     static FILE* file = nullptr;
     static bool tried = false;
-    static std::uint64_t lines = 0;
+    static std::uint64_t counts[2] = {};
     std::lock_guard lock(mu);
     if (!tried) {
         tried = true;
         file = std::fopen(path, "ab");
-        std::fprintf(stderr, "[hack] PSO_RECORD: appending graphics pipeline variants to %s%s\n", path,
+        std::fprintf(stderr, "[hack] PSO_RECORD: appending pipelines in first-use order to %s%s\n", path,
                      file ? "" : " (cannot open)");
     }
     if (!file) return;
-    std::fprintf(file, "G %s %s\n", record.c_str(), variant.c_str());
+    std::fprintf(file, "%s\n", line.c_str());
     std::fflush(file);
-    ++lines;
-    if ((lines & (lines - 1)) == 0) std::fprintf(stderr, "[hack] PSO_RECORD: %llu variant(s) recorded\n", (unsigned long long)lines);
+    const std::uint64_t n = ++counts[compute ? 1 : 0];
+    if ((n & (n - 1)) == 0)
+        std::fprintf(stderr, "[hack] PSO_RECORD: %llu %s recorded\n", (unsigned long long)n,
+                     compute ? "compute module(s)" : "graphics variant(s)");
+}
+void ce_pso_record_line(const std::string& record, const std::string& variant) {
+    if (ce_pso_record_path()) ce_record_write("G " + record + " " + variant, false);
+}
+void ce_cs_record(const std::string& name) {
+    if (!ce_pso_record_path()) return;
+    static std::mutex mu;
+    static std::set<std::string> seen;
+    {
+        std::lock_guard l(mu);
+        if (!seen.insert(name).second) return;
+    }
+    ce_record_write("C " + name, true);
+}
+
+VkPipeline ce_prebaked_find(DeviceState& device, const std::string& key) {
+    std::lock_guard l(device.ce_prebaked_mu);
+    const auto it = device.ce_prebaked.find(key);
+    return it == device.ce_prebaked.end() ? VK_NULL_HANDLE : it->second;
+}
+
+// A title request for prebake job `key`: 0 = not in the prebake (or it is over), 1 = built, 2 = queued or building
+// (moved to the front of the queue; waited for up to LEONIDA_CE_PREBAKE_WAIT_MS, default 100).
+// For a compute module the wait is LEONIDA_CE_PREBAKE_WAIT_CS_MS (default 0: only moved to the front; create_compute
+// has its own placeholder and background compile, and the title creates thousands at boot on its job workers).
+int ce_prebake_bump(DeviceState& device, const std::string& key, bool compute = false) {
+    static const unsigned gfx_wait_ms = [] {
+        const char* v = std::getenv("LEONIDA_CE_PREBAKE_WAIT_MS");
+        return v ? unsigned(std::strtoul(v, nullptr, 0)) : 100u;
+    }();
+    static const unsigned cs_wait_ms = [] {
+        const char* v = std::getenv("LEONIDA_CE_PREBAKE_WAIT_CS_MS");
+        return v ? unsigned(std::strtoul(v, nullptr, 0)) : 0u;
+    }();
+    const unsigned wait_ms = compute ? cs_wait_ms : gfx_wait_ms;
+    static std::atomic<std::uint64_t> bumped{0}, waited_ok{0}, waited_out{0};
+    std::unique_lock l(device.ce_pq_mu);
+    if (!device.ce_pq_ready) return 0;
+    const auto it = device.ce_pq_index.find(key);
+    if (it == device.ce_pq_index.end()) return 0;
+    const std::size_t j = it->second;
+    if (device.ce_pq_state[j] == 2) return 1;
+    if (!device.ce_pq_running) return 0;
+    if (device.ce_pq_state[j] == 0) {
+        device.ce_pq_urgent.push_front(j);
+        const std::uint64_t n = ++bumped;
+        if ((n & (n - 1)) == 0)
+            std::fprintf(stderr, "[hack] PREBAKE: %llu request(s) moved to the front of the queue (%llu ready in the wait, %llu not)\n",
+                         (unsigned long long)n, (unsigned long long)waited_ok.load(), (unsigned long long)waited_out.load());
+    }
+    if (wait_ms)
+        device.ce_pq_cv.wait_for(l, std::chrono::milliseconds(wait_ms),
+                                 [&] { return device.ce_pq_state[j] == 2 || !device.ce_pq_running; });
+    if (device.ce_pq_state[j] == 2) {
+        ++waited_ok;
+        return 1;
+    }
+    ++waited_out;
+    return device.ce_pq_running ? 2 : 0;
 }
 
 class PipelineState final
@@ -6140,6 +6214,10 @@ public:
             return E_NOTIMPL;
         }
         if (entry->binding_count) register_literal_samplers(device_, *entry);
+        if (!prebake_) {  // agA38 (build 151): record first use; a module still queued in the prebake goes first
+            ce_cs_record(entry->name);
+            if (ce_pso_prebake_path() || ce_env_on("LEONIDA_CE_PREBAKE_COMPUTE")) ce_prebake_bump(device_, "C " + entry->name, true);
+        }
         // SHADER-309: a module over the device's maxComputeSharedMemorySize is invalid usage that spirv-val accepts
         // and RADV dies on (#1721); some drivers report 32768. Refuse it here instead of creating the pipeline.
         if (entry->lds_bytes) {
@@ -6575,11 +6653,15 @@ private:
             const std::string text = ce_variant_text(unbound, key.second.data(), key.second.size());
             if (recorded_.insert(key).second) ce_pso_record_line(record_, text);
             if (ce_pso_prebake_path()) {
-                VkPipeline prebaked = VK_NULL_HANDLE;
-                {
-                    std::lock_guard l(device_.ce_prebaked_mu);
-                    if (const auto it = device_.ce_prebaked.find(record_ + " " + text); it != device_.ce_prebaked.end())
-                        prebaked = it->second;
+                const std::string full = record_ + " " + text;
+                VkPipeline prebaked = ce_prebaked_find(device_, full);
+                int queued = 0;
+                if (!prebaked) {  // build 151: still in the prebake queue -> to the front, and a short wait
+                    lock.unlock();
+                    queued = ce_prebake_bump(device_, "G " + full);
+                    lock.lock();
+                    if (const auto it = variants_.find(key); it != variants_.end()) return it->second;
+                    prebaked = ce_prebaked_find(device_, full);
                 }
                 if (prebaked) {
                     variants_.emplace(key, prebaked);
@@ -6591,6 +6673,7 @@ private:
                                      (unsigned long long)n);
                     return prebaked;
                 }
+                if (queued == 2) return VK_NULL_HANDLE;  // the prebake builds it (now first in line): no second build
             }
         }
         if (sync) {
@@ -6687,179 +6770,211 @@ private:
     std::set<VariantKey> adopted_;    // variants taken from DeviceState::ce_prebaked (not destroyed here)
 };
 
-// agA38: the prebake (see ce_prebake_start's caller and DeviceState::ce_prebake_thread). ------------------------
-// Runs job(0..count-1) on LEONIDA_CE_PREBAKE_THREADS threads (default: every core) at below-normal priority.
-template<class Job>
-void ce_parallel(DeviceState& device, std::size_t count, Job&& job) {
-    static const unsigned threads = [] {
-        const char* v = std::getenv("LEONIDA_CE_PREBAKE_THREADS");
-        unsigned n = v ? unsigned(std::strtoul(v, nullptr, 0)) : 0;
-        return n ? n : std::max(2u, std::thread::hardware_concurrency());
-    }();
-    std::atomic<std::size_t> next{0};
-    std::vector<std::thread> pool;
-    for (std::size_t t = 0; t < std::min<std::size_t>(threads, count); ++t)
-        pool.emplace_back([&] {
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-            for (;;) {
-                if (device.ce_prebake_stop) return;
-                const std::size_t i = next++;
-                if (i >= count) return;
-                job(i);
-            }
-        });
-    for (std::thread& t : pool) t.join();
-}
-
+// agA38: the prebake (see ce_prebake_start's caller and DeviceState::ce_prebake_thread). --------------------------
+// Build 151 (lazy): the jobs are what a recorded run used, in its first-use order (LEONIDA_CE_PSO_PREBAKE's "G" and
+// "C" lines); every compute module only with LEONIDA_CE_PREBAKE_COMPUTE=1 and no "C" line in the list. Workers run at
+// the lowest thread priority, and a title request moves its job to the front (ce_prebake_bump).
 double ce_seconds_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
-void ce_prebake_compute_all(DeviceState& device, const leonida::ShaderLibrary& library) {
-    std::vector<const leonida::ShaderEntry*> list;
-    std::set<std::string> seen;
-    library.for_each_entry([&](const leonida::ShaderEntry& e) {
-        // "1" = every compute module, else a comma list of name substrings (e.g. fspx_game/,bvh/).
-        if (e.stage == "cs" && ce_name_list_match("LEONIDA_CE_PREBAKE_COMPUTE", e.name) && seen.insert(e.name).second)
-            list.push_back(&e);
-    });
-    std::fprintf(stderr, "[hack] PREBAKE_COMPUTE: %zu compute modules\n", list.size());
-    std::fflush(stderr);
-    std::atomic<int> built{0}, skipped{0}, failed{0}, slow{0};
-    std::atomic<std::uint64_t> busy_ms{0};
-    const auto t0 = std::chrono::steady_clock::now();
-    ce_parallel(device, list.size(), [&](std::size_t i) {
-        auto* pso = new PipelineState(device);
-        pso->ce_set_prebake(nullptr);
-        const auto t1 = std::chrono::steady_clock::now();
-        const int r = pso->ce_prebake_compute(*list[i]);
-        const double took = ce_seconds_since(t1);
-        pso->Release();
-        if (r > 0) {
-            ++built;
-            busy_ms += std::uint64_t(took * 1000);
-        } else if (r == 0) {
-            ++skipped;
-        } else if (failed++ < 16) {
-            std::fprintf(stderr, "[hack] PREBAKE_COMPUTE: %s failed\n", list[i]->name.c_str());
-        }
-        if (took > 5.0 && slow++ < 32)
-            std::fprintf(stderr, "[hack] PREBAKE_COMPUTE: %s took %.1f s\n", list[i]->name.c_str(), took);
-        const int done = built + skipped + failed;
-        if (done % 250 == 0)
-            std::fprintf(stderr, "[hack] PREBAKE_COMPUTE: %d / %zu after %.1f s\n", done, list.size(), ce_seconds_since(t0));
-    });
-    const int b = built;
-    std::fprintf(stderr, "[hack] PREBAKE_COMPUTE: done%s in %.1f s: %d built, %d skipped, %d failed, %.1f ms average per module\n",
-                 device.ce_prebake_stop ? " (stopped)" : "", ce_seconds_since(t0), b, int(skipped), int(failed),
-                 b ? double(busy_ms.load()) / b : 0.0);
-    std::fflush(stderr);
-}
+struct CePrebakeJob {
+    const leonida::ShaderEntry* entry = nullptr;  // compute
+    std::string record;                           // graphics: the description
+    std::vector<std::string> variants;
+};
 
-void ce_prebake_graphics_all(DeviceState& device, const char* path) {
-    // Lines "G <record> <variant>", deduplicated (a record file grows across runs).
-    std::map<std::string, std::set<std::string>> records;
-    std::size_t lines = 0, bad = 0;
-    {
+void ce_prebake_run(DeviceState& device) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    const leonida::ShaderLibrary* library = device.library();
+    if (!library || !device.pipeline_cache()) {
+        std::fprintf(stderr, "[hack] PREBAKE: no shader library or no pipeline cache; nothing prebaked\n");
+        return;
+    }
+    std::vector<const leonida::ShaderEntry*> all_cs;
+    std::map<std::string, const leonida::ShaderEntry*> cs_by_name;
+    library->for_each_entry([&](const leonida::ShaderEntry& e) {
+        if (e.stage == "cs" && cs_by_name.emplace(e.name, &e).second) all_cs.push_back(&e);
+    });
+    std::vector<CePrebakeJob> jobs;
+    std::map<std::string, std::size_t> index;  // ce_pq_index
+    std::map<std::string, std::size_t> by_record;
+    std::size_t lines = 0, bad = 0, unknown_cs = 0, variants = 0, listed_cs = 0;
+    if (const char* path = ce_pso_prebake_path()) {
         std::ifstream in(path, std::ios::binary);
-        if (!in) {
-            std::fprintf(stderr, "[hack] PSO_PREBAKE: cannot open %s\n", path);
-            return;
-        }
+        if (!in) std::fprintf(stderr, "[hack] PSO_PREBAKE: cannot open %s\n", path);
         std::string line;
-        while (std::getline(in, line)) {
+        while (in && std::getline(in, line)) {
             if (!line.empty() && line.back() == '\r') line.pop_back();
             if (line.empty()) continue;
             ++lines;
+            if (line.compare(0, 2, "C ") == 0) {
+                const std::string name = line.substr(2);
+                const auto it = cs_by_name.find(name);
+                if (it == cs_by_name.end()) { ++unknown_cs; continue; }
+                if (!index.emplace("C " + name, jobs.size()).second) continue;
+                CePrebakeJob job;
+                job.entry = it->second;
+                jobs.push_back(std::move(job));
+                ++listed_cs;
+                continue;
+            }
             const std::size_t sp = line.find(' ', 2);
             if (line.compare(0, 2, "G ") != 0 || sp == std::string::npos) { ++bad; continue; }
-            records[line.substr(2, sp - 2)].insert(line.substr(sp + 1));
+            std::string record = line.substr(2, sp - 2);
+            std::string variant = line.substr(sp + 1);
+            auto [rit, fresh] = by_record.emplace(record, jobs.size());
+            if (fresh) {
+                CePrebakeJob job;
+                job.record = record;
+                jobs.push_back(std::move(job));
+            }
+            if (!index.emplace("G " + record + " " + variant, rit->second).second) continue;
+            jobs[rit->second].variants.push_back(std::move(variant));
+            ++variants;
         }
     }
-    std::vector<const std::pair<const std::string, std::set<std::string>>*> jobs;
-    std::size_t variants = 0;
-    for (const auto& r : records) {
-        jobs.push_back(&r);
-        variants += r.second.size();
+    bool all_compute = false;
+    if (!listed_cs && ce_env_on("LEONIDA_CE_PREBAKE_COMPUTE")) {  // no list of used modules: all of them
+        all_compute = true;
+        // "1" = every compute module, else a comma list of name substrings (e.g. fspx_game/,bvh/).
+        for (const leonida::ShaderEntry* e : all_cs)
+            if (ce_name_list_match("LEONIDA_CE_PREBAKE_COMPUTE", e->name) && index.emplace("C " + e->name, jobs.size()).second) {
+                CePrebakeJob job;
+                job.entry = e;
+                jobs.push_back(std::move(job));
+                ++listed_cs;
+            }
+    }
+    const std::size_t count = jobs.size();
+    {
+        std::lock_guard l(device.ce_pq_mu);
+        device.ce_pq_index = std::move(index);
+        device.ce_pq_state.assign(count, 0);
+        device.ce_pq_next = 0;
+        device.ce_pq_ready = true;
+        device.ce_pq_running = true;
     }
     static const bool adopt = [] { const char* e = std::getenv("LEONIDA_CE_PSO_ADOPT"); return !e || e[0] != '0'; }();
-    std::fprintf(stderr, "[hack] PSO_PREBAKE: %s: %zu line(s), %zu bad, %zu pipeline description(s), %zu variant(s)%s\n",
-                 path, lines, bad, jobs.size(), variants, adopt ? "" : " (cache only: LEONIDA_CE_PSO_ADOPT=0)");
+    static const unsigned threads = [] {
+        const char* v = std::getenv("LEONIDA_CE_PREBAKE_THREADS");
+        const unsigned n = v ? unsigned(std::strtoul(v, nullptr, 0)) : 0;
+        return n ? n : std::max(2u, std::thread::hardware_concurrency());
+    }();
+    std::fprintf(stderr, "[hack] PREBAKE: %zu job(s) on %u lowest-priority thread(s): %zu graphics description(s) with %zu "
+                         "variant(s), %zu compute module(s) (%s); list %zu line(s), %zu bad, %zu unknown module(s)%s\n",
+                 count, threads, by_record.size(), variants, listed_cs, all_compute ? "all: no recorded list" : "recorded",
+                 lines, bad, unknown_cs, adopt ? "" : " (graphics cache only: LEONIDA_CE_PSO_ADOPT=0)");
     std::fflush(stderr);
-    std::atomic<int> built{0}, failed_pso{0}, failed_variant{0}, mismatch{0};
-    std::atomic<std::uint64_t> busy_ms{0};
-    const auto t0 = std::chrono::steady_clock::now();
     auto& vk = device.context->vk;
-    ce_parallel(device, jobs.size(), [&](std::size_t i) {
-        const std::string& record = jobs[i]->first;
+    std::atomic<int> cs_built{0}, cs_skipped{0}, cs_failed{0}, g_built{0}, g_failed{0}, g_desc_failed{0}, mismatch{0}, slow{0};
+    std::atomic<std::size_t> done{0};
+    std::atomic<std::uint64_t> cs_ms{0}, g_ms{0};
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto run_job = [&](std::size_t i) {
+        CePrebakeJob& job = jobs[i];
+        const auto t1 = std::chrono::steady_clock::now();
+        if (job.entry) {
+            auto* pso = new PipelineState(device);
+            pso->ce_set_prebake(nullptr);
+            const int r = pso->ce_prebake_compute(*job.entry);
+            pso->Release();
+            const double took = ce_seconds_since(t1);
+            if (r > 0) { ++cs_built; cs_ms += std::uint64_t(took * 1000); }
+            else if (r == 0) ++cs_skipped;
+            else if (cs_failed++ < 16) std::fprintf(stderr, "[hack] PREBAKE: compute %s failed\n", job.entry->name.c_str());
+            if (took > 5.0 && slow++ < 32)
+                std::fprintf(stderr, "[hack] PREBAKE: compute %s took %.1f s (job %zu)\n", job.entry->name.c_str(), took, i);
+            return;
+        }
         CePsoRecord rec;
-        if (!ce_pso_decode(record, rec)) {
-            if (failed_pso++ < 16) std::fprintf(stderr, "[hack] PSO_PREBAKE: record %zu does not decode\n", i);
+        if (!ce_pso_decode(job.record, rec)) {
+            if (g_desc_failed++ < 16) std::fprintf(stderr, "[hack] PREBAKE: graphics job %zu does not decode\n", i);
             return;
         }
         auto* pso = new PipelineState(device);
         pso->ce_set_prebake(&rec.hashes);
-        const auto t1 = std::chrono::steady_clock::now();
         if (const HRESULT hr = pso->create_graphics(rec.desc, rec.mesh ? &rec.ms : nullptr); FAILED(hr)) {
-            if (failed_pso++ < 16) std::fprintf(stderr, "[hack] PSO_PREBAKE: record %zu: create_graphics 0x%08lx\n", i, (unsigned long)hr);
+            if (g_desc_failed++ < 16) std::fprintf(stderr, "[hack] PREBAKE: graphics job %zu: create_graphics 0x%08lx\n", i, (unsigned long)hr);
             pso->Release();
             return;
         }
-        if (pso->ce_record() != record && mismatch++ < 4)
-            std::fprintf(stderr, "[hack] PSO_PREBAKE: record %zu re-encodes differently (its pipelines will not be taken)\n", i);
+        if (pso->ce_record() != job.record && mismatch++ < 4)
+            std::fprintf(stderr, "[hack] PREBAKE: graphics job %zu re-encodes differently (its pipelines will not be taken)\n", i);
         bool kept = false;
-        for (const std::string& text : jobs[i]->second) {
+        for (const std::string& text : job.variants) {
             std::uint32_t unbound = 0;
             std::array<VkFormat, leonida::detail::max_render_targets> formats{};
-            if (!ce_variant_parse(text, unbound, formats)) { ++failed_variant; continue; }
+            if (!ce_variant_parse(text, unbound, formats)) { ++g_failed; continue; }
             bool overridden = false;
             for (VkFormat f : formats) overridden |= f != VK_FORMAT_UNDEFINED;
             const VkPipeline p = pso->ce_prebake_build(unbound, overridden ? formats.data() : nullptr);
-            if (!p) { ++failed_variant; continue; }
-            ++built;
+            if (!p) { ++g_failed; continue; }
+            ++g_built;
             bool taken = false;
             if (adopt) {
                 std::lock_guard l(device.ce_prebaked_mu);
-                taken = device.ce_prebaked.emplace(record + " " + text, p).second;
+                taken = device.ce_prebaked.emplace(job.record + " " + text, p).second;
             }
             if (taken) kept = true;
             else vk.vkDestroyPipeline(device.info.device, p, nullptr);
         }
-        busy_ms += std::uint64_t(ce_seconds_since(t1) * 1000);
+        g_ms += std::uint64_t(ce_seconds_since(t1) * 1000);
         if (kept) {
             std::lock_guard l(device.ce_prebaked_mu);
             device.ce_prebake_keep.push_back(pso);  // its layout stays alive while its pipelines may be used
         } else {
             pso->Release();
         }
-        const std::size_t done = i + 1;
-        if (done % 500 == 0)
-            std::fprintf(stderr, "[hack] PSO_PREBAKE: description %zu / %zu after %.1f s\n", done, jobs.size(), ce_seconds_since(t0));
-    });
-    const int b = built;
-    std::fprintf(stderr, "[hack] PSO_PREBAKE: done%s in %.1f s: %d variant(s) built, %d failed, %d description(s) failed, "
-                         "%d re-encode mismatch(es), %.1f ms average per description\n",
-                 device.ce_prebake_stop ? " (stopped)" : "", ce_seconds_since(t0), b, int(failed_variant), int(failed_pso),
-                 int(mismatch), jobs.empty() ? 0.0 : double(busy_ms.load()) / jobs.size());
+    };
+    std::vector<std::thread> pool;
+    for (std::size_t t = 0; t < std::min<std::size_t>(threads, count); ++t)
+        pool.emplace_back([&] {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+            for (;;) {
+                std::size_t j = 0;
+                {
+                    std::lock_guard l(device.ce_pq_mu);
+                    if (device.ce_prebake_stop) return;
+                    bool found = false;
+                    while (!device.ce_pq_urgent.empty() && !found) {
+                        j = device.ce_pq_urgent.front();
+                        device.ce_pq_urgent.pop_front();
+                        found = device.ce_pq_state[j] == 0;
+                    }
+                    if (!found) {
+                        while (device.ce_pq_next < count && device.ce_pq_state[device.ce_pq_next] != 0) ++device.ce_pq_next;
+                        if (device.ce_pq_next >= count) return;
+                        j = device.ce_pq_next++;
+                    }
+                    device.ce_pq_state[j] = 1;
+                }
+                run_job(j);
+                {
+                    std::lock_guard l(device.ce_pq_mu);
+                    device.ce_pq_state[j] = 2;
+                }
+                device.ce_pq_cv.notify_all();
+                const std::size_t d = ++done;
+                if (d % 250 == 0)
+                    std::fprintf(stderr, "[hack] PREBAKE: %zu / %zu after %.1f s\n", d, count, ce_seconds_since(t0));
+            }
+        });
+    for (std::thread& t : pool) t.join();
+    {
+        std::lock_guard l(device.ce_pq_mu);
+        device.ce_pq_running = false;
+    }
+    device.ce_pq_cv.notify_all();
+    const int cb = cs_built, gd = int(by_record.size());
+    std::fprintf(stderr, "[hack] PREBAKE: done%s in %.1f s: compute %d built, %d skipped, %d failed (%.1f ms average); graphics "
+                         "%d variant(s) built, %d failed, %d description(s) failed, %d re-encode mismatch(es) (%.1f ms average "
+                         "per description)\n",
+                 device.ce_prebake_stop ? " (stopped)" : "", ce_seconds_since(t0), cb, int(cs_skipped), int(cs_failed),
+                 cb ? double(cs_ms.load()) / cb : 0.0, int(g_built), int(g_failed), int(g_desc_failed), int(mismatch),
+                 gd ? double(g_ms.load()) / gd : 0.0);
     std::fflush(stderr);
-}
-
-void ce_prebake_run(DeviceState& device) {
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    const leonida::ShaderLibrary* library = device.library();
-    if (!library || !device.pipeline_cache()) {
-        std::fprintf(stderr, "[hack] PREBAKE: no shader library or no pipeline cache; nothing prebaked\n");
-        return;
-    }
-    // Graphics first: its pipelines are taken at the first draw (pending-pso); compute only warms the cache.
-    if (const char* path = ce_pso_prebake_path()) {
-        ce_prebake_graphics_all(device, path);
-        if (!device.ce_prebake_stop) device.cache_writer.save_now();
-    }
-    if (ce_env_on("LEONIDA_CE_PREBAKE_COMPUTE") && !device.ce_prebake_stop) {
-        ce_prebake_compute_all(device, *library);
-        if (!device.ce_prebake_stop) device.cache_writer.save_now();
-    }
+    if (!device.ce_prebake_stop) device.cache_writer.save_now();
 }
 
 void ce_prebake_start(DeviceState& device) {
