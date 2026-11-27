@@ -950,6 +950,15 @@ public:
         return all;
     }
 
+    // agA38: every entry (main and FSPX maps; an entry in both is visited twice), for the shader prebake.
+    template<class F>
+    void for_each_entry(F&& f) const {
+        for (const auto& [key, list] : entries_)
+            for (const ShaderEntry& e : list) f(e);
+        for (const auto& [key, list] : fspx_entries_)
+            for (const ShaderEntry& e : list) f(e);
+    }
+
     // The module's words, or empty when <dir>/<name>.spv is missing or not SPIR-V.
     std::vector<std::uint32_t> spirv(const ShaderEntry& entry) const {
         auto path = dir_;

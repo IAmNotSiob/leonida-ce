@@ -1414,6 +1414,12 @@ public:
         if (thread_.joinable()) thread_.join();
     }
 
+    // agA38: a save outside the 60 s cadence (the shader prebake calls it when it is done).
+    void save_now() {
+        const std::lock_guard<std::mutex> lock(save_mutex_);
+        if (get_) save_if_grown();
+    }
+
 private:
     std::size_t query_size() const {
         std::size_t size = 0;
@@ -1425,7 +1431,7 @@ private:
         while (!stopping_) {
             if (wake_.wait_for(lock, std::chrono::seconds(60), [this] { return stopping_; })) return;
             lock.unlock();
-            save_if_grown();
+            save_now();
             lock.lock();
         }
     }
@@ -1471,6 +1477,7 @@ private:
     std::mutex mutex_;
     std::condition_variable wake_;
     bool stopping_ = false;
+    std::mutex save_mutex_;  // agA38: save_now from the prebake thread and the writer thread
 };
 
 // A shader whose subgroup size cannot be had runs at the device's: inexact if it crosses the halves of a wave64 (or,
@@ -1885,6 +1892,16 @@ struct DeviceState {
     std::once_flag pipeline_cache_once;
     VkPipelineCache pipeline_cache_handle = VK_NULL_HANDLE;
     PipelineCacheWriter cache_writer;  // stopped in the device destructor before the cache is destroyed
+    // agA38 shader prebake (LEONIDA_CE_PREBAKE_COMPUTE, LEONIDA_CE_PSO_PREBAKE): its thread starts on the first
+    // pipeline the title creates and is joined first thing in ~Device. ce_prebaked: graphics pipelines built from
+    // the PSO record (key: record + " " + variant), handed to a title PSO of the same description at its first draw
+    // instead of a background build; ce_prebake_keep: the prebake PSO objects those pipelines were made with.
+    std::once_flag ce_prebake_once;
+    std::thread ce_prebake_thread;
+    std::atomic<bool> ce_prebake_stop{false};
+    std::mutex ce_prebaked_mu;
+    std::map<std::string, VkPipeline> ce_prebaked;
+    std::vector<ID3D12PipelineState*> ce_prebake_keep;
 
     VkPipelineCache pipeline_cache() {
         std::call_once(pipeline_cache_once, [this] {
@@ -4951,6 +4968,220 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
     return S_OK;
 }
 
+// agA38: the shader prebake. LEONIDA_CE_PREBAKE_COMPUTE=1 builds every translated compute module (with this run's
+// LOOP_CAP / guard transforms) into the pipeline cache on a thread pool; LEONIDA_CE_PSO_RECORD=<file> appends each
+// graphics pipeline variant the title draws with (its description + attachment variant) to a file;
+// LEONIDA_CE_PSO_PREBAKE=<file> rebuilds those at startup (with this run's LOOP_CAP_GFX transforms) and hands them
+// to the title's PSOs at their first draw, so those draws are not left out ("pending-pso").
+void ce_prebake_start(DeviceState& device);
+bool ce_env_on(const char* name) {
+    const char* e = std::getenv(name);
+    return e && e[0] && e[0] != '0';
+}
+const char* ce_pso_record_path() {
+    static const char* const p = [] { const char* e = std::getenv("LEONIDA_CE_PSO_RECORD"); return e && *e ? e : nullptr; }();
+    return p;
+}
+const char* ce_pso_prebake_path() {
+    static const char* const p = [] { const char* e = std::getenv("LEONIDA_CE_PSO_PREBAKE"); return e && *e ? e : nullptr; }();
+    return p;
+}
+
+// What create_graphics reads of a description, field by field (pointers, the root signature and CachedPSO left out).
+template<class F>
+void ce_pso_fields(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, F&& f) {
+    auto& b = d.BlendState;
+    f(b.AlphaToCoverageEnable);
+    f(b.IndependentBlendEnable);
+    for (auto& t : b.RenderTarget) {
+        f(t.BlendEnable); f(t.LogicOpEnable); f(t.SrcBlend); f(t.DestBlend); f(t.BlendOp);
+        f(t.SrcBlendAlpha); f(t.DestBlendAlpha); f(t.BlendOpAlpha); f(t.LogicOp); f(t.RenderTargetWriteMask);
+    }
+    f(d.SampleMask);
+    auto& r = d.RasterizerState;
+    f(r.FillMode); f(r.CullMode); f(r.FrontCounterClockwise); f(r.DepthBias); f(r.DepthBiasClamp);
+    f(r.SlopeScaledDepthBias); f(r.DepthClipEnable); f(r.MultisampleEnable); f(r.AntialiasedLineEnable);
+    f(r.ForcedSampleCount); f(r.ConservativeRaster);
+    auto& z = d.DepthStencilState;
+    f(z.DepthEnable); f(z.DepthWriteMask); f(z.DepthFunc); f(z.StencilEnable); f(z.StencilReadMask); f(z.StencilWriteMask);
+    f(z.FrontFace.StencilFailOp); f(z.FrontFace.StencilDepthFailOp); f(z.FrontFace.StencilPassOp); f(z.FrontFace.StencilFunc);
+    f(z.BackFace.StencilFailOp); f(z.BackFace.StencilDepthFailOp); f(z.BackFace.StencilPassOp); f(z.BackFace.StencilFunc);
+    f(d.IBStripCutValue); f(d.PrimitiveTopologyType); f(d.NumRenderTargets);
+    for (auto& fmt : d.RTVFormats) f(fmt);
+    f(d.DSVFormat); f(d.SampleDesc.Count); f(d.SampleDesc.Quality); f(d.NodeMask); f(d.Flags);
+}
+
+// A record is lower-case hex: u32s as 8 digits, strings as a u32 length then their bytes as 2 digits each, the
+// stage hashes (already hex) as a length then the text.
+struct CeHexWriter {
+    std::string out;
+    void u32(std::uint32_t v) {
+        char b[9];
+        std::snprintf(b, sizeof(b), "%08x", v);
+        out += b;
+    }
+    void str(const char* s) {
+        const std::size_t n = std::strlen(s);
+        u32(std::uint32_t(n));
+        for (std::size_t i = 0; i < n; ++i) {
+            char b[3];
+            std::snprintf(b, sizeof(b), "%02x", unsigned(std::uint8_t(s[i])));
+            out += b;
+        }
+    }
+    void hex(const std::string& h) {
+        u32(std::uint32_t(h.size()));
+        out += h;
+    }
+};
+struct CeHexReader {
+    const std::string& in;
+    std::size_t at = 0;
+    bool ok = true;
+    std::uint32_t u32() {
+        if (at + 8 > in.size()) { ok = false; return 0; }
+        const std::uint32_t v = std::uint32_t(std::strtoul(in.substr(at, 8).c_str(), nullptr, 16));
+        at += 8;
+        return v;
+    }
+    std::string str() {
+        const std::uint32_t n = u32();
+        if (!ok || n > 4096 || at + 2 * std::size_t(n) > in.size()) { ok = false; return {}; }
+        std::string s;
+        for (std::uint32_t i = 0; i < n; ++i) s += char(std::strtoul(in.substr(at + 2 * i, 2).c_str(), nullptr, 16));
+        at += 2 * std::size_t(n);
+        return s;
+    }
+    std::string hex() {
+        const std::uint32_t n = u32();
+        if (!ok || n > 4096 || at + n > in.size()) { ok = false; return {}; }
+        std::string s = in.substr(at, n);
+        at += n;
+        return s;
+    }
+};
+
+// hashes: the FSSM SHA-256 of stage 0 (VS, or MS for a mesh PSO), GS and PS; empty for an absent stage.
+std::string ce_pso_encode(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, bool mesh, const std::array<std::string, 3>& hashes) {
+    CeHexWriter w;
+    w.u32(1);  // version
+    w.u32(mesh ? 1 : 0);
+    for (const std::string& h : hashes) w.hex(h);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC d = desc;
+    ce_pso_fields(d, [&](auto& v) {
+        static_assert(sizeof(v) <= 4);
+        std::uint32_t x = 0;
+        std::memcpy(&x, &v, sizeof(v));
+        w.u32(x);
+    });
+    const UINT n = mesh ? 0 : desc.InputLayout.NumElements;
+    w.u32(n);
+    for (UINT i = 0; i < n; ++i) {
+        const D3D12_INPUT_ELEMENT_DESC& e = desc.InputLayout.pInputElementDescs[i];
+        w.str(e.SemanticName ? e.SemanticName : "");
+        w.u32(e.SemanticIndex);
+        w.u32(std::uint32_t(e.Format));
+        w.u32(e.InputSlot);
+        w.u32(e.AlignedByteOffset);
+        w.u32(std::uint32_t(e.InputSlotClass));
+        w.u32(e.InstanceDataStepRate);
+    }
+    return w.out;
+}
+
+// A decoded record. Holds pointers into itself (semantic names, input elements): used where it is made, never copied.
+struct CePsoRecord {
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+    D3D12_SHADER_BYTECODE ms{};
+    bool mesh = false;
+    std::array<std::string, 3> hashes;
+    std::vector<std::string> names;
+    std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
+    CePsoRecord() = default;
+    CePsoRecord(const CePsoRecord&) = delete;
+    CePsoRecord& operator=(const CePsoRecord&) = delete;
+};
+bool ce_pso_decode(const std::string& text, CePsoRecord& r) {
+    CeHexReader rd{text};
+    if (rd.u32() != 1) return false;
+    r.mesh = rd.u32() != 0;
+    for (std::string& h : r.hashes) h = rd.hex();
+    ce_pso_fields(r.desc, [&](auto& v) {
+        const std::uint32_t x = rd.u32();
+        std::memcpy(&v, &x, sizeof(v));
+    });
+    const std::uint32_t n = rd.u32();
+    if (!rd.ok || n > D3D12_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT) return false;
+    r.names.resize(n);
+    r.elements.resize(n);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        r.names[i] = rd.str();
+        D3D12_INPUT_ELEMENT_DESC& e = r.elements[i];
+        e.SemanticIndex = rd.u32();
+        e.Format = DXGI_FORMAT(rd.u32());
+        e.InputSlot = rd.u32();
+        e.AlignedByteOffset = rd.u32();
+        e.InputSlotClass = D3D12_INPUT_CLASSIFICATION(rd.u32());
+        e.InstanceDataStepRate = rd.u32();
+    }
+    for (std::uint32_t i = 0; i < n; ++i) r.elements[i].SemanticName = r.names[i].c_str();
+    r.desc.InputLayout = {n ? r.elements.data() : nullptr, n};
+    // create_graphics takes a stage as present when it has bytes; with prebake hashes it never reads them.
+    static const std::uint8_t present[4] = {};
+    const D3D12_SHADER_BYTECODE code{present, sizeof(present)};
+    if (!r.hashes[0].empty()) (r.mesh ? r.ms : r.desc.VS) = code;
+    if (!r.hashes[1].empty()) r.desc.GS = code;
+    if (!r.hashes[2].empty()) r.desc.PS = code;
+    return rd.ok && rd.at == text.size();
+}
+
+// A variant key as text: "<unbound hex>:<f0>,...,<f7>" (format overrides, 0 = none).
+std::string ce_variant_text(std::uint32_t unbound, const VkFormat* formats, std::size_t count) {
+    std::string t;
+    char b[16];
+    std::snprintf(b, sizeof(b), "%x:", unbound);
+    t += b;
+    for (std::size_t i = 0; i < count; ++i) {
+        std::snprintf(b, sizeof(b), i ? ",%d" : "%d", int(formats[i]));
+        t += b;
+    }
+    return t;
+}
+bool ce_variant_parse(const std::string& t, std::uint32_t& unbound, std::array<VkFormat, leonida::detail::max_render_targets>& formats) {
+    formats.fill(VK_FORMAT_UNDEFINED);
+    char* end = nullptr;
+    unbound = std::uint32_t(std::strtoul(t.c_str(), &end, 16));
+    if (!end || *end != ':') return false;
+    for (std::size_t i = 0; i < formats.size(); ++i) {
+        ++end;
+        formats[i] = VkFormat(std::strtol(end, &end, 10));
+        if (!end || (*end != ',' && *end != 0)) return false;
+        if (!*end) return i + 1 == formats.size();
+    }
+    return false;
+}
+
+void ce_pso_record_line(const std::string& record, const std::string& variant) {
+    const char* const path = ce_pso_record_path();
+    if (!path) return;
+    static std::mutex mu;
+    static FILE* file = nullptr;
+    static bool tried = false;
+    static std::uint64_t lines = 0;
+    std::lock_guard lock(mu);
+    if (!tried) {
+        tried = true;
+        file = std::fopen(path, "ab");
+        std::fprintf(stderr, "[hack] PSO_RECORD: appending graphics pipeline variants to %s%s\n", path,
+                     file ? "" : " (cannot open)");
+    }
+    if (!file) return;
+    std::fprintf(file, "G %s %s\n", record.c_str(), variant.c_str());
+    std::fflush(file);
+    ++lines;
+    if ((lines & (lines - 1)) == 0) std::fprintf(stderr, "[hack] PSO_RECORD: %llu variant(s) recorded\n", (unsigned long long)lines);
+}
+
 class PipelineState final
     : public Child<PipelineState, XboxPipelineStateStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
                    ID3D12PipelineState> {
@@ -4968,7 +5199,8 @@ public:
         if (pipeline_.layout) vk.vkDestroyPipelineLayout(dev, pipeline_.layout, nullptr);
         if (module_) vk.vkDestroyShaderModule(dev, module_, nullptr);
         if (graphics_.pipeline) vk.vkDestroyPipeline(dev, graphics_.pipeline, nullptr);
-        for (const auto& [key, built] : variants_) vk.vkDestroyPipeline(dev, built, nullptr);
+        for (const auto& [key, built] : variants_)
+            if (!adopted_.count(key)) vk.vkDestroyPipeline(dev, built, nullptr);  // agA38: adopted = the device's
         if (graphics_.layout) vk.vkDestroyPipelineLayout(dev, graphics_.layout, nullptr);
         for (VkShaderModule module : modules_) vk.vkDestroyShaderModule(dev, module, nullptr);
         if (code_bytes_) device_.arena_release(code_base_, code_bytes_, DeviceState::arena_shader);
@@ -5001,6 +5233,66 @@ public:
 
     std::uintptr_t id() const { return reinterpret_cast<std::uintptr_t>(static_cast<const ID3D12PipelineState*>(this)); }
     void set_cache_key(leonida::cached_pso::Key key) { cache_key_ = std::move(key); }
+
+    // agA38: a prebake object. With `hashes` (a PSO record's stage programs) create_graphics takes the programs by
+    // hash, and it stops before registering the pipeline or copying code into the arena.
+    void ce_set_prebake(const std::array<std::string, 3>* hashes) {
+        prebake_ = true;
+        prebake_hashes_ = hashes;
+    }
+    const std::string& ce_record() const { return record_; }
+    VkPipeline ce_prebake_build(std::uint32_t unbound, const VkFormat* overrides) const { return build(unbound, overrides); }
+
+    // agA38: `e`'s compute pipeline as create_compute builds it (same module transforms, layout and subgroup size),
+    // synchronously through the pipeline cache, then left for the destructor. 1 = built, 0 = skipped (as
+    // create_compute would: placeholder, SKIP_CS, no bindless set, over the LDS limit), -1 = failed.
+    int ce_prebake_compute(const leonida::ShaderEntry& e) {
+        const leonida::ShaderEntry* entry = &e;
+        auto& vk = device_.context->vk;
+        const VkDevice dev = device_.info.device;
+        if (entry->binding_count && !device_.bindless) return 0;
+        if (compute_skip(entry->name)) return 0;
+        if (entry->lds_bytes) {
+            const auto& dinfo = device_.info;
+            if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                    dinfo.get_instance_proc ? dinfo.get_instance_proc(dinfo.instance, "vkGetPhysicalDeviceProperties")
+                                            : nullptr)) {
+                VkPhysicalDeviceProperties props{};
+                get_props(dinfo.physical, &props);
+                if (entry->lds_bytes > props.limits.maxComputeSharedMemorySize) return 0;
+            }
+        }
+        const leonida::ShaderLibrary* library = device_.library();
+        if (!library) return -1;
+        std::vector<std::uint32_t> words = library->spirv(*entry);
+        if (words.empty()) return -1;
+        compute_transforms(words, *entry);
+        VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        module_info.codeSize = words.size() * 4;
+        module_info.pCode = words.data();
+        if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module_) != VK_SUCCESS) return -1;
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(leonida::ShaderUserData)};
+        VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layout_info.pushConstantRangeCount = 1;
+        layout_info.pPushConstantRanges = &push;
+        VkDescriptorSetLayout set0_layout = VK_NULL_HANDLE;
+        if (entry->binding_count) {
+            set0_layout = device_.bindless->layout();
+            layout_info.setLayoutCount = 1;
+            layout_info.pSetLayouts = &set0_layout;
+        }
+        if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS) return -1;
+        VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipeline_info.stage.module = module_;
+        pipeline_info.stage.pName = "main";
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
+        subgroup_size_for(*entry, required_size, pipeline_info.stage);
+        pipeline_info.layout = pipeline_.layout;
+        return vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr,
+                                           &pipeline_.pipeline) == VK_SUCCESS ? 1 : -1;
+    }
 
     // A null pointer is accepted with S_OK, as by the PC runtime (measured on an RTX 3060 and WARP).
     HRESULT STDMETHODCALLTYPE GetCachedBlob(ID3DBlob** blob) override {
@@ -5050,6 +5342,7 @@ public:
     // does for mesh PSOs), drawn by DispatchMesh. An AS (amplification shader) is refused: the game has none.
     HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const D3D12_SHADER_BYTECODE* ms = nullptr,
                             const D3D12_SHADER_BYTECODE* as = nullptr) {
+        if (!prebake_) ce_prebake_start(device_);  // agA38
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
         const bool mesh = ms && ms->pShaderBytecode && ms->BytecodeLength;
@@ -5181,15 +5474,22 @@ public:
         const leonida::Depth24Bias depth24_bias{desc.RasterizerState.DepthBias,
                                                 desc.RasterizerState.SlopeScaledDepthBias,
                                                 desc.RasterizerState.DepthBiasClamp};
+        std::array<std::string, 3> stage_hashes;  // agA38: for the PSO record
         for (Stage& stage : stages) {
             if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // no PS: depth only
-            stage.fssm = leonida::fssm_program(
-                {static_cast<const std::uint8_t*>(stage.code.pShaderBytecode), stage.code.BytecodeLength});
-            if (stage.fssm.empty()) {
-                log_once("shader bytecode holds no FSSM program; bytes", int(stage.code.BytecodeLength));
-                return E_INVALIDARG;
+            std::string hash;
+            if (prebake_hashes_) {  // agA38: a recorded description names its programs by hash
+                hash = (*prebake_hashes_)[std::size_t(&stage - stages)];
+            } else {
+                stage.fssm = leonida::fssm_program(
+                    {static_cast<const std::uint8_t*>(stage.code.pShaderBytecode), stage.code.BytecodeLength});
+                if (stage.fssm.empty()) {
+                    log_once("shader bytecode holds no FSSM program; bytes", int(stage.code.BytecodeLength));
+                    return E_INVALIDARG;
+                }
+                hash = leonida::sha256_hex(stage.fssm);
             }
-            const std::string hash = leonida::sha256_hex(stage.fssm);
+            stage_hashes[std::size_t(&stage - stages)] = hash;
             // Containers with the same program can differ in their input signature or bindings: a VS must have its
             // inputs fed by this input layout (else the layout check below reports it).
             const bool vertex = stage.bit == VK_SHADER_STAGE_VERTEX_BIT;
@@ -5706,6 +6006,9 @@ public:
         recipe_.depth = depth;
         recipe_.blends = std::move(blends);
         recipe_.blend = blend;
+        // agA38: LEONIDA_CE_PSO_RECORD / _PREBAKE: the description as a record. A prebake object stops here.
+        if (ce_pso_record_path() || ce_pso_prebake_path()) record_ = ce_pso_encode(desc, mesh, stage_hashes);
+        if (prebake_) return S_OK;
         // HACK (Leonida CE): lazy graphics pipelines. GTA VI creates 20,000+ graphics pipelines in its startup task
         // graph and its boot state machine (and the frontend, the first screen) waits for all of them; compiled here,
         // one by one through the driver, that took far longer than any run (black screen, the boot node never ran).
@@ -5746,6 +6049,7 @@ public:
     }
 
     HRESULT create_compute(const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc) {
+        if (!prebake_) ce_prebake_start(device_);  // agA38
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
         if (!desc.CS.pShaderBytecode || !desc.CS.BytecodeLength) return E_INVALIDARG;
@@ -5860,6 +6164,117 @@ public:
             std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", entry->name.c_str());
             return E_FAIL;
         }
+        compute_transforms(words, *entry);  // agA38: shared with the prebake
+
+        VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        module_info.codeSize = words.size() * 4;
+        module_info.pCode = words.data();
+        if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module_) != VK_SUCCESS) return E_FAIL;
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(leonida::ShaderUserData)};
+        VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layout_info.pushConstantRangeCount = 1;
+        layout_info.pPushConstantRanges = &push;
+        VkDescriptorSetLayout set0_layout = VK_NULL_HANDLE;
+        if (entry->binding_count) {
+            set0_layout = device_.bindless->layout();
+            layout_info.setLayoutCount = 1;
+            layout_info.pSetLayouts = &set0_layout;
+            pipeline_.bindless_set = device_.bindless->set();
+        }
+        if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS) return E_FAIL;
+        VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipeline_info.stage.module = module_;
+        pipeline_info.stage.pName = "main";
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
+        subgroup_size_for(*entry, required_size, pipeline_info.stage);
+        cs_local_size_ = entry->local_size;  // agA21
+        pipeline_info.layout = pipeline_.layout;
+        // HACK (Leonida CE boot): some translated compute programs (ray-traced shadow traces, strand interpolation)
+        // take the host driver minutes to compile, or longer, and the title creates pipelines on its job workers: a
+        // worker held in the compile never returns its job context, and loading stops once all 32 are out. The
+        // compile runs on its own thread; if it is not done in 5 ms the pipeline is registered with an empty
+        // placeholder program (its dispatches do nothing) and the real one replaces it when the compile finishes.
+        // Programs whose compile the host driver (NVIDIA 5xx) does not finish in minutes, and which hold its other
+        // compiles behind them: ray-traced shadow traces, screen-probe ray activation, hair strand interpolation.
+        // They keep the empty placeholder.
+        // (agA38: the lists are in compute_skip, which the prebake uses too.)
+        if (const int why = compute_skip(entry->name)) {
+            pipeline_.pipeline = empty_compute_pipeline(pipeline_.layout);
+            if (!pipeline_.pipeline) return E_FAIL;
+            if (why == 1)
+                std::fprintf(stderr, "[hack] compute %s skipped (LEONIDA_CE_SKIP_CS)\n", entry->name.c_str());
+            else
+                std::fprintf(stderr, "[hack] compute %s is not compiled (placeholder)\n", entry->name.c_str());
+            goto compiled;
+        }
+        {
+        auto job = std::make_shared<AsyncCompute>();
+        async_job_ = job;
+        job->info = pipeline_info;
+        job->required_size = required_size;
+        if (pipeline_info.stage.pNext == &required_size) job->info.stage.pNext = &job->required_size;
+        job->name = entry->name;
+        job->device = &device_;
+        job->self = this;
+        job->event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        static_cast<ID3D12PipelineState*>(this)->AddRef();  // released by the compile thread
+        HANDLE compile_thread = CreateThread(nullptr, 0, &PipelineState::async_compute_main, new std::shared_ptr<AsyncCompute>(job),
+                                             0, nullptr);
+        if (!compile_thread) {
+            static_cast<ID3D12PipelineState*>(this)->Release();
+            if (vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr,
+                                            &pipeline_.pipeline) != VK_SUCCESS)
+                return E_FAIL;
+            leonida::ce::name_pipeline(pipeline_.pipeline, "cs " + entry->name);
+        } else {
+            CloseHandle(compile_thread);
+            WaitForSingleObject(job->event, 5);
+            std::lock_guard lock(job->mu);
+            if (job->done) {
+                if (job->result != VK_SUCCESS) return E_FAIL;
+                pipeline_.pipeline = job->pipeline;
+                job->taken = true;
+            } else {
+                pipeline_.pipeline = empty_compute_pipeline(pipeline_.layout);
+                if (!pipeline_.pipeline) return E_FAIL;
+                job->placeholder = true;
+                std::fprintf(stderr, "[hack] compute %s compiles in the background (placeholder for now)\n",
+                             entry->name.c_str());
+            }
+        }
+        }
+    compiled:
+
+        // The code base: shaders read constant tables embedded in their own program through s_getpc_b64. The
+        // translator's code offsets are into the bytes the key hashes (the FSSM blob, or the kind-6 program).
+        const std::vector<std::uint8_t>& code = program.bytes;
+        VkDeviceSize offset = 0;
+        if (!device_.arena_allocate(code.size(), 256, offset, DeviceState::arena_shader)) return E_OUTOFMEMORY;
+        std::memcpy(device_.arena.mapped + offset, code.data(), code.size());
+        code_bytes_ = code.size();
+        code_base_ = offset;
+        pipeline_.code_base = offset;
+        if (async_job_) {
+            std::lock_guard lock(async_job_->mu);
+            if (async_job_->done && !async_job_->taken && async_job_->result == VK_SUCCESS) {
+                pipeline_.pipeline = async_job_->pipeline;
+                async_job_->taken = true;
+            }
+            device_.context->add_pipeline(id(), pipeline_);
+            registered_ = true;
+            async_job_->registered = true;
+        } else {
+            device_.context->add_pipeline(id(), pipeline_);
+            registered_ = true;
+        }
+        return S_OK;
+    }
+
+    // agA38 (moved out of create_compute, unchanged): the module transforms of a compute program.
+    static void compute_transforms(std::vector<std::uint32_t>& words, const leonida::ShaderEntry& e) {
+        const leonida::ShaderEntry* entry = &e;
         // HACK (agA14): LEONIDA_CE_LOOP_CAP=sub1,sub2 (or 1 = every compute program): a watchdog counter on each
         // translated loop (src/spirv_loop_cap.h), so a data-dependent endless loop ends instead of a TDR (re34:
         // fspx cs_f33ac9e9). LEONIDA_CE_LOOP_CAP_INNER / _OUTER = the caps (blocks per invocation / barrier rounds).
@@ -5922,40 +6337,10 @@ public:
                                  (unsigned long long)window);
             }
         }
+    }
 
-        VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        module_info.codeSize = words.size() * 4;
-        module_info.pCode = words.data();
-        if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module_) != VK_SUCCESS) return E_FAIL;
-        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(leonida::ShaderUserData)};
-        VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        layout_info.pushConstantRangeCount = 1;
-        layout_info.pPushConstantRanges = &push;
-        VkDescriptorSetLayout set0_layout = VK_NULL_HANDLE;
-        if (entry->binding_count) {
-            set0_layout = device_.bindless->layout();
-            layout_info.setLayoutCount = 1;
-            layout_info.pSetLayouts = &set0_layout;
-            pipeline_.bindless_set = device_.bindless->set();
-        }
-        if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS) return E_FAIL;
-        VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-        pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        pipeline_info.stage.module = module_;
-        pipeline_info.stage.pName = "main";
-        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
-        subgroup_size_for(*entry, required_size, pipeline_info.stage);
-        cs_local_size_ = entry->local_size;  // agA21
-        pipeline_info.layout = pipeline_.layout;
-        // HACK (Leonida CE boot): some translated compute programs (ray-traced shadow traces, strand interpolation)
-        // take the host driver minutes to compile, or longer, and the title creates pipelines on its job workers: a
-        // worker held in the compile never returns its job context, and loading stops once all 32 are out. The
-        // compile runs on its own thread; if it is not done in 5 ms the pipeline is registered with an empty
-        // placeholder program (its dispatches do nothing) and the real one replaces it when the compile finishes.
-        // Programs whose compile the host driver (NVIDIA 5xx) does not finish in minutes, and which hold its other
-        // compiles behind them: ray-traced shadow traces, screen-probe ray activation, hair strand interpolation.
-        // They keep the empty placeholder.
+    // agA38 (moved out of create_compute): 1 = LEONIDA_CE_SKIP_CS names it, 2 = never compiled (kNeverCompile), 0 = built.
+    static int compute_skip(const std::string& name) {
         static const char* const kNeverCompile[] = {"RTShadowTrace", "ScreenProbes_ActivateRays", "InterpolateStrands",
                                                     "TraceShadowRays"};
         // HACK (agA12): LEONIDA_CE_SKIP_CS=sub1,sub2 also gets the empty placeholder (re29: cs_bedf0201.. page-faults
@@ -5975,80 +6360,14 @@ public:
             return v;
         }();
         for (const std::string& pattern : skip_cs)
-            if (entry->name.find(pattern) != std::string::npos) {
-                pipeline_.pipeline = empty_compute_pipeline(pipeline_.layout);
-                if (!pipeline_.pipeline) return E_FAIL;
-                std::fprintf(stderr, "[hack] compute %s skipped (LEONIDA_CE_SKIP_CS)\n", entry->name.c_str());
-                goto compiled;
+            if (name.find(pattern) != std::string::npos) {
+                return 1;
             }
         for (const char* pattern : kNeverCompile)
-            if (entry->name.find(pattern) != std::string::npos) {
-                pipeline_.pipeline = empty_compute_pipeline(pipeline_.layout);
-                if (!pipeline_.pipeline) return E_FAIL;
-                std::fprintf(stderr, "[hack] compute %s is not compiled (placeholder)\n", entry->name.c_str());
-                goto compiled;
+            if (name.find(pattern) != std::string::npos) {
+                return 2;
             }
-        {
-        auto job = std::make_shared<AsyncCompute>();
-        async_job_ = job;
-        job->info = pipeline_info;
-        job->required_size = required_size;
-        if (pipeline_info.stage.pNext == &required_size) job->info.stage.pNext = &job->required_size;
-        job->name = entry->name;
-        job->device = &device_;
-        job->self = this;
-        job->event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        static_cast<ID3D12PipelineState*>(this)->AddRef();  // released by the compile thread
-        HANDLE compile_thread = CreateThread(nullptr, 0, &PipelineState::async_compute_main, new std::shared_ptr<AsyncCompute>(job),
-                                             0, nullptr);
-        if (!compile_thread) {
-            static_cast<ID3D12PipelineState*>(this)->Release();
-            if (vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr,
-                                            &pipeline_.pipeline) != VK_SUCCESS)
-                return E_FAIL;
-            leonida::ce::name_pipeline(pipeline_.pipeline, "cs " + entry->name);
-        } else {
-            CloseHandle(compile_thread);
-            WaitForSingleObject(job->event, 5);
-            std::lock_guard lock(job->mu);
-            if (job->done) {
-                if (job->result != VK_SUCCESS) return E_FAIL;
-                pipeline_.pipeline = job->pipeline;
-                job->taken = true;
-            } else {
-                pipeline_.pipeline = empty_compute_pipeline(pipeline_.layout);
-                if (!pipeline_.pipeline) return E_FAIL;
-                job->placeholder = true;
-                std::fprintf(stderr, "[hack] compute %s compiles in the background (placeholder for now)\n",
-                             entry->name.c_str());
-            }
-        }
-        }
-    compiled:
-
-        // The code base: shaders read constant tables embedded in their own program through s_getpc_b64. The
-        // translator's code offsets are into the bytes the key hashes (the FSSM blob, or the kind-6 program).
-        const std::vector<std::uint8_t>& code = program.bytes;
-        VkDeviceSize offset = 0;
-        if (!device_.arena_allocate(code.size(), 256, offset, DeviceState::arena_shader)) return E_OUTOFMEMORY;
-        std::memcpy(device_.arena.mapped + offset, code.data(), code.size());
-        code_bytes_ = code.size();
-        code_base_ = offset;
-        pipeline_.code_base = offset;
-        if (async_job_) {
-            std::lock_guard lock(async_job_->mu);
-            if (async_job_->done && !async_job_->taken && async_job_->result == VK_SUCCESS) {
-                pipeline_.pipeline = async_job_->pipeline;
-                async_job_->taken = true;
-            }
-            device_.context->add_pipeline(id(), pipeline_);
-            registered_ = true;
-            async_job_->registered = true;
-        } else {
-            device_.context->add_pipeline(id(), pipeline_);
-            registered_ = true;
-        }
-        return S_OK;
+        return 0;
     }
 
     struct AsyncCompute {
@@ -6252,6 +6571,28 @@ private:
         }();
         std::unique_lock lock(variants_mutex_);
         if (const auto it = variants_.find(key); it != variants_.end()) return it->second;
+        if (!record_.empty() && !prebake_) {  // agA38: record the variant; take a prebaked pipeline for it
+            const std::string text = ce_variant_text(unbound, key.second.data(), key.second.size());
+            if (recorded_.insert(key).second) ce_pso_record_line(record_, text);
+            if (ce_pso_prebake_path()) {
+                VkPipeline prebaked = VK_NULL_HANDLE;
+                {
+                    std::lock_guard l(device_.ce_prebaked_mu);
+                    if (const auto it = device_.ce_prebaked.find(record_ + " " + text); it != device_.ce_prebaked.end())
+                        prebaked = it->second;
+                }
+                if (prebaked) {
+                    variants_.emplace(key, prebaked);
+                    adopted_.insert(key);
+                    static std::atomic<std::uint64_t> adopted{0};
+                    const std::uint64_t n = ++adopted;
+                    if ((n & (n - 1)) == 0)
+                        std::fprintf(stderr, "[hack] PSO_PREBAKE: %llu draw-time variant(s) taken from the prebake\n",
+                                     (unsigned long long)n);
+                    return prebaked;
+                }
+            }
+        }
         if (sync) {
             const VkPipeline pipeline = build(unbound, overrides);
             leonida::ce::name_pipeline(pipeline, ce_name_);
@@ -6338,7 +6679,198 @@ private:
     std::vector<leonida::SubgroupRequest> subgroup_requests_;  // one per stage, in creation order
     std::array<std::uint32_t, 3> cs_local_size_{0, 0, 0};  // agA21: compute workgroup size (0 = unknown)
     leonida::cached_pso::Key cache_key_;
+    // agA38 prebake / PSO record
+    bool prebake_ = false;
+    const std::array<std::string, 3>* prebake_hashes_ = nullptr;
+    std::string record_;              // this PSO's description as a record (PSO_RECORD / PSO_PREBAKE)
+    std::set<VariantKey> recorded_;   // variants already written to the record file
+    std::set<VariantKey> adopted_;    // variants taken from DeviceState::ce_prebaked (not destroyed here)
 };
+
+// agA38: the prebake (see ce_prebake_start's caller and DeviceState::ce_prebake_thread). ------------------------
+// Runs job(0..count-1) on LEONIDA_CE_PREBAKE_THREADS threads (default: every core) at below-normal priority.
+template<class Job>
+void ce_parallel(DeviceState& device, std::size_t count, Job&& job) {
+    static const unsigned threads = [] {
+        const char* v = std::getenv("LEONIDA_CE_PREBAKE_THREADS");
+        unsigned n = v ? unsigned(std::strtoul(v, nullptr, 0)) : 0;
+        return n ? n : std::max(2u, std::thread::hardware_concurrency());
+    }();
+    std::atomic<std::size_t> next{0};
+    std::vector<std::thread> pool;
+    for (std::size_t t = 0; t < std::min<std::size_t>(threads, count); ++t)
+        pool.emplace_back([&] {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            for (;;) {
+                if (device.ce_prebake_stop) return;
+                const std::size_t i = next++;
+                if (i >= count) return;
+                job(i);
+            }
+        });
+    for (std::thread& t : pool) t.join();
+}
+
+double ce_seconds_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+void ce_prebake_compute_all(DeviceState& device, const leonida::ShaderLibrary& library) {
+    std::vector<const leonida::ShaderEntry*> list;
+    std::set<std::string> seen;
+    library.for_each_entry([&](const leonida::ShaderEntry& e) {
+        // "1" = every compute module, else a comma list of name substrings (e.g. fspx_game/,bvh/).
+        if (e.stage == "cs" && ce_name_list_match("LEONIDA_CE_PREBAKE_COMPUTE", e.name) && seen.insert(e.name).second)
+            list.push_back(&e);
+    });
+    std::fprintf(stderr, "[hack] PREBAKE_COMPUTE: %zu compute modules\n", list.size());
+    std::fflush(stderr);
+    std::atomic<int> built{0}, skipped{0}, failed{0}, slow{0};
+    std::atomic<std::uint64_t> busy_ms{0};
+    const auto t0 = std::chrono::steady_clock::now();
+    ce_parallel(device, list.size(), [&](std::size_t i) {
+        auto* pso = new PipelineState(device);
+        pso->ce_set_prebake(nullptr);
+        const auto t1 = std::chrono::steady_clock::now();
+        const int r = pso->ce_prebake_compute(*list[i]);
+        const double took = ce_seconds_since(t1);
+        pso->Release();
+        if (r > 0) {
+            ++built;
+            busy_ms += std::uint64_t(took * 1000);
+        } else if (r == 0) {
+            ++skipped;
+        } else if (failed++ < 16) {
+            std::fprintf(stderr, "[hack] PREBAKE_COMPUTE: %s failed\n", list[i]->name.c_str());
+        }
+        if (took > 5.0 && slow++ < 32)
+            std::fprintf(stderr, "[hack] PREBAKE_COMPUTE: %s took %.1f s\n", list[i]->name.c_str(), took);
+        const int done = built + skipped + failed;
+        if (done % 250 == 0)
+            std::fprintf(stderr, "[hack] PREBAKE_COMPUTE: %d / %zu after %.1f s\n", done, list.size(), ce_seconds_since(t0));
+    });
+    const int b = built;
+    std::fprintf(stderr, "[hack] PREBAKE_COMPUTE: done%s in %.1f s: %d built, %d skipped, %d failed, %.1f ms average per module\n",
+                 device.ce_prebake_stop ? " (stopped)" : "", ce_seconds_since(t0), b, int(skipped), int(failed),
+                 b ? double(busy_ms.load()) / b : 0.0);
+    std::fflush(stderr);
+}
+
+void ce_prebake_graphics_all(DeviceState& device, const char* path) {
+    // Lines "G <record> <variant>", deduplicated (a record file grows across runs).
+    std::map<std::string, std::set<std::string>> records;
+    std::size_t lines = 0, bad = 0;
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            std::fprintf(stderr, "[hack] PSO_PREBAKE: cannot open %s\n", path);
+            return;
+        }
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty()) continue;
+            ++lines;
+            const std::size_t sp = line.find(' ', 2);
+            if (line.compare(0, 2, "G ") != 0 || sp == std::string::npos) { ++bad; continue; }
+            records[line.substr(2, sp - 2)].insert(line.substr(sp + 1));
+        }
+    }
+    std::vector<const std::pair<const std::string, std::set<std::string>>*> jobs;
+    std::size_t variants = 0;
+    for (const auto& r : records) {
+        jobs.push_back(&r);
+        variants += r.second.size();
+    }
+    static const bool adopt = [] { const char* e = std::getenv("LEONIDA_CE_PSO_ADOPT"); return !e || e[0] != '0'; }();
+    std::fprintf(stderr, "[hack] PSO_PREBAKE: %s: %zu line(s), %zu bad, %zu pipeline description(s), %zu variant(s)%s\n",
+                 path, lines, bad, jobs.size(), variants, adopt ? "" : " (cache only: LEONIDA_CE_PSO_ADOPT=0)");
+    std::fflush(stderr);
+    std::atomic<int> built{0}, failed_pso{0}, failed_variant{0}, mismatch{0};
+    std::atomic<std::uint64_t> busy_ms{0};
+    const auto t0 = std::chrono::steady_clock::now();
+    auto& vk = device.context->vk;
+    ce_parallel(device, jobs.size(), [&](std::size_t i) {
+        const std::string& record = jobs[i]->first;
+        CePsoRecord rec;
+        if (!ce_pso_decode(record, rec)) {
+            if (failed_pso++ < 16) std::fprintf(stderr, "[hack] PSO_PREBAKE: record %zu does not decode\n", i);
+            return;
+        }
+        auto* pso = new PipelineState(device);
+        pso->ce_set_prebake(&rec.hashes);
+        const auto t1 = std::chrono::steady_clock::now();
+        if (const HRESULT hr = pso->create_graphics(rec.desc, rec.mesh ? &rec.ms : nullptr); FAILED(hr)) {
+            if (failed_pso++ < 16) std::fprintf(stderr, "[hack] PSO_PREBAKE: record %zu: create_graphics 0x%08lx\n", i, (unsigned long)hr);
+            pso->Release();
+            return;
+        }
+        if (pso->ce_record() != record && mismatch++ < 4)
+            std::fprintf(stderr, "[hack] PSO_PREBAKE: record %zu re-encodes differently (its pipelines will not be taken)\n", i);
+        bool kept = false;
+        for (const std::string& text : jobs[i]->second) {
+            std::uint32_t unbound = 0;
+            std::array<VkFormat, leonida::detail::max_render_targets> formats{};
+            if (!ce_variant_parse(text, unbound, formats)) { ++failed_variant; continue; }
+            bool overridden = false;
+            for (VkFormat f : formats) overridden |= f != VK_FORMAT_UNDEFINED;
+            const VkPipeline p = pso->ce_prebake_build(unbound, overridden ? formats.data() : nullptr);
+            if (!p) { ++failed_variant; continue; }
+            ++built;
+            bool taken = false;
+            if (adopt) {
+                std::lock_guard l(device.ce_prebaked_mu);
+                taken = device.ce_prebaked.emplace(record + " " + text, p).second;
+            }
+            if (taken) kept = true;
+            else vk.vkDestroyPipeline(device.info.device, p, nullptr);
+        }
+        busy_ms += std::uint64_t(ce_seconds_since(t1) * 1000);
+        if (kept) {
+            std::lock_guard l(device.ce_prebaked_mu);
+            device.ce_prebake_keep.push_back(pso);  // its layout stays alive while its pipelines may be used
+        } else {
+            pso->Release();
+        }
+        const std::size_t done = i + 1;
+        if (done % 500 == 0)
+            std::fprintf(stderr, "[hack] PSO_PREBAKE: description %zu / %zu after %.1f s\n", done, jobs.size(), ce_seconds_since(t0));
+    });
+    const int b = built;
+    std::fprintf(stderr, "[hack] PSO_PREBAKE: done%s in %.1f s: %d variant(s) built, %d failed, %d description(s) failed, "
+                         "%d re-encode mismatch(es), %.1f ms average per description\n",
+                 device.ce_prebake_stop ? " (stopped)" : "", ce_seconds_since(t0), b, int(failed_variant), int(failed_pso),
+                 int(mismatch), jobs.empty() ? 0.0 : double(busy_ms.load()) / jobs.size());
+    std::fflush(stderr);
+}
+
+void ce_prebake_run(DeviceState& device) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    const leonida::ShaderLibrary* library = device.library();
+    if (!library || !device.pipeline_cache()) {
+        std::fprintf(stderr, "[hack] PREBAKE: no shader library or no pipeline cache; nothing prebaked\n");
+        return;
+    }
+    // Graphics first: its pipelines are taken at the first draw (pending-pso); compute only warms the cache.
+    if (const char* path = ce_pso_prebake_path()) {
+        ce_prebake_graphics_all(device, path);
+        if (!device.ce_prebake_stop) device.cache_writer.save_now();
+    }
+    if (ce_env_on("LEONIDA_CE_PREBAKE_COMPUTE") && !device.ce_prebake_stop) {
+        ce_prebake_compute_all(device, *library);
+        if (!device.ce_prebake_stop) device.cache_writer.save_now();
+    }
+}
+
+void ce_prebake_start(DeviceState& device) {
+    static const bool want = ce_env_on("LEONIDA_CE_PREBAKE_COMPUTE") || ce_pso_prebake_path();
+    if (!want) return;
+    std::call_once(device.ce_prebake_once, [&device] {
+        std::fprintf(stderr, "[hack] PREBAKE: starting (compute %s, graphics %s)\n",
+                     ce_env_on("LEONIDA_CE_PREBAKE_COMPUTE") ? "on" : "off", ce_pso_prebake_path() ? ce_pso_prebake_path() : "off");
+        device.ce_prebake_thread = std::thread(ce_prebake_run, std::ref(device));
+    });
+}
 
 void key_root_signature(leonida::cached_pso::KeyBuilder& key, ID3D12RootSignature* signature) {
     if (!signature) {
@@ -7835,11 +8367,18 @@ public:
     }
 
     ~Device() override {
+        state_.ce_prebake_stop = true;  // agA38: the prebake uses the bindless layout and the cache
+        if (state_.ce_prebake_thread.joinable()) state_.ce_prebake_thread.join();
         if (state_.context) {
             {
                 std::lock_guard lock(state_.context->submit_mutex());
                 state_.context->vk.vkDeviceWaitIdle(state_.info.device);
             }
+            for (ID3D12PipelineState* kept : state_.ce_prebake_keep) kept->Release();
+            state_.ce_prebake_keep.clear();
+            for (const auto& [key, prebaked] : state_.ce_prebaked)
+                if (prebaked) state_.context->vk.vkDestroyPipeline(state_.info.device, prebaked, nullptr);
+            state_.ce_prebaked.clear();
             state_.context->drain_deleted_resources(UINT64_MAX);
             state_.context->set_bindless_release(nullptr, nullptr);
             state_.context->set_bindless_current(nullptr);  // the retired generations go with state_.bindless below
