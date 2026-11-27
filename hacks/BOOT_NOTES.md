@@ -2684,3 +2684,8 @@ Where it stands:
   * NEXT for black: find the world V-buffer / depth writer and why it is skipped (rt44 rtdiag: pending-pso 867, variant-skip
     462, no-target 4908 per 60 frames). Put an RTDIAG dump right after gameplay starts (DUMP_FROM ~3100, EVERY 60) so one
     lands before a device loss.
+- CORRECTION (agA36): fmt 17 2560x1440 is the HAIR-strand V-buffer (docs/strand_grooms.md), not a world V-buffer.
+  The world looks GPU-DRIVEN (Plausible): rt44 has ~430 draws/frame; INDIRECT_SRC/INDIRECT_DRAW lines (rt44/51/52, also after the
+  first TAA copies in rt52) show args [3 0 0 0 0] = InstanceCount 0. Chain: culling CBs zero -> zero instance counts -> no world
+  -> empty depth -> TiledLighting/SSSResolve NaN -> black. With COPY_SRC_SYNC the culling kernels get real CBs, which is where
+  the new hangs start (cs_d8b54205 etc.). A NaN scrub would only show sky/UI. Check INDIRECT args after gameplay in rt58/rt54.
